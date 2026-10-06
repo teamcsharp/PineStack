@@ -52,6 +52,7 @@
     {id: 'music', label: 'Music', why: 'Playlist, schedule, requests, the shelf.'},
     {id: 'sampler', label: 'Sampler', why: 'Sixteen pads, five banks.'},
     {id: 'script', label: 'Script', why: 'Where a line came from.'},
+    {id: 'books', label: 'Books', why: 'Find a book, locate a passage, and read.'},
     {id: 'presentation', label: 'Present', why: 'The wall: playlist, schedule, feed, gallery.'},
     {id: 'control', label: 'Tech', why: 'The full Pine Box application.'}
   ];
@@ -71,6 +72,7 @@
    * visit, pausing another). Only when there is no tab does this move the
    * `active` class itself. */
   function show(id) {
+    if(id === 'books' && root.PineViewRail) return root.PineViewRail.open(id);
     var tab = document.querySelector('[data-view="' + id + '"]');
     if (tab && typeof tab.click === 'function') { tab.click(); return true; }
     var target = document.getElementById(id);

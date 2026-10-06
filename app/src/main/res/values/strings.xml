@@ -20,7 +20,7 @@
     <string name="rail_fix_go">↻   Get the broadcast back</string>
     <string name="rail_fix_idle">one tap finds what is wrong, fixes only that, then asks you</string>
     <!-- [tablet-update-ask] the download icon beside it -->
-    <string name="rail_update">Update this tablet: the Pine Box app on the computer builds, signs and installs the newest PineTab app</string>
+    <string name="rail_update">Build the newest PineTab update on the computer, then tap again to install</string>
     <!-- [smart-reinit] the question after every cure -->
     <string name="rail_fix_ask">Is the broadcast working now?</string>
     <string name="rail_fix_yes">Yes</string>
@@ -85,4 +85,5 @@
     <!-- DGX Terminal: its own entry in the app list, beside Pine Box
          and the SC stack. -->
     <string name="dgx_name">DGX Terminal</string>
+    <string name="rail_pinelens">Open Pine Lens desktop sessions</string>
 </resources>

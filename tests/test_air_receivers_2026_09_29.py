@@ -16,6 +16,9 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from broadcast_recovery import AudioProgress
+
 _arg = Path(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].endswith(".py") else None
 SRC = str(os.environ.get("AIR_APP_SRC") or (_arg if _arg and _arg.is_file()
           else Path(__file__).resolve().parents[1] / "app.py"))
@@ -78,7 +81,7 @@ def build():
           "OWNER_DEAF_SECONDS": 75.0, "OWNER_DEAF_REST": 300.0,
           "_AUDIO_OWNER": {}, "_LISTENER_SEEN": {}, "_LISTENERS": {},
           "_OWNER_RUN": {"who": "", "since": 0.0}, "_OWNER_DEAF": {},
-          "_PAGE_ACK_EVENTS": [], "_PAGE_DELIVERIES": {},
+          "_PAGE_ACK_EVENTS": [], "_PAGE_DELIVERIES": {}, "_AUDIO_PROGRESS": AudioProgress(),
           "_TERMINALS_CACHE": {"at": 0.0, "rows": {}}, "TERMINALS_TTL": 0.0,
           "_RADIO": {"music_to": "here", "voice_to": "here",
                      "reply_to": "here", "voice_device": "nabu",
@@ -86,7 +89,7 @@ def build():
           "_BOX_LAST_OK": [0.0],
           "_DIALOGUE_HEARD": [0.0], "_BANK_RETIMED": [0.0, 0.0],
           "_LISTENERS_SEEN": [0.0], "_STREAM_NOW": {},
-          "PAGE_WEDGE_QUIET": 45.0, "PAGE_WEDGE_WAITING": 4,
+          "PAGE_WEDGE_QUIET": 45.0, "PAGE_WEDGE_WAITING": 4, "PAGE_WAIT_LATE_S": 120,
           "radio_paused": lambda: False, "radio_paused_for": lambda: 0.0,
           "prepared_seconds": lambda: 0.0,
           "page_delivery_waits": lambda r: False,
@@ -305,12 +308,13 @@ class AirReceivers(unittest.TestCase):
         t0 = time.time()
         for seq, (who, muted, vol) in enumerate((
                 ("pbkztc5rkx", True, 0.0), ("yzhfb4a8qbj", True, 0.0),
-                ("pbnnmzpnrf", False, 1.0), ("pbkztc5rkx", True, 0.0)), 1):
+                ("pbnnmzpnrf", False, 1.0), ("pbkztc5rkx", True, 0.0),
+                ("pbnnmzpnrf", False, 1.0)), 1):
             ack({"event": "playing", "listener_id": who, "delivery_id": "d1",
                  "volume": 1.0, "audible_volume": vol, "muted": muted,
                  "current_time": seq * 1.0, "sequence": seq})
         self.assertGreaterEqual(ns["_DIALOGUE_HEARD"][0], t0)       # #1231
-        self.assertEqual(receipts, ["d1"])        # line receipt: the tablet's
+        self.assertEqual(receipts, ["d1", "d1"])  # advancing receipts: the tablet's
         self.assertEqual(ns["_PAGE_DELIVERIES"]["d1"]["state"], "playing")
         wedge = ns["page_wedge_state"]()
         self.assertGreaterEqual(wedge["heard_at"], round(t0, 1) - 0.1)

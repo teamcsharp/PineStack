@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep the PineCam secondary tablet Wi-Fi awake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ehm_eckx
+ExecStart=/usr/bin/python3 /home/ehm_eckx/pinevoice-stack/spark-agent/tools/pinetab-dual-wifi/keep-awake.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

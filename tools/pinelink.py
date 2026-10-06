@@ -156,13 +156,14 @@ RELAY_PREF_FILE = ROOT / "data" / "pinelink_relay_pref.json"
 RELAY_PREFS = ("auto", "always", "never")
 RELAY_RTSP_PORT, RELAY_HTTP_PORT = 8554, 8580
 RELAY_FRESH_S = 20.0        # a report older than this is a tablet that is not there
+RELAY_IDLE_FRESH_S = 75.0   # idle reports arrive every 30 s, with a 30 s HTTP budget
 RELAY_MBB_S = 20.0          # the tablet's first try, with the dongle still streaming
 RELAY_BBM_S = 45.0          # then the dongle lets go for this long
-RELAY_LOSS_S = 12.0         # a tablet that lost the camera gets this long to rejoin
+RELAY_LOSS_S = 60.0         # allow a full 30 s Android join plus retry/report time
 RELAY_BACKOFF_S = (120.0, 300.0, 900.0)
 RELAY_WANTED_S = 1800.0     # "the camera is wanted": announced or relayed this recently
 _SRC: dict = {"use": "dongle", "why": "", "want_tablet": False,
-              "release_dongle": False, "pref": "auto", "ip": "", "url": RTSP,
+              "release_dongle": False, "pref": "never", "ip": "", "url": RTSP,
               "at": 0.0, "running": ""}
 _SRC_MEM: dict = {}
 _DONGLE_LET_GO = [False]
@@ -170,15 +171,15 @@ _DONGLE_LET_GO = [False]
 
 def relay_pref() -> dict:
     """[tabrelay] {"pref": auto|always|never, "mode": udp|pass}. No file, or a
-    file that cannot be read, is auto/udp."""
+    file that cannot be read, defaults to the DGX Spark dongle (never/udp)."""
     try:
         got = json.loads(RELAY_PREF_FILE.read_text())
-        pref = str(got.get("pref") or "auto")
+        pref = str(got.get("pref") or "never")
         mode = str(got.get("mode") or "udp")
-        return {"pref": pref if pref in RELAY_PREFS else "auto",
+        return {"pref": pref if pref in RELAY_PREFS else "never",
                 "mode": mode if mode in ("udp", "pass") else "udp"}
     except Exception:  # noqa: BLE001
-        return {"pref": "auto", "mode": "udp"}
+        return {"pref": "never", "mode": "udp"}
 
 
 def relay_report() -> dict:
@@ -200,9 +201,12 @@ def plan_source(pref: str, rep: dict, now: float, mem: dict,
     `wait` = neither road is up yet and the dongle must not take the camera.
     """
     rep = rep if isinstance(rep, dict) else {}
-    fresh = bool(rep) and now - float(rep.get("at") or 0) <= RELAY_FRESH_S
     link = rep.get("link") if isinstance(rep.get("link"), dict) else {}
     relay = rep.get("relay") if isinstance(rep.get("relay"), dict) else {}
+    # Idle is slower than the active heartbeat. Expiring an idle report at
+    # 20 s repeatedly cancels handoff before the next 30 s tablet poll.
+    ttl = RELAY_FRESH_S if link.get("joined") and relay.get("listening") else RELAY_IDLE_FRESH_S
+    fresh = bool(rep) and now - float(rep.get("at") or 0) <= ttl
     ip = str(rep.get("ip") or "") if fresh else ""
     capable = fresh and bool(rep.get("capable")) and bool(ip)
     joined = capable and bool(link.get("joined")) and bool(relay.get("listening"))
@@ -291,6 +295,41 @@ def cam_rtsp() -> str:
     return RTSP
 
 
+def input_timestamp_options() -> list[str]:
+    # The H88's RTP clock advances at 30 fps. Replacing it with packet
+    # arrival time turns Wi-Fi bursts into 1 ms frame spacing and pauses,
+    # which makes the tablet skip frames even after the link recovers.
+    # Keep the camera clock on the relay; generate only genuinely missing
+    # timestamps. The direct dongle retains its existing recording policy.
+    if _SRC.get("use") == "tablet":
+        return ["-fflags", "+genpts"]
+    return ["-use_wallclock_as_timestamps", "1"]
+
+
+def release_dongle() -> tuple[bool, str]:
+    """Release the spare radio and verify association, even after a prior release.
+
+    A failed disconnect or an external rejoin can leave the camera's client
+    slot occupied. An earlier successful request is not proof it remains free.
+    Association is checked rather than IPv4: DHCP may still be pending.
+    """
+    if SPARE_IF == STATION_IF:
+        return False, "refusing to disconnect the station radio"
+    probe = ["iw", "dev", SPARE_IF, "link"]
+    code, link = run(probe, 3)
+    if code == 0 and "Not connected." in link:
+        return True, ""
+    code, answer = run(["nmcli", "device", "disconnect", SPARE_IF], 8)
+    checked, link = run(probe, 3)
+    if checked == 0 and "Not connected." in link:
+        return True, ""
+    if code:
+        return False, "the spare radio disconnect failed: " + answer.strip()[:160]
+    if checked:
+        return False, "the spare radio release could not be verified"
+    return False, "the spare radio is still associated with the camera"
+
+
 def source_turn() -> dict:
     """[tabrelay] Plan this pass and act on the dongle side of it."""
     now = time.time()
@@ -299,14 +338,19 @@ def source_turn() -> dict:
     # camera_wanted() runs `ip` - only asked when a capable tablet is reporting
     wanted = bool(rep.get("capable")) and camera_wanted(rep, now)
     plan = plan_source(pref["pref"], rep, now, _SRC_MEM, wanted)
-    if plan["release_dongle"] and not _DONGLE_LET_GO[0]:
-        # Let the camera's one client slot go. `device disconnect` also stops
-        # NetworkManager auto-joining it again; join() asks explicitly later.
-        run(["nmcli", "device", "disconnect", SPARE_IF], 20)
-        _DONGLE_LET_GO[0] = True
-        print("PineLink: the dongle let the camera go - %s" % plan["why"], flush=True)
-    if plan["use"] == "dongle":
+    if plan["release_dongle"]:
+        released, error = release_dongle()
+        if released and not _DONGLE_LET_GO[0]:
+            print("PineLink: the dongle let the camera go (verified) - %s" % plan["why"], flush=True)
+        if error and error != _SRC.get("dongle_release_error"):
+            print("PineLink: " + error, flush=True)
+        _DONGLE_LET_GO[0] = released
+        plan.update(dongle_released=released, dongle_release_error=error)
+        if error:
+            plan["why"] += "; " + error
+    else:
         _DONGLE_LET_GO[0] = False
+        plan.update(dongle_released=False, dongle_release_error="")
     _SRC.update(plan)
     _SRC.update({"pref": pref["pref"], "mode": pref["mode"], "at": now})
     _SRC["url"] = cam_rtsp()
@@ -329,7 +373,8 @@ def source_view() -> dict:
         rep = relay_report()
         link = rep.get("link") if isinstance(rep.get("link"), dict) else {}
         return {**{k: _SRC.get(k) for k in ("use", "why", "want_tablet", "release_dongle",
-                                            "pref", "mode", "ip", "url", "at", "running")},
+                                            "pref", "mode", "ip", "url", "at", "running",
+                                            "dongle_released", "dongle_release_error")},
                 "rtsp_port": RELAY_RTSP_PORT, "http_port": RELAY_HTTP_PORT,
                 "tablet_signal": int(link.get("signal") or 0),
                 "tablet_link_mbps": int(link.get("link_mbps") or 0),
@@ -420,6 +465,26 @@ def run(cmd: list[str], timeout: float = 30.0) -> tuple[int, str]:
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as err:  # noqa: BLE001
         return 1, str(err)
+
+
+def drain_stderr(proc):
+    """Drain a live child's diagnostics so a full pipe cannot stop video.
+
+    Keep a bounded tail for stream_fault(), rather than waiting until exit
+    to read stderr. Wireless decode warnings can fill a pipe within minutes.
+    """
+    tail = deque(maxlen=2000)
+
+    def read():
+        try:
+            for line in proc.stderr:
+                tail.append(line[-4096:])
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=read, name="pinelink-stderr", daemon=True)
+    reader.start()
+    return reader, tail
 
 
 def phone_lanes() -> dict:
@@ -879,6 +944,16 @@ def rtsp_transport() -> str:
     return TRANSPORTS[_TRANSPORT[0] % len(TRANSPORTS)]
 
 
+def relay_packet_options() -> list[str]:
+    # The tablet wraps camera UDP in TCP without reordering its RTP packets.
+    # FFmpeg disables its reorder queue for TCP by default. Keep a small
+    # queue for this hybrid transport so wireless reordering does not corrupt
+    # H.264 fragments; a bounded queue also limits delay after packet loss.
+    if _SRC.get("use") == "tablet" and _SRC.get("mode", "udp") == "udp":
+        return ["-reorder_queue_size", "64", "-max_delay", "200000"]
+    return []
+
+
 def stream_fault(err: str, life_s: float, stalled: bool) -> dict:
     """#1250b: NAME the way a stream ended, in one word.
 
@@ -1179,8 +1254,9 @@ def ffmpeg_cmd_cropped(box: dict) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-rtsp_transport", tport,
+        *relay_packet_options(),
         "-timeout", str(int(FRAME_STALL_S * 1_000_000)),
-        "-use_wallclock_as_timestamps", "1",
+        *input_timestamp_options(),
         "-i", cam_rtsp(),                   # [tabrelay] the road in force
         "-filter_complex", crop_graph(plan),
         # the house, the kept clips, the TS door: one encode, three muxers
@@ -1238,6 +1314,7 @@ def ffmpeg_cmd(crop: dict | None = None) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-rtsp_transport", tport,
+        *relay_packet_options(),
         # #1388: a read that gets nothing for twenty seconds is a dead
         # link, and ffmpeg must EXIT on it. Without this it sat on a
         # dropped camera for 12.9 hours (measured: pid alive, the radio
@@ -1249,7 +1326,7 @@ def ffmpeg_cmd(crop: dict | None = None) -> list[str]:
         "-timeout", str(int(FRAME_STALL_S * 1_000_000)),
         # The camera sets no PTS. Without this the copy is unplayable
         # later in ways that do not show up now.
-        "-use_wallclock_as_timestamps", "1",
+        *input_timestamp_options(),
         "-i", cam_rtsp(),                   # [tabrelay] the road in force
         # what the house watches
         "-map", "0:v", "-c", "copy",
@@ -1725,8 +1802,6 @@ def supervise(once: bool = False) -> None:
     reframe = False             # [pincrop] a new crop restarts ffmpeg, not the radio
     while True:
         quick, reframe = reframe, False
-        if not quick and not on_tablet():      # [tabrelay] no dongle scan on the tablet's road
-            _LAST_SEEN.update(seen_on_air())
         # #1349: and why not, when it is not. Cheap - the scan above
         # has already been paid for - and it is the difference between
         # a surface that says 'not found' and one that says which of
@@ -1738,7 +1813,23 @@ def supervise(once: bool = False) -> None:
         # minute on top, to answer a question nobody had asked (we
         # were already joined). Scan when there is a reason to, or
         # every five minutes.
-        if (not quick) and (not on_tablet()) and ((not linked())   # [pincrop] [tabrelay]
+        # Plan before any potentially minute-long radio scan or join. The
+        # tablet must keep receiving fresh control while it takes over.
+        try:
+            src = source_turn()
+        except Exception as err:
+            src = {"use": "dongle", "why": "planning failed: %s" % err}
+            _SRC.update(src)
+        if not quick and not src.get("want_tablet") and not on_tablet():
+            _LAST_SEEN.update(seen_on_air())
+        if src.get("want_tablet") and src["use"] == "dongle" and not linked():
+            say("waiting-tablet", why=src["why"])
+            if once:
+                return
+            time.sleep(3)
+            reframe = True
+            continue
+        if (not quick) and (not src.get("want_tablet")) and (not on_tablet()) and ((not linked())   # [pincrop] [tabrelay]
                             or (time.time() - _DOCTOR[0] > DOCTOR_EVERY_S)):
             try:
                 doc = doctor()
@@ -1747,12 +1838,6 @@ def supervise(once: bool = False) -> None:
                 _DOCTOR[0] = time.time()
             except Exception:  # noqa: BLE001
                 pass
-        # [tabrelay] which road reaches the camera this pass
-        try:
-            src = source_turn()
-        except Exception as err:  # noqa: BLE001
-            src = {"use": "dongle", "why": "planning failed: %s" % err}
-            _SRC.update(src)
         if src["use"] == "wait":
             say("waiting-tablet", why=src["why"])
             if once:
@@ -1803,7 +1888,8 @@ def supervise(once: bool = False) -> None:
         print("PineLink live: %s -> %s" % (RTSP, LIVE))
         began = time.time()                                   # #1250b
         proc = subprocess.Popen(ffmpeg_cmd(box), stdout=subprocess.DEVNULL,  # [pincrop]
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.PIPE, text=True, errors="replace")
+        stderr_reader, stderr_tail = drain_stderr(proc)
         _STREAM["transport"] = rtsp_transport()               # #1250b
         _SRC["running"] = _SRC.get("use") or "dongle"         # [tabrelay]
         say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8")
@@ -1857,7 +1943,9 @@ def supervise(once: bool = False) -> None:
                 say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8",
                     frame_age=round(time.time() - last_frame, 1))
             try:
-                _, err = proc.communicate(timeout=10)
+                proc.wait(timeout=10)
+                stderr_reader.join(timeout=2)
+                err = "".join(list(stderr_tail))
             except Exception:  # noqa: BLE001
                 err = ""
         except KeyboardInterrupt:

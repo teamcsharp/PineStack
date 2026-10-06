@@ -77,3 +77,34 @@ The schedule, System 2, road choice, prepared-stock shelves, voice binding,
 render ladder, assembly, admission, sequencing, publication and receipts
 keep their current owners. System 3 decides nothing after the script
 freezes. See `SYSTEM3_DECISION_OWNERSHIP.md`.
+
+## Dialogue recovery
+
+The operator's choices `1A 2B 3A 4A 5A 6B` define the recovery policy:
+repair failed turns, rewrite, reroll instructions, then rebuild the exchange.
+Two consecutive occurrences of the same rejection mark an approach stuck.
+Each pass tries three distinct operations before a cooldown; the next pass
+continues with fresh recorded variations until the dialogue succeeds.
+Due recovery choices gain priority and alternate with other runnable work.
+Model admission deferrals do not count as rejected creative attempts.
+
+`dialogue_recovery.py` owns the persisted attempt, cooldown and scheduling
+decisions. `dialogue_repair.py` prepares one isolated candidate with at most
+one whole-exchange writing request per operation. System 3 records the actual
+prompt permutation, seed, operation, creative policy and rebuild ancestry.
+New plan revisions keep the original speakers, names, roles and voices, with
+unique turn and event identities for newly planned material.
+
+Randomness may change instruction wording/order and a free banter topic or
+structure. Grounded facts, caller/news/memo premises, character, protected exact
+copy and mandatory conclusions remain preserved. Rhyme, optional length targets
+and decorative style loosen progressively. Every candidate still passes the
+current plan's full turn-count and speaker-order checks and its ordinary review
+gates; an incomplete exchange never becomes ready stock.
+
+Recovery debt survives failed preparation and restarts. A changed approved
+script invalidates old recordings before it re-enters recording and playback.
+An unrecorded draft binding may reopen with ancestry recorded; committed ledger
+lines and speech already in flight remain immutable. Preparing valid words is
+an intermediate result: brief review and recording still determine whether
+the recovered dialogue can air.

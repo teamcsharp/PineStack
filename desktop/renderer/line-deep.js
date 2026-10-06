@@ -670,6 +670,7 @@
   /* ------------------------------------------------------------ the shell */
 
   function close() {
+    disposeS3Story();
     edits.length = 0;            // [#1231] the window is going; so are its fields
     if (s3FocusOpen && typeof s3FocusOpen.close === 'function') {   /* [s3-focus] */
       var focused = s3FocusOpen;
@@ -882,6 +883,7 @@
      * typing into out of the document with their words still in it. */
     if (editsBusy()) return;
     var body = box.querySelector('.ld-body');
+    disposeS3Story();
     body.replaceChildren();
 
     /* #1149: the panel a tapped road opens is the FIRST thing in the
@@ -892,9 +894,11 @@
     body.appendChild(make('div', 'ld-stage-host'));
 
     var stages = stageFacts(line, all);
+    var paintedBox = box;
     drawFlow(box.querySelector('.ld-canvas'), stages).then(function (made) {
+      if (box !== paintedBox) { if (made && made.stop) made.stop(); return; }
       scene = made;
-      if (!made) box.querySelector('.ld-flow').classList.add('flat');
+      if (!made) paintedBox.querySelector('.ld-flow').classList.add('flat');
     }, function () { scene = null; });
     stageBar(line, all, stages);
     canvasTaps(line, all, stages);
@@ -948,7 +952,13 @@
    * line's dice again and shows the running-order row it wrote and where
    * that row sits in the prompt (the provenance fetched above). */
   var s3Load = null;
+  var s3StoryView = null;
+  function disposeS3Story() {
+    if (s3StoryView && s3StoryView.dispose) s3StoryView.dispose();
+    s3StoryView = null;
+  }
   function s3Url(name) {
+    if (root.PINE_NATIVE_TOOLS && root.pineStationBase) return root.pineStationBase().replace(/\/$/, '') + name;
     try {
       if (/^https?:$/.test(location.protocol) && location.origin && location.origin !== 'null') {
         return location.origin + name;
@@ -959,21 +969,42 @@
     } catch (err) { /* older shell */ }
     return 'http://127.0.0.1:8096' + name;
   }
+  var s3Styles = null;
+  function loadS3() {
+    if (!s3Styles) {
+      if (root.PINE_NATIVE_TOOLS && root.pineDesktop.pipToolsAsset) {
+        s3Styles = root.pineDesktop.pipToolsAsset('/system3/system3.css?v=6').then(function (asset) {
+          var style = document.createElement('style');
+          style.setAttribute('data-pine-s3', ''); style.textContent = asset.text;
+          document.head.appendChild(style);
+        }).catch(function (err) { s3Styles = null; throw err; });
+      } else {
+        if (!document.querySelector('[data-pine-s3]')) {
+          var link = document.createElement('link'); link.rel = 'stylesheet';
+          link.href = s3Url('/system3/system3.css?v=6'); link.setAttribute('data-pine-s3', '');
+          document.head.appendChild(link);
+        }
+        s3Styles = Promise.resolve();
+      }
+    }
+    if (!s3Load) s3Load = Promise.all([s3Styles,
+      root.PINE_NATIVE_TOOLS && root.pineToolsImport
+        ? root.pineToolsImport('/system3/system3.js?v=8') : import(s3Url('/system3/system3.js?v=8'))
+    ]).then(function (loaded) { return loaded[1]; });
+    return s3Load;
+  }
   function s3Story(line, all) {
     var node = make('div', 'ld-s3', 'Reading System 3...');
-    if (!document.querySelector('link[data-pine-s3]')) {
-      var link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = s3Url('/system3/system3.css?v=6');
-      link.setAttribute('data-pine-s3', '');
-      document.head.appendChild(link);
-    }
     var prov = (all && all.prov) || {};
     var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=8'))).then(function (mod) {
+    loadS3().then(function (mod) {
       if (!node.isConnected) return null;
       return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
         lineId: String((line && line.id) || ''), prompt: prompt});
+    }).then(function (view) {
+      if (!view) return;
+      if (!node.isConnected) { if (view.dispose) view.dispose(); return; }
+      s3StoryView = view;
     })['catch'](function (err) {
       s3Load = null;
       node.textContent = 'System 3 could not be read here: ' + String((err && err.message) || err);
@@ -1004,14 +1035,7 @@
     var loaded = false;
     s3FocusOpen = {pending: true};
     if (btn) btn.disabled = true;
-    if (!document.querySelector('link[data-pine-s3]')) {
-      var link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = s3Url('/system3/system3.css?v=6');
-      link.setAttribute('data-pine-s3', '');
-      document.head.appendChild(link);
-    }
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=8'))).then(function (mod) {
+    loadS3().then(function (mod) {
       loaded = true;
       if (typeof mod.openSystem3Focus !== 'function') {
         throw new Error('this station\u2019s System 3 has no focused view yet');

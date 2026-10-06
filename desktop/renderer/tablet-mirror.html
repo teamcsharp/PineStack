@@ -19,7 +19,7 @@
     the WINDOW size   how big it is on this desk. Drag it, or use the
                       quarter/half/full-size buttons.
     the CAPTURE size  how many pixels the tablet actually sends - a third,
-                      a half, or all of them. This is what costs the tablet.
+                      a half, balanced, or all of them. This is what costs the tablet.
 -->
 <html lang="en">
 <head>
@@ -48,12 +48,14 @@
         <button class="res" data-size="third" type="button"
                 title="A third of the tablet's pixels">&frac13;</button>
         <button class="res" data-size="half" type="button"
-                title="Half of the tablet's pixels - the everyday setting">&frac12;</button>
+                title="Half of the tablet's pixels">&frac12;</button>
+        <button class="res" data-size="balanced" type="button"
+                title="Balanced detail: up to 960 pixels on the long edge, for a steadier connection. The opening default.">Balanced</button>
         <button class="res" data-size="full" type="button"
                 title="Every pixel the tablet has. Costs it the most work.">Full</button>
-        <!-- [mirror-pip-auto-off] Auto rests OFF: every open is full detail. -->
+        <!-- Auto rests OFF: every open starts at Balanced detail. -->
         <button id="autoRes" class="toggle" type="button"
-                title="Match the tablet's detail to the window size on its own. Off by default: the tablet sends full detail until asked.">Auto</button>
+                title="Match the tablet's detail to the window size on its own. Off by default: keeps the detail you choose.">Auto</button>
       </div>
 
       <!-- [mirror-quality] Bits per pixel, apart from Detail (how many

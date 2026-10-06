@@ -1,0 +1,22 @@
+﻿const {app,BrowserWindow}=require('electron'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),{pathToFileURL}=require('node:url');
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'pine-cloud-gazette-'));app.setPath('userData',dir);let win;const wait=ms=>new Promise(r=>setTimeout(r,ms));const deadline=setTimeout(()=>app.exit(1),55000);
+app.whenReady().then(async()=>{
+ const uri=n=>pathToFileURL(path.resolve(__dirname,'../desktop/renderer/'+n)).href,three=pathToFileURL(path.resolve(__dirname,'../desktop/vendor/three.module.js')).href;
+ const html=`<html><head><link rel="stylesheet" href="${uri('pine-pip.css')}"></head><body class="pine-pip pine-native-tools pip-popups-open"><section class="pip-popup-visible" id="gazetteFixture"><b>The Gazette</b><button title="Hourly press loading">clock</button></section><script>
+ window.settings={dj:{paper_hourly:true,keep:'original'},model:'writer'};window.writes=[];window.rows=[{id:'a',aired:'box',air_at:Date.now()/1000-60,text:'Neighbourhood water repairs bridge concert radio'}];
+ window.pineDesktop={get:async()=>structuredClone(settings),put:async(p,b)=>{writes.push(b);settings=b;return b}};
+ window.pineToolsImport=()=>import(${JSON.stringify(three)});
+ </script><script src="${uri('broadcast-words.js')}"></script><script src="${uri('broadcast-cloud.js')}"></script><script src="${uri('gazette-hourly.js')}"></script></body></html>`;
+ const file=path.join(dir,'index.html');fs.writeFileSync(file,html);win=new BrowserWindow({show:false,width:800,height:600,webPreferences:{offscreen:true,sandbox:false}});win.webContents.on("console-message",(_event,level,message)=>console.log("renderer",level,message));await win.loadFile(file);console.log("Fixture loaded");await wait(200);
+ assert.equal(await win.webContents.executeJavaScript("document.querySelector('[role=switch]').getAttribute('aria-checked')"),'true');
+ await win.webContents.executeJavaScript("document.querySelector('[role=switch]').click()");await wait(100);assert.equal(await win.webContents.executeJavaScript('settings.dj.paper_hourly'),false);
+ await win.webContents.executeJavaScript("document.querySelector('[role=switch]').click()");await wait(100);assert.equal(await win.webContents.executeJavaScript('settings.dj.paper_hourly'),true);assert.equal(await win.webContents.executeJavaScript('settings.dj.keep'),'original');
+ await win.webContents.executeJavaScript("(async()=>{document.getElementById('gazetteFixture').remove();window.scene=await PineBroadcastWordCloud.open({request:async()=>({rows})});scene.element.classList.add('pip-popup-visible');return true})()");await wait(1200);
+ const measure=()=>win.webContents.executeJavaScript("(()=>{const host=document.querySelector('#pineWin-cloud>.pine-win-host'),canvas=host.querySelector('canvas'),box=host.getBoundingClientRect();return {height:box.height,bottom:box.bottom,viewport:innerHeight,width:box.width,canvasWidth:canvas?.width,canvasHeight:canvas?.height,words:scene.state(),status:document.querySelector('.broadcast-cloud-status').textContent}})()");
+ let m=await measure();assert(m.height>400,'cloud fills content instead of 320px strip');assert(Math.abs(m.bottom-m.viewport)<8);assert(m.canvasHeight>=m.height);assert(m.words.total>0);assert(!m.status.includes('unavailable'));
+ const before=(await win.webContents.capturePage()).toPNG();await wait(1800);const after=(await win.webContents.capturePage()).toPNG();assert(!before.equals(after),'animation continuously moves without new speech');
+ win.setSize(500,800);await wait(400);m=await measure();assert(m.height>600);assert(m.canvasHeight>=m.height);assert(Math.abs(m.bottom-m.viewport)<8);
+ await win.webContents.executeJavaScript("rows.push({id:'b',aired:'stream',air_at:Date.now()/1000-1,text:'Water neighbourhood garden garden'});true");await wait(8300);assert.equal((await measure()).words.total,10);assert.equal((await measure()).words.lines,2);
+ await win.webContents.executeJavaScript('scene.close();true');assert.equal(await win.webContents.executeJavaScript("!!document.getElementById('pineWin-cloud')"),false);
+ console.log('Gazette radial switch and full-area live Word Cloud browser checks passed: On/Off/On, settings retained, resize, continuous animation, new aired words and cleanup.');win.destroy();clearTimeout(deadline);app.exit(0);
+}).catch(e=>{console.error(e);clearTimeout(deadline);app.exit(1)});

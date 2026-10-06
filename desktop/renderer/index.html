@@ -45,7 +45,10 @@
   <link rel="stylesheet" href="./msg-id.css"> <!-- [msgid] the message code chip -->
   <link rel="stylesheet" href="./three-full.css">
   <link rel="stylesheet" href="./busy.css">
+  <link rel="stylesheet" href="./system3-message-tile.css">
   <link rel="stylesheet" href="./script-page.css">
+  <link rel="stylesheet" href="./gazette-view.css">
+  <link rel="stylesheet" href="./book-mode.css">
   <link rel="stylesheet" href="./prompt-history.css">
   <link rel="stylesheet" href="./listen-music.css">
   <link rel="stylesheet" href="./terminal.css">
@@ -55,6 +58,7 @@
   <!-- #1263: the SFX guy's television. Mounted at BODY level so it floats
        over whatever view is showing rather than living inside one. -->
   <link rel="stylesheet" href="./sfx-tv.css">
+  <link rel="stylesheet" href="./supercut-review.css">
   <link rel="stylesheet" href="./pine-cam.css">
   <link rel="stylesheet" href="./clip-doctor.css">
   <!-- 2026-09-15 (#1178): the ladder behind the words "Pine Box". -->
@@ -843,6 +847,7 @@
   <script src="./terminal.js"></script>
   <script src="./sampler-engine.js"></script>
   <script src="./sampler-feed.js"></script>
+  <script src="./screen-export.js"></script>
   <!-- The air tap loads BEFORE the sampler: sampler.js reads PineAir at
        mount to light the SOLO PAD toggle and to start listening, and an
        undefined one there would leave the toggle dark and the ring empty. -->
@@ -933,12 +938,16 @@
   <script src="./script-stage.js"></script>
   <script src="./script.js"></script>
   <script src="./script-diagnostics.js"></script>
+  <script src="./book-mode.js"></script>
+  <script src="./system3-message-tile.js"></script>
+  <script src="./gazette-view.js"></script>
   <script src="./script-page.js"></script>
   <!-- Last: it looks for every global above and welds the tab rail on. -->
   <script src="./busy.js"></script>
   <script src="./three-full.js"></script>
   <script src="./line-deep.js"></script>
   <script src="./line-repeat.js"></script>
+  <script src="./supercut-review.js"></script>
   <script src="./ad-viewer.js"></script>
   <script src="./prompt-history.js"></script>
   <script src="./line-actions.js"></script>
@@ -958,6 +967,8 @@
        whatever is showing. -->
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
+  <link rel="stylesheet" href="./pinelens.css">
+  <script src="./pinelens.js"></script>
   <script src="./tech-drawer.js"></script>
   <!-- 2026-09-14: the hot corners. After rail.js: it adds its own tab to
        the rail when the rail is already up, and rail.js calls it when the
@@ -1048,5 +1059,13 @@
        "wherever somebody remembered". Loaded last so any view with a better
        menu of its own has already claimed its rows. -->
   <script src="./line-reach.js"></script>
+  <link rel="stylesheet" href="./pine-pip.css">
+  <script src="./pine-pip-popups.js"></script>
+  <script src="./playback-recovery.js"></script>
+  <script src="./pine-pip-shift.js"></script>  <!-- [pip-shift] the change between the app and PiP, as one move -->
+  <script src="./pine-pip.js"></script>
+  <script src="./pine-pip-camera-recovery.js"></script>
+  <link rel="stylesheet" href="./generated-media.css">
+  <script src="./generated-media.js"></script>
 </body>
 </html>

@@ -46,6 +46,8 @@ harmless default on any fault.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import math
 import json
 import random
 import re
@@ -103,6 +105,20 @@ GRAMMAR: tuple[dict[str, str], ...] = (
 )
 
 
+GRAMMAR += (
+    {"cmd": "{gazette}", "says": "an actual article from the current published Gazette issue"},
+    {"cmd": "{gazettetopic}", "says": "issue-bound Gazette participant, topic guidance, emotions and response order through System Three"},
+    {"cmd": "{book}", "says": "a real cached library title chosen for this occurrence; related book tokens use that title"},
+    {"cmd": "{booktopic}", "says": "a topic from the chosen book section; alone, chooses a random book source"},
+    {"cmd": "{bookchapter}", "says": "the selected book chapter or PDF section"},
+    {"cmd": "{booksegment}", "says": "the selected source section from this title, for discussion rather than a full read"},
+    {"cmd": "{booksentence}", "says": "one short exact source sentence from the selected title and section"},
+    {"cmd": "{booksentences}", "says": "a small set of short source sentences from the same selected title and section"},
+    {"cmd": "{sentence}", "says": "the sentence roulette focus; inside a book prompt, comes from that selected book section"},
+    {"cmd": "{stationname}", "says": "the station's configured on-air name"},
+)
+
+
 # --- the host --------------------------------------------------------------
 
 def install(host: dict[str, Any], data_dir: Any = None) -> None:
@@ -135,12 +151,56 @@ def kind_key(kind: Any) -> str:
     return str(kind or "").strip().lower()[:40]
 
 
+def config_row(raw: Any) -> dict[str, Any]:
+    """The small JSON-safe controls attached to a reusable content template."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("target_seconds", "min_seconds", "max_seconds"):
+        if key in raw:
+            try:
+                value = float(raw[key])
+                if math.isfinite(value):
+                    out[key] = round(max(0.0, min(3600.0, value)), 3)
+            except (TypeError, ValueError):
+                pass
+    for key in ("sponsor", "item", "station", "book_binding"):
+        if key in raw:
+            out[key] = str(raw[key] or "").strip()[:300]
+    for key in ("quotation_style", "discussion_share"):
+        if key in raw:
+            out[key] = str(raw[key] or "").strip()[:60]
+    for key in ("unique_book_each_segment", "source_only"):
+        if key in raw and isinstance(raw[key], bool):
+            out[key] = raw[key]
+    if "product_mode" in raw:
+        mode = str(raw.get("product_mode") or "mixed")
+        out["product_mode"] = mode if mode in {"mixed", "saved", "invented", "fixed", "random"} else "mixed"
+    if isinstance(raw.get("campaign_enabled"), bool):
+        out["campaign_enabled"] = raw["campaign_enabled"]
+    if isinstance(raw.get("products"), (list, tuple)):
+        from supercut_campaigns import clean_products
+        out["products"] = clean_products(raw["products"])
+    if isinstance(raw.get("starts_at_minutes"), (list, tuple)):
+        starts = []
+        for one in raw["starts_at_minutes"][:12]:
+            try:
+                number = float(one)
+                if math.isfinite(number) and 0 <= number < 60:
+                    starts.append(round(number, 3))
+            except (TypeError, ValueError):
+                pass
+        out["starts_at_minutes"] = starts
+    return out
+
+
 def _alt_row(raw: Any) -> dict[str, Any]:
     """One alternative, scrubbed.  {} when there are no words in it."""
     try:
         row = raw if isinstance(raw, dict) else {}
-        text = str(row.get("text") or "")[:TEXT_MOST]
-        if not text.strip():
+        text = str(row.get("text") or row.get("system_prompt") or "")[:TEXT_MOST]
+        generation = str(row.get("generation_prompt") or "")[:TEXT_MOST]
+        if not text.strip() and not generation.strip():
             return {}
         try:
             weight = max(1, min(WEIGHT_MAX, int(row.get("weight") or 1)))
@@ -159,6 +219,8 @@ def _alt_row(raw: Any) -> dict[str, Any]:
             "name": str(row.get("name") or "Untitled").strip()[:NAME_MOST]
                     or "Untitled",
             "text": text,
+            "generation_prompt": generation,
+            "config": config_row(row.get("config")),
             "weight": weight,
             "on": True if on is None else bool(on),
             "at": round(_num("at") or time.time(), 3),
@@ -356,6 +418,10 @@ def put_alternative(kind: Any, raw: Any) -> dict[str, Any]:
         found = next((a for a in alts if want and a["id"] == want), None)
         if found is not None:
             row["id"] = found["id"]
+            if "generation_prompt" not in (raw if isinstance(raw, dict) else {}):
+                row["generation_prompt"] = str(found.get("generation_prompt") or "")
+            if "config" not in (raw if isinstance(raw, dict) else {}):
+                row["config"] = config_row(found.get("config"))
             row["at"] = found.get("at") or row["at"]
             row["used"] = int(found.get("used") or 0)
             row["used_at"] = float(found.get("used_at") or 0)
@@ -384,7 +450,7 @@ def patch_alternative(kind: Any, aid: str, fields: dict[str, Any]) -> dict[str, 
     if not row or found is None:
         raise KeyError("no alternative %r on the %s shelf" % (want, key or "?"))
     merged = dict(found)
-    for name in ("name", "text", "weight", "on"):
+    for name in ("name", "text", "generation_prompt", "config", "weight", "on"):
         if name in (fields or {}):
             merged[name] = fields[name]
     merged["id"] = found["id"]
@@ -487,6 +553,8 @@ def dial_preview(kind: Any) -> dict[str, Any] | None:
         return None
     on = sum(1 for a in row["alternatives"] if a.get("on"))
     return {"id": pick["id"], "name": pick["name"], "text": pick["text"],
+            "generation_prompt": str(pick.get("generation_prompt") or ""),
+            "config": config_row(pick.get("config")),
             "mode": row["mode"], "of": on,
             "says": ("the “%s” alternative in the segment prompt "
                      "book - %s" % (pick["name"], mode_says(row)))}
@@ -656,7 +724,7 @@ def _plot() -> str:
         return ""
 
 
-def expand(text: str, kind: str, stamp: bool = True) -> tuple[str, list[dict[str, Any]]]:
+def _expand_commands(text: str, kind: str, stamp: bool = True) -> tuple[str, list[dict[str, Any]]]:
     """The grammar, applied.  Returns the text with every command replaced
     and one record per command saying what it became - or why it did not
     (a `miss`), because an instruction that quietly vanished is the kind
@@ -730,6 +798,68 @@ def expand(text: str, kind: str, stamp: bool = True) -> tuple[str, list[dict[str
     return out, expansions
 
 
+
+def _expand_book_fields(texts: list[str], kind: str, key: str, stamp: bool,
+                        config: Any = None) -> dict[str, Any]:
+    """One source draw for all fields; a preview never spends that draw."""
+    fallback = {"texts": list(texts), "expanded": [], "source": {}, "rolls": []}
+    fill = _h("expand_book_tokens")
+    if not callable(fill):
+        return fallback
+    try:
+        kwargs = {"kind": kind_key(kind), "key": str(key or ""), "stamp": bool(stamp)}
+        try:
+            parameters = inspect.signature(fill).parameters
+            has_config = "config" in parameters or any(
+                one.kind == inspect.Parameter.VAR_KEYWORD for one in parameters.values())
+        except (TypeError, ValueError):
+            has_config = True
+        if has_config:
+            kwargs["config"] = config_row(config)
+        result = fill(list(texts), **kwargs)
+        if not isinstance(result, dict):
+            return fallback
+        words = result.get("texts")
+        if not isinstance(words, (list, tuple)) or len(words) != len(texts):
+            return fallback
+        return {"texts": [str(word or "") for word in words],
+                "expanded": [dict(row) for row in (result.get("expanded") or [])
+                             if isinstance(row, dict)],
+                "source": dict(result.get("source") or {})
+                          if isinstance(result.get("source"), dict) else {},
+                "rolls": [dict(row) for row in (result.get("rolls") or [])
+                          if isinstance(row, dict)]}
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def expand(text: str, kind: str, stamp: bool = True, key: str = "", config: Any = None
+           ) -> tuple[str, list[dict[str, Any]]]:
+    """Expand a single prompt; book tokens share one title and passage."""
+    out, records = _expand_commands(text, kind, stamp=stamp)
+    books = _expand_book_fields([out], kind, key, stamp, config)
+    return books["texts"][0], records + books["expanded"]
+
+
+def expand_pair(system_prompt: str, generation_prompt: str, kind: str,
+                key: str = "", stamp: bool = False, config: Any = None) -> dict[str, Any]:
+    """Resolve both editable prompt fields against one occurrence source."""
+    words, records = [], []
+    for text in (system_prompt, generation_prompt):
+        out, one = _expand_commands(str(text or ""), kind, stamp=stamp)
+        words.append(out)
+        records.extend(one)
+    books = _expand_book_fields(words, kind, key, stamp, config)
+    system, generation = books["texts"]
+    text = system
+    if generation.strip():
+        text += ("\n\n" if text.strip() else "") + "GENERATION PROMPT:\n" + generation
+    return {"system_prompt": system, "generation_prompt": generation,
+            "text": text, "expanded": records + books["expanded"],
+            "source": books["source"], "rolls": books["rolls"],
+            "config": config_row(config)}
+
+
 # --- the one road the writing room takes --------------------------------------
 
 def memo_key(kind: Any, slot_id: Any = "", occurrence: Any = "") -> str:
@@ -749,6 +879,9 @@ def _compact(rec: dict[str, Any], words: bool = True) -> dict[str, Any]:
            "name": rec.get("name", ""), "mode": rec.get("mode", ""),
            "of": rec.get("of", 0), "source": rec.get("source", ""),
            "at": rec.get("at", 0.0),
+           "config": config_row(rec.get("config")),
+           "book_source": dict(rec.get("book_source") or {}),
+           "book_rolls": [dict(r) for r in (rec.get("book_rolls") or [])],
            "expanded": [dict(e) for e in (rec.get("expanded") or [])][:8]}
     if words:
         out["instruction"] = str(rec.get("text") or "")[:600]
@@ -772,6 +905,7 @@ def govern(kind: Any, text: str, key: str, dial: bool = True,
     row = entry(kind) if dial else None
     pick = None
     source = "shelf" if text.strip() else "none"
+    generation, config = "", {}
     if row:
         try:
             with _LOCK:
@@ -782,9 +916,12 @@ def govern(kind: Any, text: str, key: str, dial: bool = True,
             pick = None
         if pick:
             text = str(pick.get("text") or "")
+            generation = str(pick.get("generation_prompt") or "")
+            config = config_row(pick.get("config"))
             source = "alternative"
-    out, expansions = expand(text, kind, stamp=stamp)
-    if not pick and not expansions:
+    filled = expand_pair(text, generation, kind, key=key, stamp=stamp, config=config)
+    out, expansions = filled["text"], filled["expanded"]
+    if not pick and not expansions and not filled["source"] and not filled["rolls"]:
         return out                          # nothing happened: no paperwork
     rec = {"at": round(time.time(), 3), "kind": kind, "key": key,
            "alt": str(pick["id"]) if pick else "",
@@ -793,6 +930,10 @@ def govern(kind: Any, text: str, key: str, dial: bool = True,
            "of": (sum(1 for a in row["alternatives"] if a.get("on"))
                   if row else 0),
            "source": source, "expanded": expansions,
+           "book_source": filled["source"], "book_rolls": filled["rolls"],
+           "system_prompt": filled["system_prompt"],
+           "generation_prompt": filled["generation_prompt"],
+           "config": filled["config"],
            "needle": _needle(out), "text": out, "input": finger}
     if stamp:
         _MEMO[key] = rec
@@ -805,6 +946,17 @@ def govern(kind: Any, text: str, key: str, dial: bool = True,
         except Exception:  # noqa: BLE001
             pass
     return out
+
+
+def occurrence_view(kind: Any, key: str) -> dict[str, Any] | None:
+    """The already chosen fields and controls; no editor peek or fresh draw."""
+    rec = _MEMO.get(str(key or ""))
+    if not rec or rec.get("kind") != kind_key(kind):
+        return None
+    return _compact(rec) | {
+        "key": str(key or ""), "text": str(rec.get("text") or ""),
+        "system_prompt": str(rec.get("system_prompt") or ""),
+        "generation_prompt": str(rec.get("generation_prompt") or "")}
 
 
 def find_in(prompt: str) -> dict[str, Any] | None:
@@ -875,6 +1027,9 @@ def for_sid(sid: str) -> dict[str, Any] | None:
         return {"alt": rec.get("alt", ""), "name": rec.get("name", ""),
                 "mode": rec.get("mode", ""), "of": rec.get("of", 0),
                 "source": rec.get("source", ""),
+                "config": config_row(rec.get("config")),
+                "book_source": dict(rec.get("book_source") or {}),
+                "book_rolls": [dict(r) for r in (rec.get("book_rolls") or [])],
                 "docs": [str(e.get("doc") or "") for e in (rec.get("expanded") or [])
                          if e.get("doc")][:6],
                 "cmds": [str(e.get("cmd") or "") for e in (rec.get("expanded") or [])][:8]}

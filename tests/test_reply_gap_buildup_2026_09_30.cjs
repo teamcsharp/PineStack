@@ -11,15 +11,16 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 
 const root = path.join(__dirname, '..');
-const src = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const src = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8').replace(/\r\n/g, '\n');
 const py = fs.readFileSync(path.join(root, 'reply_gap.py'), 'utf8');
+const sharedTile = require(path.join(root, 'desktop/renderer/system3-message-tile.js'));
+const sharedSource = fs.readFileSync(path.join(root, 'desktop/renderer/system3-message-tile.js'), 'utf8');
+const engineSource = src + '\n' + sharedSource;
 const convs = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures_reply_gap_buildup.json'), 'utf8'));
 
 // 1. The numbers.
-const m = /var MV_BUILD = (\{[\s\S]*?\});/.exec(src);
-assert(m, 'MV_BUILD in the page');
-// eslint-disable-next-line no-new-func
-const B = new Function('return ' + m[1])();
+const B = sharedTile.BUILD;
+assert(src.includes('var MV_BUILD = root.PineSystem3MessageTile.BUILD;'), 'the feed uses the shared timing contract');
 const num = name => Number((new RegExp('^' + name + ' = ([0-9.]+)', 'm').exec(py) || [])[1]);
 const tup = name => (new RegExp('^' + name + ' = \\(([^)]*)\\)', 'm').exec(py) || [])[1].split(',').map(Number);
 assert.strictEqual(B.per, num('BUILD_PER_MS'));
@@ -38,12 +39,12 @@ assert.strictEqual(B.hold, num('BUILD_HOLD_MS'));
 //    scheduled buildup rolls at the contract's pace and is fitted to it.
 for (const needle of ['T.dIn = per * 0.08;', 'T.dDie = per * (two ? 0.12 : 0.18);', 'T.dSpin = per * (two ? 0.27 : 0.6);',
   'T.dPop = per * 0.06;', 'T.dDie2 = two ? per * 0.12 : 0;', 'T.dSpin2 = two ? per * 0.27 : 0;',
-  'T.dPop2 = two ? per * 0.06 : 0;', 'T.dFail = T.r.failed ? 420 : 0;', 'at = T.end + 40;',
-  "return {box: box, tables: tables, rolled: at, total: at + 1500, now: ''};",
-  'if (fit && fit.ms > 0) per = MV_BUILD.per;', 'if (fit && fit.ms > 0) at = mvBuildFit(tables, fit.from || 0, fit.ms, at);']) {
-  assert(src.includes(needle), 'the sheet: ' + needle);
+  'T.dPop2 = two ? per * 0.06 : 0;', 'T.dFail = T.r.failed ? 420 : 0;', 'at = T.end + MV_BUILD.between;',
+  "return {box: box, rows: recorded, tables: tables, rolled: at, total: at + MV_BUILD.hold, now: '', elapsed: 0};",
+  'if (fit && fit.ms > 0) per = MV_BUILD.per;', 'if (fit && fit.ms > 0) at = mvBuildFit(tables, Math.max(from, Number(fit.from) || 0), fit.ms, at);']) {
+  assert(engineSource.includes(needle), 'the sheet: ' + needle);
 }
-assert(/return n \? Math\.min\(per \* 0\.4, 260 \* n \+ 140\) : 0;/.test(src), 'the rejected rolls\' time');
+assert(/return n \? Math\.min\(per \* 0\.4, 260 \* n \+ 140\) : 0;/.test(engineSource), 'the rejected rolls\' time');
 assert(src.includes('var RR_REJ_MAX = 6;'));
 
 // 3. The page's tables, off the real records.
@@ -52,9 +53,11 @@ const grab = name => {
   assert(g, 'missing ' + name);
   return g[0];
 };
-const names = ['mvStageOf', 'mvReel', 'mvDecisionRow', 'mvRrRejOf', 'mvRrVerdicts', 'mvRrFailed', 'mvMerge', 'mvBuildFit'];
+const names = ['mvStageOf', 'mvReel', 'mvDecisionRow', 'mvRrRejOf', 'mvRrVerdicts', 'mvRrFailed', 'mvMerge'];
 // eslint-disable-next-line no-new-func
-const page = new Function('RR_REJ_MAX', 'MV_BUILD', names.map(grab).join('') + 'return {' + names.map(n => n + ': ' + n).join(', ') + '};')(6, B);
+const page = {mvStageOf:sharedTile.stageOf,mvReel:sharedTile.reel,mvDecisionRow:sharedTile.decisionRow,
+  mvRrRejOf:sharedTile.rejected,mvRrVerdicts:sharedTile.verdicts,mvRrFailed:sharedTile.failed};
+page.mvBuildFit = sharedTile.createRenderer().buildFit;
 const rejMs = n => (n ? Math.min(B.per * B.rejCap, B.rejEach * n + B.rejBase) : 0);
 const tableMs = t => B.per * (t.sub ? B.two : B.one).reduce((a, b) => a + b, 0)
   + rejMs(t.rej) + (t.sub ? rejMs(t.rej2) : 0) + (t.failed ? B.fail : 0);
@@ -135,11 +138,11 @@ assert(tables >= 10, 'enough tables to mean something: ' + tables);
 }
 
 // 6. The card engine: the next card builds first, starts buildup ms before
-//    its words, its height is reserved, its tally stays under the words.
+//    its words, its reels keep their geometry, its tally stays under the words.
 for (const needle of ['function mvBubbleStart(item, redraw, pre) {', 'cur.t0 = pre.audioAt - pre.ms;',
   'cur.buildFit = {ms: pre.ms, from: 0};', 'cur.keepRolls = true;', 'if (cur.sheet) mvRrReserve(cur.sheet);',
   'cur.accEnd = Math.max(cur.accEnd, cur.preroll.ms);', 'var mvUp = mvUpcomingNow(now);',
-  'mvBubbleStart(mvUp.item, false, mvUp);', "host.buildFit = cur.preroll ? {ms: cur.preroll.ms, from: from} : null;"]) {
+  'mvBubbleStart(mvUp.item, false, mvUp);', "host.buildFit = cur.preroll ? {ms: cur.preroll.ms, from: existing ? sheet.tables.length : 0} : null;"]) {
   assert(src.includes(needle), 'the card engine: ' + needle);
 }
 console.log('reply-gap buildup contract: ok (' + tables + ' tables on ' + pageSpecs.length + ' turns)');

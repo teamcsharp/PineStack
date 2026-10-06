@@ -37,6 +37,19 @@ parse = _parser()
 
 
 class ScreenOrders(unittest.TestCase):
+    def test_pinepip_display_has_its_own_export_target(self):
+        for text in ('export the last five minutes of the pinepip display',
+                     'export the last 5 minutes of Pine PiP',
+                     'save the last 5 minutes of pine-pip'):
+            self.assertEqual(parse(text), {'seconds': 300, 'screen': 'pip'})
+
+    def test_pine_lens_history_is_a_distinct_computer_recording(self):
+        for said in ("export the last five minutes of pine lens",
+                     "Export the last 2 minutes of the PineLens.",
+                     "export the last 30 seconds of pine-lens"):
+            seconds = 30 if "30 seconds" in said else 120 if "2 minutes" in said else 300
+            self.assertEqual(parse(said), {"seconds": seconds, "screen": "lens"})
+
     def test_the_pine_tab(self):
         self.assertEqual(parse("export the last 5 minutes of the pine tab"), {"seconds": 300, "screen": "tab"})
         self.assertEqual(parse("Export the last two minutes of the PineTab."), {"seconds": 120, "screen": "tab"})
@@ -107,13 +120,48 @@ class ScreenOrders(unittest.TestCase):
         self.assertIsNone(parse("why does the pine tab export the last five minutes so slowly?"))
 
 
+class ProgressOwnership(unittest.TestCase):
+    def test_every_progress_stage_keeps_the_export_target(self):
+        import threading
+        import types
+        start = SRC.index("def export_progress()")
+        end = SRC.index("\ndef export_screen_public()", start)
+        node = ast.parse(SRC[start:end]).body[0]
+        row = {"target": "pip", "name": "clip.mp4", "seconds": 600, "at": 990}
+        uploads = {}
+        placed = []
+        ns = {"Any": Any, "time": types.SimpleNamespace(time=lambda: 1000),
+              "_SCREEN_EXPORT_LOCK": threading.Lock(), "_SCREEN_EXPORT": row,
+              "_EXPORT_UPLOADS": uploads, "SCREEN_EXPORT_NAMES": {"pip": "PinePiP"},
+              "SCREEN_EXPORT_LIFE": 600, "_screen_export_minutes": str,
+              "courier_read": lambda: placed, "export_desk_dir": lambda: "exports"}
+        exec(compile(ast.Module([node], []), "app.py", "exec"), ns)
+        progress = ns["export_progress"]
+        def check(stage):
+            got = progress()
+            self.assertEqual(got["stage"], stage)
+            self.assertEqual(got["target"], "pip")
+        check("asked")
+        row.update(claimed_by="pip", claimed_at=995)
+        check("cutting")
+        uploads["clip.mp4"] = {"got": 50, "total": 100}
+        check("uploading")
+        row.update(done=True, result={"ok": True})
+        check("owed")
+        placed.append({"name": "clip.mp4", "state": "placed", "done_at": 999})
+        check("placed")
+        row["result"] = {"ok": False, "detail": "failed"}
+        check("failed")
+
+
 class TheRoad(unittest.TestCase):
     def test_the_order_rides_the_state_and_the_panel_answers_it(self):
         self.assertIn('base["screen_export"] = export_screen_public()', SRC)
         self.assertIn('@app.post("/api/export/screen/claim")', SRC)
         self.assertIn('@app.post("/api/export/screen/done")', SRC)
         self.assertIn("try { screenExportWatch(state); }", SRC)
-        self.assertIn("desk.replayExport({seconds: claim.seconds, upload: true, name: claim.name})", SRC)
+        self.assertIn("desk.replayExport({seconds: claim.seconds, upload: true, name: claim.name,", SRC)
+        self.assertIn('view: order.target === "pip" ? "pip" : "app", require_audio: true', SRC)
         self.assertIn('if cmd.get("screen"):', SRC)
 
     def test_the_cam_order_has_its_own_runner(self):

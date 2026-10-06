@@ -1,0 +1,24 @@
+﻿const {app,BrowserWindow}=require('electron'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),{pathToFileURL}=require('node:url');
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'pine-entry-replay-'));app.setPath('userData',dir);let win;const wait=ms=>new Promise(r=>setTimeout(r,ms)),deadline=setTimeout(()=>app.exit(1),40000);
+app.whenReady().then(async()=>{
+ const uri=n=>pathToFileURL(path.resolve(__dirname,'../desktop/renderer/'+n)).href;
+ const event=(id,family,turn,index)=>({event_id:id,family,turn_id:turn,turn_index:index,stages:[{stage:'item',selected:'b',draw:{dice:72},candidates:[{id:'a',label:'First',weight:1},{id:'b',label:'Landed',weight:1}]}],selected:{id:'b',label:'Landed'}});
+ const conv={turns:[{turn_id:'t0',index:0},{turn_id:'t1',index:1},{turn_id:'t2',index:2}],decision_events:[event('root','TOPIC','',-1),event('prior','GRAPH','t0',0),event('chosen','RS','t1',1),event('future','SFX','t2',2)]};
+ const file=path.join(dir,'index.html');
+ const html='<html><body><div class="scp-dia" id="sp-ln-line1">This is the actual aired line.</div><div class="scp-ctl"><button>provenance</button></div><div class="scp-dia scp-ins" id="sp-ln-insert">An operator note.</div><div class="scp-ctl"></div><script>window.PINE_NATIVE_TOOLS=true;window.conv='+JSON.stringify(conv)+';window.calls=[];window.pineDesktop={get:async p=>{calls.push(p);return p.includes("/origin/")?{nodes:[{node:"conversation",conversation_id:"c1",turn_id:"t1"}]}:conv;}};</script><script src="'+uri('system3-entry-replay.js')+'"></script></body></html>';
+ fs.writeFileSync(file,html);
+ win=new BrowserWindow({show:false,width:900,height:700,webPreferences:{offscreen:true,sandbox:false}});win.webContents.on('console-message',(_e,_l,m)=>{if(/Error/.test(m))console.log(m)});await win.loadFile(file);
+ assert.equal(await win.webContents.executeJavaScript("document.querySelectorAll('.scp-system3-replay').length"),1);
+ await win.webContents.executeJavaScript("document.querySelector('.scp-system3-replay').click()");await wait(500);
+ let state=await win.webContents.executeJavaScript("({requests:calls,rows:document.querySelector('.pip-system3-message')?.dataset.rows,scope:document.querySelector('[aria-label=\"Replay scope\"]').value})");
+ assert.deepEqual(state.requests,['/api/system3/origin/line1','/api/system3/conversation/c1']);assert.equal(state.rows,'3');assert.equal(state.scope,'conversation');
+ await win.webContents.executeJavaScript("window.firstRoll=document.querySelector('.sp-rr-t');true");await wait(10500);
+ assert.equal(await win.webContents.executeJavaScript("document.querySelector('.pip-system3-words').textContent"),'This is the actual aired line.');
+ assert.equal(await win.webContents.executeJavaScript("firstRoll===document.querySelector('.sp-rr-t')"),true);
+ await win.webContents.executeJavaScript("document.querySelector('.sp-rr-wheel').click()");assert.equal(await win.webContents.executeJavaScript("!!document.getElementById('spRrPop')"),true);
+ await win.webContents.executeJavaScript("document.getElementById('spRrPop').click()");assert.equal(await win.webContents.executeJavaScript("!!document.getElementById('spRrPop')"),false);
+ await win.webContents.executeJavaScript("const scope=document.querySelector('[aria-label=\"Replay scope\"]');scope.value='line';scope.dispatchEvent(new Event('change'));true");await wait(100);
+ assert.equal(await win.webContents.executeJavaScript("document.querySelector('.pip-system3-message').dataset.rows"),'2');assert.equal(await win.webContents.executeJavaScript('calls.length'),2);
+ await win.webContents.executeJavaScript("document.querySelector('.sp-rr-wheel').click()");assert.equal(await win.webContents.executeJavaScript("!!document.getElementById('spRrPop')"),true);await win.webContents.executeJavaScript("document.querySelector('.scp-system3-replay').click()");assert.equal(await win.webContents.executeJavaScript("!!document.querySelector('.s3-entry-rollout')||!!document.getElementById('spRrPop')"),false);
+ console.log('Selected-entry replay passed: correct recording, no future turns, stable reels, typed aired text, popups, scope switching and cleanup.');win.destroy();clearTimeout(deadline);app.exit(0);
+}).catch(e=>{console.error(e);clearTimeout(deadline);app.exit(1)});

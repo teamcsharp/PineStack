@@ -7,9 +7,10 @@ segment occurrence receive the same dice results on repeated prompt reads.
 from __future__ import annotations
 
 from typing import Any
+import system3_reply
 
 
-TYPES = {"initiator", "reply", "rebuttal", "topic_change", "call", "decision", "end", "protocol"}
+TYPES = {"initiator", "reply", "rebuttal", "topic_change", "call", "decision", "end", "protocol", "book_reader"}
 DEFAULT_MOODS = [
     "takes the point seriously", "feels challenged by the argument",
     "reconsiders part of their position", "pushes back on the premise",
@@ -53,6 +54,12 @@ def normalize(raw: Any) -> dict[str, Any]:
             "id": ident, "type": kind,
             "label": _text(item.get("label"), 80) or kind.replace("_", " ").title(),
             "speaker": _text(item.get("speaker"), 60),
+            **({"readers": [r for r in items(item.get("readers") or ["host", "cohost", "third"], 6)
+                            if r in ("host", "cohost", "third", "sfx", "manager", "caller")],
+                "routing": _text(item.get("routing"), 20) if item.get("routing") in ("single", "sequential", "roulette") else "sequential",
+                "weights": {r: _number((item.get("weights") or {}).get(r), 1, 0, 100)
+                            for r in ("host", "cohost", "third", "sfx", "manager", "caller")}}
+               if kind == "book_reader" else {}),
             "protocol_road": _text(item.get("protocol_road"), 40),
             "respond_to": _text(item.get("respond_to"), 64),
             "topic": _text(item.get("topic"), 200),
@@ -104,6 +111,7 @@ def normalize(raw: Any) -> dict[str, Any]:
         start = next((node["id"] for node in nodes if node["type"] == "initiator"),
                      nodes[0]["id"] if nodes else "")
     return {"nodes": nodes, "edges": edges, "start": start,
+            "reply_roulette": system3_reply.normalize(source.get("reply_roulette")),
             "enabled": bool(source.get("enabled", False)),
             "topic_options": [_text(x, 120) for x in items(source.get("topic_options"), 30)
                               if _text(x, 120)],

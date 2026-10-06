@@ -221,6 +221,177 @@
     return wrap;
   }
 
+  /* Named dynamic templates retain both prompts and their content controls. */
+  function dynamicBlock(kind, row, reload) {
+    var wrap = el('div', 'pseg-kind pseg-dynamic');
+    var head_ = el('button', 'pseg-kind-head');
+    head_.type = 'button';
+    head_.appendChild(el('span', 'pseg-kind-name', kind === 'book_time' ? 'Book Time' : 'Station supercut'));
+    head_.appendChild(el('span', 'pseg-kind-sum', row.says || 'saved templates'));
+    var body = el('div', 'pseg-kind-body');
+    body.hidden = true;
+    head_.setAttribute('aria-expanded', 'false');
+    head_.addEventListener('click', function () {
+      body.hidden = !body.hidden;
+      head_.setAttribute('aria-expanded', String(!body.hidden));
+      wrap.classList.toggle('open', !body.hidden);
+    });
+    wrap.appendChild(head_); wrap.appendChild(body);
+    var alts = row.alternatives || [];
+    var controls = el('div', 'pseg-dynamic-controls');
+    var select = el('select', 'pseg-field');
+    select.setAttribute('aria-label', 'Recall a ' + kind + ' template');
+    alts.forEach(function (a) {
+      var op = el('option', '', a.name || 'Untitled'); op.value = a.id; select.appendChild(op);
+    });
+    var mode = el('select', 'pseg-field');
+    mode.setAttribute('aria-label', 'Template selection mode');
+    [['fixed', 'Use selected template'], ['cycle', 'Cycle templates'], ['random', 'Weighted roulette']].forEach(function (r) {
+      var op = el('option', '', r[1]); op.value = r[0]; mode.appendChild(op);
+    });
+    mode.value = row.mode === 'cycle' || row.mode === 'random' ? row.mode : 'fixed';
+    controls.appendChild(select); controls.appendChild(mode); body.appendChild(controls);
+    function field(label, tag, value, rows) {
+      var lab = el('label', 'pseg-field-label', label);
+      var input = el(tag || 'input', tag === 'textarea' ? 'pseg-text' : 'pseg-field');
+      input.value = value || '';
+      if (rows) input.rows = rows;
+      lab.appendChild(input); body.appendChild(lab); return input;
+    }
+    var name = field('Template name', 'input', '');
+    var sys = field('System prompt', 'textarea', '', 7);
+    var gen = field('Generation prompt', 'textarea', '', 7);
+    var target = field('Length in seconds', 'input', ''); target.type = 'number'; target.step = '1';
+    target.min = kind === 'book_time' ? '300' : '30'; target.max = kind === 'book_time' ? '600' : '60';
+    var times = field('Minutes past each hour', 'input', '');
+    var subject = field(kind === 'book_time' ? 'Book title or ID (blank for roulette)' : 'Item or station to promote', 'input', '');
+    var weight = field('Template roulette weight', 'input', '1'); weight.type = 'number'; weight.min = '0'; weight.step = '0.1';
+    var enabled = el('label', 'pseg-field-label pseg-check');
+    var on = el('input'); on.type = 'checkbox'; enabled.appendChild(on);
+    enabled.appendChild(root.document.createTextNode(' Include this template')); body.appendChild(enabled);
+    body.appendChild(el('p', 'pseg-lead', kind === 'book_time'
+      ? '{book} {booktopic} {bookchapter} {booksegment} {booksentence} {booksentences} share one title. {sentence} selects a short quote in Book Time. Use {book:Title} to bind a title and {stationname} for the station.'
+      : 'The spot uses existing clips. Preview the cut list, then render its audio to hear the montage.'));
+    var current = null;
+    function recall(id) {
+      current = alts.filter(function (a) { return a.id === id; })[0] || alts[0] || {};
+      select.value = current.id || '';
+      var cfg = current.config || {};
+      name.value = current.name || ''; sys.value = current.text || ''; gen.value = current.generation_prompt || '';
+      target.value = cfg.target_seconds || (kind === 'book_time' ? 450 : 45);
+      times.value = (cfg.starts_at_minutes || (kind === 'book_time' ? [15, 45] : [58])).join(', ');
+      subject.value = kind === 'book_time' ? cfg.book_binding || '' : cfg.item || cfg.sponsor || 'Pine Box FM';
+      weight.value = typeof current.weight === 'number' ? current.weight : 1; on.checked = current.on !== false;
+    }
+    select.addEventListener('change', function () { recall(select.value); });
+    recall(row.next && row.next.id || '');
+    function payload(fresh) {
+      var cfg = Object.assign({}, current.config || {});
+      cfg.target_seconds = Number(target.value);
+      cfg.min_seconds = kind === 'book_time' ? 300 : 30;
+      cfg.max_seconds = kind === 'book_time' ? 600 : 60;
+      cfg.starts_at_minutes = times.value.split(',').map(Number).filter(function (n) { return isFinite(n) && n >= 0 && n < 60; });
+      if (kind === 'book_time') cfg.book_binding = subject.value.trim();
+      else { cfg.item = subject.value.trim(); cfg.sponsor = subject.value.trim(); cfg.source_only = true; }
+      return {id: fresh ? undefined : current.id, name: name.value, text: sys.value,
+        generation_prompt: gen.value, weight: Number(weight.value), on: on.checked, config: cfg};
+    }
+    var bar = el('div', 'pseg-bar pseg-dynamic-bar'); body.appendChild(bar);
+    function button(label, action) {
+      var b = el('button', 'pseg-save', label); b.type = 'button';
+      b.addEventListener('click', function () {
+        b.disabled = true;
+        Promise.resolve().then(action).then(function (r) {
+          if (!r || r.ok === false) note(body, r && (r.why || r.detail) || 'The station could not complete that action.');
+        }).catch(function (err) { note(body, String(err && err.message || err)); })
+          .then(function () { b.disabled = false; });
+      }); bar.appendChild(b); return b;
+    }
+    function save(fresh) {
+      var data = payload(fresh);
+      if (!data.name.trim() || !data.text.trim() || !data.generation_prompt.trim()) throw new Error('Name the template and enter both prompts.');
+      if (!(data.config.target_seconds >= Number(target.min) && data.config.target_seconds <= Number(target.max))) throw new Error('Choose a length between ' + target.min + ' and ' + target.max + ' seconds.');
+      return send('POST', '/api/segment/prompts/' + kind + '/alternative', data).then(function (r) {
+        if (r && r.ok) {
+          current = r.alternative; alts = r.book.alternatives || alts;
+          select.textContent = '';
+          alts.forEach(function (a) { var op = el('option', '', a.name); op.value = a.id; select.appendChild(op); });
+          recall(current.id); note(body, 'Saved. Use this template to select it for upcoming segments.');
+        } return r;
+      });
+    }
+    button('Save', function () { return save(false); });
+    button('Save as new', function () { return save(true); });
+    button('Use this template', function () {
+      return send('POST', '/api/segment/prompts/' + kind + '/mode', {mode: mode.value === 'fixed' ? 'fixed:' + current.id : mode.value})
+        .then(function (r) { if (r && r.ok) { head_.querySelector('.pseg-kind-sum').textContent = r.says; note(body, r.says + '. Upcoming writing uses this setting.'); } return r; });
+    });
+    var preview = el('div', 'pseg-dynamic-preview'); body.appendChild(preview);
+    var lastPlan = '';
+    function show(result) {
+      preview.textContent = '';
+      if (!result) return;
+      if (result.ok === false) { preview.appendChild(el('p', 'pseg-note', result.why || 'No usable source is available.')); return; }
+      var source = result.source || {};
+      if (source.title) preview.appendChild(el('strong', '', source.title + (source.chapter ? ' / ' + source.chapter : '')));
+      if (result.system_prompt || result.generation_prompt) {
+        preview.appendChild(el('pre', 'pseg-preview-text', (result.system_prompt || '') + '\n\n' + (result.generation_prompt || '')));
+      }
+      if (result.clips) {
+        lastPlan = result.id;
+        preview.appendChild(el('p', 'pseg-note', result.clips.length + ' source cuts / ' + Number(result.seconds).toFixed(1) + ' seconds'));
+        var list = el('ol', 'pseg-cuts');
+        result.clips.forEach(function (cut) {
+          list.appendChild(el('li', '', Number(cut.at || 0).toFixed(1) + 's ' + cut.role + ': ' + (cut.said || cut.transcript || cut.text || cut.name || cut.sid)
+            + ' [' + Number(cut.from_s).toFixed(2) + '-' + Number(cut.until_s).toFixed(2) + 's]'));
+        }); preview.appendChild(list);
+      }
+      if (result.rolls || result.source || result.coverage) {
+        var details = el('details', 'pseg-source-details'); details.appendChild(el('summary', '', 'Source and roulette choices'));
+        details.appendChild(el('pre', 'pseg-preview-text', JSON.stringify({source: result.source, rolls: result.rolls, coverage: result.coverage, clips: result.clips, warnings: result.warnings}, null, 2)));
+        preview.appendChild(details);
+      }
+    }
+    button(kind === 'book_time' ? 'Preview source and prompts' : 'Preview cut list', function () {
+      var data = payload(false);
+      var path = kind === 'book_time' ? '/api/dynamic-segments/book_time/preview' : '/api/sfx/supercut/plan';
+      if (kind !== 'book_time') data.prompt = data.text + '\n\n' + data.generation_prompt;
+      return send('POST', path, data).then(function (r) { show(r); return r; });
+    });
+    if (kind === 'sfx_supercut') button('Render preview audio', function () {
+      if (!lastPlan) throw new Error('Preview the cut list first.');
+      return send('POST', '/api/sfx/supercut/render', {plan_id: lastPlan}).then(function (r) {
+        if (r && r.ok && r.clip) {
+          var audio = el('audio'); audio.controls = true; audio.preload = 'none';
+          var media = r.media || {};
+          audio.src = where() + (media.path || '/media/' + encodeURIComponent(r.clip))
+            + (media.sig ? '?sig=' + encodeURIComponent(media.sig) : '');
+          preview.appendChild(audio); note(body, 'Rendered from existing source audio.');
+        } return r;
+      });
+    });
+    return wrap;
+  }
+
+  function dynamicPane(host, reload) {
+    host.appendChild(el('div', 'pseg-loading', 'Reading dynamic segment templates...'));
+    get('/api/dynamic-segments').then(function (data) {
+      host.textContent = '';
+      if (!data) { host.appendChild(el('div', 'pseg-note', 'Dynamic segment controls are waiting for the station update.')); return; }
+      var kinds = data.kinds || {};
+      ['book_time', 'sfx_supercut'].forEach(function (kind) { if (kinds[kind]) host.appendChild(dynamicBlock(kind, kinds[kind], reload)); });
+      var schedule = el('div', 'pseg-bar pseg-schedule-dynamic');
+      schedule.appendChild(el('p', 'pseg-lead', 'Book Time: :15 and :45, 5-10 minutes. Station supercut: :58, 30-60 seconds. Changes apply to future hours.'));
+      var apply = el('button', 'pseg-save', 'Apply saved timings to future hours'); apply.type = 'button';
+      apply.addEventListener('click', function () {
+        apply.disabled = true;
+        send('POST', '/api/dynamic-segments/activate', {}).then(function (r) {
+          note(schedule, r && r.ok ? 'The recurring schedule is updated' + (r.effective_hour ? ' from ' + r.effective_hour : ' for future hours') + '.' : r && (r.why || r.detail) || 'The station could not update the schedule.');
+        }).catch(function () { note(schedule, 'Could not reach the station.'); }).then(function () { apply.disabled = false; });
+      }); schedule.appendChild(apply); host.appendChild(schedule);
+    }).catch(function () { host.textContent = ''; note(host, 'Could not read the dynamic templates.'); });
+  }
+
   function pane(host) {
     host.textContent = '';
     var mount = el('div', 'pseg-wrap');
@@ -231,7 +402,7 @@
       get('/api/schedule/prompts').then(function (all) {
         shelves = all || {};
         mount.textContent = '';
-        var kinds = Object.keys(shelves).sort();
+        var kinds = Object.keys(shelves).filter(function (k) { return k !== 'book_time' && k !== 'sfx_supercut'; }).sort();
         if (!kinds.length) {
           mount.appendChild(el('div', 'pseg-loading',
             'the station published no prompt shelves'));
@@ -241,6 +412,8 @@
           'Every segment the running order can call, and the system prompt each '
           + 'one is written against. A prompt you arm here is used IMMEDIATELY - '
           + 'the next round of that segment reads it, without a restart.'));
+        var dynamic = el('div', 'pseg-dynamic-templates');
+        mount.appendChild(dynamic); dynamicPane(dynamic, redraw);
         for (var i = 0; i < kinds.length; i += 1) {
           mount.appendChild(kindBlock(kinds[i], shelves[kinds[i]], redraw));
         }

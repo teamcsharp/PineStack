@@ -6,7 +6,8 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
-const src = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const rawSrc = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const src = rawSrc.replace(/\r\n/g, '\n');
 const grab = name => {
   const m = src.match(new RegExp('\\n  function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n  \\}\\n'));
   assert(m, 'missing ' + name);
@@ -36,7 +37,7 @@ const document = {body, getElementById: id => body.all().find(e => e.id === id) 
 const make = (t, c, x) => new El(t, c, x);
 // eslint-disable-next-line no-new-func
 const f = new Function('document', 'make',
-  grab('mvRrStepName') + grab('mvRrChain') + grab('mvRrPopTable') + grab('mvRrPopOpen') + 'return {mvRrPopOpen};')(document, make);
+  grab('mvRrStepName') + grab('mvRrChain') + grab('mvRrPopTable') + grab('mvRrPromptShare') + grab('mvRrPopOpen') + 'return {mvRrPopOpen};')(document, make);
 
 const rows = [
   {fam: 'ES', table: 'ES1', main: {stage: 'category', label: 'ANGER', dice: 26, hit: 1, of: 9, opts: ['JOY', 'ANGER'], weights: [1, 1]},

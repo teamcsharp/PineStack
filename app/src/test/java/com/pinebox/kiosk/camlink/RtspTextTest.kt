@@ -97,4 +97,21 @@ class RtspTextTest {
         assertEquals(7, rr[3].toInt())                 // length in words - 1
         assertEquals(0x1A, rr[8].toInt() and 0xFF)     // the source's SSRC
     }
+
+    @Test fun receiverCompoundContainsPaddedCnameForTheReporter() {
+        for (source in listOf(0, 0x1A2B3C4D)) {
+            val packet = RtspText.receiverCompound(0x11223344, source, 70000, 0, 0)
+            val offset = if (source == 0) 8 else 32
+            val sdes = java.nio.ByteBuffer.wrap(packet, offset, packet.size - offset)
+            assertEquals(0x81, sdes.get().toInt() and 0xFF)
+            assertEquals(202, sdes.get().toInt() and 0xFF)
+            assertEquals(packet.size - offset, (sdes.short.toInt() + 1) * 4)
+            assertEquals(0x11223344, sdes.int)
+            assertEquals(1, sdes.get().toInt())
+            val name = ByteArray(sdes.get().toInt() and 0xFF); sdes.get(name)
+            assertEquals("pinecam-11223344", String(name, Charsets.US_ASCII))
+            assertEquals(0, sdes.get().toInt())
+            assertEquals(0, packet.size % 4)
+        }
+    }
 }

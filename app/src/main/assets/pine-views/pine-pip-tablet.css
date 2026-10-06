@@ -1,0 +1,10 @@
+/* Reuse desktop PiP widgets on the tablet while keeping the station page as
+   the media source behind them. The rail remains above the PiP surface. */
+body.pine-pip.pine-pip-tablet > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(script):not(link):not(.pine-view-host):not(.plv-sheet):not(#pineExportBar):not(#pinePipFavorites):not(#pinePipPopupDock):not(.pip-popup-visible):not(.sp-rrp-back){display:block!important}
+body.pine-pip.pine-pip-tablet > main{position:relative!important;inset:auto!important;padding:0!important;margin:0!important;width:auto!important;height:auto!important}
+body.pine-pip.pine-pip-tablet > main > *{visibility:visible!important;pointer-events:auto!important}
+body.pine-pip.pine-pip-tablet > .pine-view-host{display:none!important}
+body.pine-pip.pine-pip-tablet > .pine-view-host.ppt-view.open{display:block!important;position:fixed!important;inset:0!important;z-index:1!important;padding:0!important;background:transparent!important;pointer-events:none!important}
+body.pine-pip.pine-pip-tablet #pine-pip-panel{z-index:20001!important}
+body.pine-pip.pine-pip-tablet #pinePipWidgets{z-index:21000!important}
+.ppt-view{background:transparent!important}

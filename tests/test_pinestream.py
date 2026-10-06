@@ -17,6 +17,7 @@
       spark-agent nice -n 10 python3 -m unittest tests.test_pinestream -v
 """
 import ast
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,7 +128,7 @@ class TheSwitchIsTheMaster(unittest.TestCase):
     def test_settings_are_read_defensively(self):
         got = pinestream.clamp_choice({"stream_on": 1, "stream_source": "bogus",
                                        "stream_fps": 99, "stream_width": "x"})
-        self.assertEqual(got, {"on": True, "source": "pinetab", "fps": 5, "width": 640, "quality": 60})
+        self.assertEqual(got, {"on": True, "source": "pinetab", "fps": 60, "width": 640, "quality": 60})
 
     def test_watching_counts_recent_viewers_only(self):
         ps, box, clock = make({"stream_on": True})
@@ -210,6 +211,58 @@ class Routes(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.headers["x-pinestream"], "off")
 
+    def test_live_stream_enforces_the_same_access_as_stills(self):
+        door = {"x-pinebox-public": "1"}
+        for query in ("", "?t=bad", "?s=sig-pinestream-preview"):
+            self.assertEqual(self.c.get("/api/pinestream/live.mjpg" + query, headers=door).status_code, 403)
+        self.box["s"]["stream_on"] = False
+        self.assertEqual(self.c.get("/api/pinestream/live.mjpg?t=good").status_code, 404)
+        self.assertIn("live.mjpg", self.c.get("/api/pinestream/mine?t=good").json()["stream"])
+
+
+class LiveFrames(unittest.IsolatedAsyncioTestCase):
+    async def test_frames_wake_immediately_and_slow_consumers_get_latest(self):
+        ps, box, _ = make({"stream_on": True, "stream_fps": 30})
+        feed = ps.live_frames(lambda: True, 'live-viewer')
+        pending = asyncio.create_task(anext(feed))
+        await asyncio.sleep(0)
+        first = b'\xff\xd8first\xff\xd9'
+        ps.accept('pinetab', first)
+        self.assertIn(first, await asyncio.wait_for(pending, .2))
+        ps.accept('pinetab', b'\xff\xd8stale\xff\xd9')
+        latest = b'\xff\xd8latest\xff\xd9'
+        ps.accept('pinetab', latest)
+        self.assertIn(latest, await asyncio.wait_for(anext(feed), .2))
+        self.assertEqual(len(ps.subscribers), 1)
+        self.assertEqual(ps.watching(), 1)
+        await feed.aclose()
+        self.assertEqual(len(ps.subscribers), 0)
+
+    async def test_private_off_and_revoked_access_stop_exposing_picture(self):
+        ps, box, _ = make({"stream_on": True})
+        authorized = True
+        ps.accept('pinetab', JPEG)
+        feed = ps.live_frames(lambda: authorized)
+        self.assertIn(JPEG, await anext(feed))
+        ps.accept('pinetab', b'', private=True)
+        # The private placeholder is sent, never the previous screen.
+        self.assertIn(pinestream._placeholder(), await asyncio.wait_for(anext(feed), .2))
+        authorized = False
+        with self.assertRaises(StopAsyncIteration): await anext(feed)
+        self.assertEqual(len(ps.subscribers), 0)
+        box['s']['stream_on'] = False
+        off = ps.live_frames(lambda: True)
+        with self.assertRaises(StopAsyncIteration): await anext(off)
+
+    async def test_cancelled_waiter_releases_subscription(self):
+        ps, _, _ = make({"stream_on": True})
+        feed = ps.live_frames(lambda: True)
+        pending = asyncio.create_task(anext(feed))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError): await pending
+        self.assertEqual(len(ps.subscribers), 0)
+
 
 class PineLiveCarriesTheSwitch(unittest.TestCase):
     def setUp(self):
@@ -230,7 +283,7 @@ class PineLiveCarriesTheSwitch(unittest.TestCase):
                                              "stream_width": 100, "stream_quality": 75})
         self.assertEqual(refused, [])
         self.assertEqual((new["stream_source"], new["stream_fps"], new["stream_width"],
-                          new["stream_quality"]), ("pineapp", 5, 320, 75))
+                          new["stream_quality"]), ("pineapp", 40, 320, 75))
         new, refused = self.pl.set_settings({"stream_source": "the moon"})
         self.assertEqual(refused, ["stream_source"])
         self.assertEqual(new["stream_source"], "pineapp")

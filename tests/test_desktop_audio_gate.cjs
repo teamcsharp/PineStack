@@ -1,0 +1,13 @@
+const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
+const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/renderer.js'), 'utf8');
+const start = source.indexOf('function desktopAudioGagged('), end = source.indexOf('\n}', start) + 2;
+assert.ok(start >= 0 && end > start);
+const gate = vm.runInNewContext('(' + source.slice(start, end) + ')');
+const roster = { listeners: [{ kind: 'app', listener: 'pb-panel', ids: ['desktop-shell', 'pb-panel'] }, { kind: 'pinetab', listener: 'pb-tablet', ids: ['pb-tablet'] }] };
+assert.equal(gate({ audio_owner: 'pb-panel', hushed: false }, roster, 'desktop-shell'), false, 'panel ownership does not mute video clips in its own shell');
+assert.equal(gate({ audio_owner: 'pb-panel', hushed: true }, roster, 'desktop-shell'), true, 'a receiver switched off stays muted');
+assert.equal(gate({ audio_owner: 'pb-tablet', hushed: false }, roster, 'desktop-shell'), true, 'another device still owns its exclusive playback');
+assert.equal(gate({ audio_owner: '' }, null, 'desktop-shell'), false);
+assert.equal(gate({ audio_owner: 'desktop-shell' }, null, 'desktop-shell'), false);
+assert.equal(gate({ audio_owner: 'pb-panel' }, null, 'desktop-shell'), true, 'unknown ownership keeps the existing gate until the roster arrives');
+console.log('Desktop audio gate: same-app shell/panel ownership, switched-off receivers and other-device exclusivity passed');

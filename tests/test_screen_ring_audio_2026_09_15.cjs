@@ -30,7 +30,7 @@
  *   3. Sound that comes and goes is reported as gaps with a coverage ratio,
  *      and never as completeness.
  *   4. THE SOUND IS NEVER IN THE FILE TWICE. When the ring carried it, the
- *      old PineAir mux must not run at all; when the ring did not, it may.
+ *      old PineAir mux must never reconstruct a recent recording.
  *   5. The recorder never opens a microphone. The operator's own voice is a
  *      separate question and is not answered by asking for the broadcast.
  *
@@ -94,6 +94,11 @@ const fakeClipMux = {
   },
   forget(dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {} },
   findFfmpeg() { return { path: 'ffmpeg', found: true }; },
+  encoderArgs(encoder) { return ['-c:v', encoder, '-preset', 'veryfast', '-crf', '18']; },
+  async encodeVideo(bin, build) {
+    await fakeClipMux.run(bin, build('libx264'));
+    return { encoder: 'libx264', hardware: false, fallback_detail: '' };
+  },
   async run(bin, args) {
     runs.push(args);
     if (fakeClipMux.refuse && args.includes('-map')) throw new Error('Invalid data found');
@@ -144,6 +149,26 @@ const argsOf = (list) => list.join(' ');
 const listsIn = (line) => line.split(' ').filter((bit) => /\.txt$/.test(bit));
 const readList = (line, which) => fs.readFileSync(listsIn(line)[which], 'utf8');
 
+test('broadcast-only export writes a stereo WAV from the sound ring', async () => {
+  const ring = ringWith([true, true, true], { present: true, supported: true });
+  const made = await ring.cutAudio({ seconds: 4 });
+  assert.equal(made.ok, true); assert.equal(made.audio.complete, true);
+  assert.match(made.out, /broadcast\.wav$/);
+  const command = runs.at(-1);
+  assert.ok(command.includes('pcm_s16le')); assert.ok(command.includes('-vn'));
+  assert.equal(command[command.indexOf('-ac') + 1], '2');
+  assert.ok(!command.includes('libx264'));
+  fakeClipMux.forget(made.dir); ring.forget();
+});
+
+test('broadcast-only export refuses missing audio and gaps', async () => {
+  const empty = ringWith([false, false], { present: false });
+  assert.equal((await empty.cutAudio({ seconds: 4 })).ok, false); empty.forget();
+  const gaps = ringWith([true, false, true], { present: true, supported: true });
+  const made = await gaps.cutAudio({ seconds: 6 });
+  assert.equal(made.ok, false); assert.equal(made.audio.complete, false); gaps.forget();
+});
+
 test('a cut carries the sound it was filmed with, and says so in the tablet shape', async () => {
   runs.length = 0;
   const ring = ringWith([true, true, true, true],
@@ -155,7 +180,7 @@ test('a cut carries the sound it was filmed with, and says so in the tablet shap
   /* #1207: the sound is a SECOND input now, and it is mapped out of the
    * filter graph that put it on the picture's timeline - never straight off
    * input 0, which has no audio track on it at all. */
-  assert.match(line, /-map 0:v:0 -map \[pinesound\]/);
+  assert.match(line, /-map \[pinevideo\] -map \[pinesound\]/);
   assert.doesNotMatch(line, /-map 0:a:0/);
   assert.equal(listsIn(line).length, 2, 'two concat lists: the picture and the sound');
   assert.match(line, /-c:a aac/);
@@ -219,26 +244,19 @@ test('sound that came and went is reported as gaps, with the coverage measured',
   ring.forget();
 });
 
-test('an encoder that refuses the sound still returns the picture, and stops claiming audio', async () => {
+test('an encoding failure is reported without silently discarding cached audio', async () => {
   runs.length = 0;
   fakeClipMux.refuse = true;
+  const ring = ringWith([true, true],
+    { source: AUDIO_SOURCE, present: true, state: 'capturing', supported: true });
   try {
-    const ring = ringWith([true, true],
-      { source: AUDIO_SOURCE, present: true, state: 'capturing', supported: true, detail: '' });
     const made = await ring.cut({ seconds: 4, back: 0 }, {});
-    assert.equal(made.ok, true, 'the recording is the part that cannot be taken again');
-    assert.equal(runs.length, 2, 'asked once with sound, once without');
-    assert.match(argsOf(runs[1]), /-an/);
-    assert.equal(listsIn(argsOf(runs[1])).length, 1,
-      'the retry drops the sound input as well as the mapping');
-    assert.equal(made.audio.present, false);
-    assert.equal(made.audio.state, 'unavailable');
-    assert.match(made.audio.detail, /encoder refused/);
-    /* Not "partial" - the file that came back has no audio track at all, and
-     * "Audio has gaps" would be a claim that some of it is in there. */
-    assert.notEqual(made.audio.state, 'partial');
-    ring.forget();
-  } finally { fakeClipMux.refuse = false; }
+    assert.equal(made.ok, false);
+    assert.equal(runs.length, 1);
+    assert.match(made.detail, /Invalid data/);
+    assert.doesNotMatch(argsOf(runs[0]), /-an/);
+    assert.equal(made.audio.present, true);
+  } finally { ring.forget(); fakeClipMux.refuse = false; }
 });
 
 test('video only means the sound is left out of the cut, not stripped afterwards', async () => {
@@ -288,11 +306,10 @@ test('a sound ring running beside no picture holds nothing a cut could use', () 
 /* --------------------------------------------------------------------------
  * THE ONE FILE, ONE COPY RULE.
  *
- * replayWithSound is the junction: the ring's own sound on one side and the
- * old PineAir mux on the other. Both muxing into the same file would put the
- * broadcast in twice, a few hundred milliseconds apart, which is worse than
- * none. main.js cannot be required without Electron, so the function is
- * lifted out of it and run for real. */
+ * replayWithSound retains the ring file and its captured audio. The sampler
+ * tap cannot reproduce the same playback mix or restore missing coverage.
+ * main.js cannot be required without Electron, so this function is lifted
+ * out of it and run for real. */
 function liftReplayWithSound() {
   const source = fs.readFileSync(path.join(__dirname, '../desktop/main.js'), 'utf8');
   const from = source.indexOf('async function replayWithSound(');
@@ -341,27 +358,39 @@ test('a cut that already has the broadcast is not dressed with it a second time'
   assert.equal(dressed.audio.present, true);
 });
 
-test('a silent cut may still be dressed by the old road, exactly once', async () => {
+test('a missing captured mix is never reconstructed by the old sampler road', async () => {
   const { context, asked } = junction({ ok: true, b64: Buffer.from('x'.repeat(200)).toString('base64') });
   const dressed = await context.replayWithSound(cutWithoutSound, false);
-  assert.equal(asked.length, 1, 'PineAir is the fallback, and it is asked once');
-  assert.equal(muxes.length, 1, 'one mux, one copy of the broadcast');
-  assert.equal(muxes[0].mic, null, 'the microphone is never added on the desk');
-  assert.equal(dressed.audio.source, 'pine-air-ring');
-  assert.equal(dressed.audio.present, true);
-  assert.equal(dressed.audio.coverage_ratio, 1);
+  assert.equal(asked.length, 0, 'a different audio tap cannot replace the captured mix');
+  assert.equal(muxes.length, 0);
+  assert.equal(dressed.path, cutWithoutSound.out);
+  assert.equal(dressed.audio, cutWithoutSound.audio);
+  assert.equal(dressed.audio.present, false);
+  assert.equal(dressed.audio.complete, false);
 });
 
-test('when neither road has the sound, the answer names both reasons and claims nothing', async () => {
-  const { context } = junction({ ok: false, why: 'the air tap is not running on this terminal' });
+test('missing audio keeps the original capture reason without asking a later source', async () => {
+  const { context, asked } = junction({ ok: false, why: 'the air tap is not running on this terminal' });
   const dressed = await context.replayWithSound(cutWithoutSound, false);
+  assert.equal(asked.length, 0);
   assert.equal(muxes.length, 0);
+  assert.equal(dressed.audio, cutWithoutSound.audio);
   assert.equal(dressed.audio.present, false);
   assert.equal(dressed.audio.state, 'unavailable');
-  assert.match(dressed.audio.detail, /loopback/);
-  assert.match(dressed.audio.detail, /air tap is not running/);
+  assert.equal(dressed.audio.detail, cutWithoutSound.audio.detail);
   assert.match(model.audioNotice({ has_audio: false, audio_capture: dressed.audio }),
     /No audio was captured in this recording/);
+});
+
+test('a partially captured mix is handed through with its original gaps and levels', async () => {
+  const { context, asked } = junction({ ok: true, b64: "AAAA" });
+  const partial = { ...cutWithSound, audio: { ...cutWithSound.audio, complete: false,
+    state: "partial", gaps: 2, coverage_ratio: 0.7, channels: 2 } };
+  const dressed = await context.replayWithSound(partial, false);
+  assert.equal(asked.length, 0);
+  assert.equal(muxes.length, 0);
+  assert.equal(dressed.path, partial.out);
+  assert.equal(dressed.audio, partial.audio);
 });
 
 test('video only asks nobody for sound and says it was asked for', async () => {
@@ -384,7 +413,7 @@ function shell(plan) {
   const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/screen-ring.js'), 'utf8');
   const calls = { display: [], sound: [], user: [], begin: [], pushes: [], notes: [] };
   const track = (kind, live) => ({ kind, readyState: live === false ? 'ended' : 'live',
-    muted: false, stop() { this.readyState = 'ended'; }, addEventListener() {} });
+    muted: false, getSettings: () => ({ width: 1920, height: 1080, frameRate: 60 }), stop() { this.readyState = 'ended'; }, addEventListener() {} });
   const streamOf = (withAudio) => {
     const video = [track('video')];
     const audio = withAudio ? [track('audio')] : [];
@@ -411,7 +440,13 @@ function shell(plan) {
   const root = {
     MediaRecorder, Blob, Promise, Date,
     console: { log: (line) => calls.notes.push(String(line)) },
-    setTimeout: () => 1,
+    setTimeout: () => 1, clearTimeout: () => {},
+    AudioContext: function () {
+      this.state = 'running'; this.resume = () => Promise.resolve();
+      this.close = () => { this.state = 'closed'; return Promise.resolve(); };
+      this.createMediaStreamDestination = () => ({ stream: soundOf(true) });
+      this.createMediaStreamSource = () => ({ connect() {}, disconnect() {} });
+    },
     document: { readyState: 'loading',
       addEventListener: (kind, fn) => { (listeners[kind] ||= []).push(fn); },
       removeEventListener: (kind, fn) => { listeners[kind] = (listeners[kind] || []).filter((x) => x !== fn); } },
@@ -426,9 +461,11 @@ function shell(plan) {
         calls.display.push(want);
         return plan.display(streamOf);
       },
-      getUserMedia: (want) => { calls.user.push(want); return plan.user ? plan.user(streamOf) : Promise.reject(new Error('no')); }
+      getUserMedia: (want) => { calls.user.push(want); return plan.user ? plan.user(streamOf) : plan.display(streamOf); }
     } },
     pineDesktop: {
+      replayAudioSources: async () => ({ ok: true, targets: ['shell', 'panel'] }),
+      replayAudioTarget: async () => ({ ok: true }),
       replaySource: async () => plan.source || { ok: true, id: 'window:1', loopback: true },
       replayBegin: async (opts) => { calls.begin.push(opts);
         /* The handshake. `plan.rings` of 1 is an older main process - one
@@ -460,17 +497,20 @@ test('the recorder opens a second, audio-only capture and the sound pieces carry
                     sound: (soundOf) => Promise.resolve(soundOf(true)) });
   await s.api.start({ gesture: true });
   await settle();
-  assert.equal(s.calls.display.length, 1, 'the window is filmed once');
-  assert.equal(s.calls.display[0].audio, false,
+  assert.equal(s.calls.user.length, 1, 'the native window is filmed once');
+  assert.equal(s.calls.user[0].audio, false,
     'and it asks for NO sound - that is what lets main.js tell the two apart');
-  assert.equal(s.calls.sound.length, 1, 'and the broadcast is asked for separately');
+  assert.equal(s.calls.sound.length, 2, 'shell and broadcast panel are captured separately');
   assert.equal(s.calls.sound[0].video, false,
     'video:false is load-bearing: asking with video:true fails the whole request');
-  assert.equal(s.calls.sound[0].audio, true);
+  assert.equal(s.calls.sound[0].audio.autoGainControl, false);
+  assert.equal(s.calls.sound[0].audio.echoCancellation, false);
+  assert.equal(s.calls.sound[0].audio.noiseSuppression, false);
+  assert.equal(s.calls.sound[0].audio.channelCount.ideal, 2);
   const said = s.calls.begin[s.calls.begin.length - 1];
   assert.equal(said.audio.present, true);
   assert.equal(said.audio.state, 'capturing');
-  assert.equal(said.audio.source, 'desk-broadcast-frame');
+  assert.equal(said.audio.source, 'desk-application-frames');
   /* Both streams named on the road that writes the diagnostic. */
   assert.equal(said.streams.picture.running, true);
   assert.equal(said.streams.sound.running, true);
@@ -505,7 +545,7 @@ test('a sound capture that comes back with no track is silence with a reason, no
   const said = s.calls.begin[s.calls.begin.length - 1].audio;
   assert.equal(said.present, false);
   assert.equal(said.state, 'unavailable');
-  assert.match(said.detail, /no audio track/);
+  assert.match(said.detail, /no live track/);
   /* The picture is untouched by any of it. */
   assert.equal(s.api.state().running, true);
   s.piece('v');
@@ -524,7 +564,7 @@ test('the window is still filmed when the panel refuses its sound outright', asy
   assert.equal(s.api.state().running, true);
   const said = s.calls.begin[s.calls.begin.length - 1].audio;
   assert.equal(said.present, false);
-  assert.match(said.detail, /would not give up its sound/);
+  assert.match(said.detail, /complete application audio unavailable/);
   assert.match(said.detail, /Error starting capture/);
 });
 
@@ -552,12 +592,12 @@ test('a later press retries the sound and never reopens the picture', async () =
   await s.api.start({ gesture: true });
   await settle();
   assert.equal(s.api.state().audio.present, false);
-  const filmedOnce = s.calls.display.length;
+  const filmedOnce = s.calls.user.length;
   ready = true;
   s.fire('pointerdown');
   await settle();
   assert.equal(s.api.state().audio.present, true, 'the first press adds the sound');
-  assert.equal(s.calls.display.length, filmedOnce,
+  assert.equal(s.calls.user.length, filmedOnce,
     'and the window capture is not reopened - the picture is opened once and left alone');
   s.piece('a');
   await settle();
@@ -585,7 +625,7 @@ test('a flush closes BOTH rings, so the newest seconds are not silent', async ()
   await settle();
   assert.equal(s.recs.v.state, 'recording');
   assert.equal(s.recs.a.state, 'recording');
-  assert.equal(s.api.flush(), true);
+  assert.equal(await s.api.flush(), true);
   await settle();
   /* Both handed a piece down. A flush that closed only the picture would make
    * exactly the stretch the operator reached for the silent one. */
@@ -634,7 +674,7 @@ test('a ring that answers for two lanes gets the second capture', async () => {
     sound: (soundOf) => Promise.resolve(soundOf(true)) });
   await s.api.start({ gesture: true });
   await settle();
-  assert.equal(s.calls.sound.length, 1);
+  assert.equal(s.calls.sound.length, 2);
   assert.equal(s.api.state().audio.present, true);
   /* And the ring really does answer it - this is not a property of the
    * stand-in. */
@@ -670,7 +710,7 @@ test('the sound is asked for TWICE and still opens only one capture', async () =
   /* And once it is up, asking again changes nothing. */
   await s.api.startSound({ gesture: true });
   await settle();
-  assert.equal(opened, 1);
+  assert.equal(opened, 2, 'one shell tap and one panel tap remain open');
 });
 
 test('a sound road that throws where it stands never costs the picture', async () => {
@@ -705,7 +745,7 @@ test('nothing here ever opens a microphone', async () => {
   /* getDisplayMedia's `audio: true` means "the thing being captured", never
    * an input device, and main.js answers it with a WebFrameMain - a page, not
    * a microphone. Pinned so a later hand cannot quietly widen it. */
-  for (const want of s.calls.sound) assert.equal(want.audio, true);
+  for (const want of s.calls.sound) assert.equal(typeof want.audio, 'object');
   const renderer = fs.readFileSync(
     path.join(__dirname, '../desktop/renderer/screen-ring.js'), 'utf8');
   assert.doesNotMatch(renderer, /getUserMedia\(\s*\{\s*audio:\s*true/,
@@ -719,6 +759,9 @@ test('nothing here ever opens a microphone', async () => {
   const local = main.slice(main.indexOf('ipcMain.handle("replay:local-edit"'),
     main.indexOf('ipcMain.handle("replay:local-edit"') + 3000);
   assert.match(local, /mic: null/);
+  assert.match(local, /audioMeta: made\.audio/);
+  assert.match(local, /embeddedAudio/);
+  assert.doesNotMatch(local, /ringAudioAsWav|broadcastQuestion/);
 });
 
 /* --------------------------------------------------------------------------
@@ -750,8 +793,8 @@ test('every piece in both lists declares the wall clock it was stamped with', as
     /* The duration written is the interval to the NEXT piece's stamp, so the
      * stop-and-start seam never accumulates: three pieces two seconds apart
      * must declare two seconds each, not the 1.98 s they actually hold. */
-    assert.equal(durations[0], 'duration 2.000');
-    assert.equal(durations[1], 'duration 2.000');
+    assert.equal(durations[0], 'duration 2.000000');
+    assert.equal(durations[1], 'duration 2.000000');
   }
   ring.forget();
 });
@@ -771,21 +814,10 @@ test('the sound is shifted onto the picture timeline, and which way is measured'
     assert.equal(made.audio.align_shift_ms, -shift || 0,
       'the shift is the picture\'s first stamp minus the sound\'s');
     const line = argsOf(runs[0]);
-    if (shift === 0) {
-      assert.doesNotMatch(line, /atrim/);
-      assert.doesNotMatch(line, /adelay/);
-    } else if (shift < 0) {
-      /* the sound ring began FIRST, so its front is trimmed off */
-      assert.match(line, /atrim=start=0\.700,asetpts=PTS-STARTPTS/);
-      assert.doesNotMatch(line, /adelay/);
-    } else {
-      /* the sound ring began LATER, so it is held back - and asetpts must
-       * come BEFORE adelay or it would reset the delay it just applied */
-      assert.match(line, /asetpts=PTS-STARTPTS,adelay=700:all=1/);
-      assert.doesNotMatch(line, /atrim/);
-    }
-    assert.match(line, /aresample=async=1:first_pts=0/,
-      'the seams are filled with silence rather than pulling the rest earlier');
+    assert.match(line, /asetpts=PTS-\(-?\d+\.\d{6}\)\/TB/);
+    assert.doesNotMatch(line, /adelay/);
+    assert.match(line, /aresample=48000:async=1:min_hard_comp=0\.001:first_pts=0/,
+      'sample timestamps and wall-clock seams remain on the absolute cut clock');
     ring.forget();
   }
 });
@@ -802,7 +834,7 @@ test('the drift that is left is bounded and reported, not hidden', async () => {
    * larger: up to one capture interval at 12 frames a second. It is stated
    * so that somebody reading the provenance can tell a bounded offset from
    * an unbounded one. */
-  assert.equal(made.audio.align_bound_ms, 83);
+  assert.equal(made.audio.align_bound_ms, 17);
   assert.ok(made.audio.align_bound_ms < 125,
     'inside what broadcast practice allows for sound behind picture');
   ring.forget();
@@ -832,7 +864,7 @@ test('a sound ring that came up LATE is delayed into place, never thrown away', 
   assert.equal(made.audio.present, true, 'ten seconds of broadcast is worth keeping');
   assert.equal(made.audio.state, 'partial');
   assert.equal(made.audio.align_shift_ms, -20000, 'the whole twenty seconds of it');
-  assert.match(argsOf(runs[0]), /adelay=20000:all=1/,
+  assert.match(argsOf(runs[0]), /asetpts=PTS-\(-20\.000000\)\/TB/,
     'held back by exactly the gap between the two rings\' first stamps');
   assert.ok(Math.abs(made.audio.coverage_ratio - (10 / 30)) < 0.03,
     'coverage ' + made.audio.coverage_ratio);
@@ -963,8 +995,10 @@ function liftHandler() {
 function handlerWith(frame) {
   const answers = [];
   const logged = [];
+  const ownerFrame = { url: 'file:///pine/index.html' };
   const context = {
-    win: { isDestroyed: () => false },
+    win: { isDestroyed: () => false, webContents: { mainFrame: ownerFrame } },
+    ringAudioTarget: 'panel',
     panelFrameNow: () => frame,
     ringSound: (line) => logged.push(String(line)),
     String, Boolean
@@ -973,7 +1007,7 @@ function handlerWith(frame) {
   vm.runInContext(liftHandler(), context);
   return {
     ask: (videoRequested, audioRequested) => {
-      context.handle({ videoRequested, audioRequested },
+      context.handle({ videoRequested, audioRequested, frame: ownerFrame },
         (answer) => answers.push(answer));
       return answers[answers.length - 1];
     },
@@ -992,25 +1026,16 @@ test('an audio-only request is answered with the panel frame AND enableLocalEcho
   assert.equal(got.video, undefined, 'and no picture, which is what makes it legal');
 });
 
-test('a picture request is answered with the window and never with sound', () => {
+test('a picture request is refused cleanly so window capture can fall back', () => {
   const h = handlerWith({ url: 'http://10.89.1.246:8096/' });
   const got = h.ask(true, true);
-  assert.ok(got.video, 'the window');
-  assert.equal(got.audio, false,
-    'said out loud, so nothing can attach sound here behind the sound ring\'s '
-    + 'back and put the broadcast in the file twice');
-  assert.equal(got.enableLocalEcho, undefined);
+  assert.equal(got, null, 'cancel with the supported null response so capture can fall back without throwing');
 });
 
 test('an audio request with no panel to record is refused rather than answered wrongly', () => {
   const h = handlerWith(null);
   const got = h.ask(false, true);
-  /* An empty answer is how Electron is told to cancel. Checked by its keys
-   * rather than by deepEqual: the handler is run in a vm, so its `{}` is a
-   * different realm's Object and would never be deep-strict-equal to ours. */
-  assert.equal(Object.keys(got).length, 0, 'better nothing than the wrong room');
-  assert.equal(got.audio, undefined);
-  assert.equal(got.video, undefined);
+  assert.equal(got, null, 'refuse a missing audio frame with the supported cancellation response');
   assert.match(h.logged.join(' '), /frame=no/);
 });
 

@@ -148,6 +148,8 @@ def test_rotation_spends_same_title_and_byte_identical_video_families(monkeypatc
 
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE sfx_meta (name TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO sfx_meta VALUES ('video_deck_cycle', '7')")
     con.execute("""CREATE TABLE clips (
         sid TEXT, name TEXT, folder TEXT, video INTEGER, bytes INTEGER,
         seconds REAL, deck_cycle INTEGER)""")

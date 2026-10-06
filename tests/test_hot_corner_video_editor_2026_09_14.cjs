@@ -15,7 +15,8 @@ class Element {
   appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
   removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; }
   replaceChildren() { this.children = []; }
-  setAttribute(name, value) { this.attrs[name] = value; }
+  setAttribute(name, value) { this.attrs[name] = String(value); }
+  getAttribute(name) { return this.attrs[name] ?? null; }
   getContext() {
     return {setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {},
       lineTo() {}, stroke() {}};
@@ -44,7 +45,7 @@ const captureButton = h => h.find(n => n.tagName === 'button' && n.className.inc
 
 test('registered source path and iframe messages reject foreign identities and senders', () => {
   const {api} = setup({}); const frame = {};
-  assert.equal(api._editorPath(SOURCE_ID), '/video-editor/?source=' + SOURCE_ID);
+  assert.equal(api._editorPath(SOURCE_ID), '/video-editor/?source=' + SOURCE_ID + '&chrome=host');
   for (const id of ['', '../secret', 'https://evil.invalid/', SOURCE_ID + '&extra=1', SOURCE_ID.toUpperCase()]) {
     assert.throws(() => api._editorPath(id));
   }
@@ -62,8 +63,9 @@ test('capture opens editor over the existing page without saving or ducking', as
   const player = h.document.body.appendChild(new Element('audio'));
   h.api.act('export'); await flush(); captureButton(h).fire('click'); await flush();
   assert.equal(calls.length, 1); assert.equal(calls[0].seconds, 60); assert.equal(calls[0].video_only, false);
+  assert.equal(calls[0].require_audio, true);
   const frame = h.find(n => n.tagName === 'iframe');
-  assert.equal(frame.src, '/video-editor/?source=' + SOURCE_ID);
+  assert.equal(frame.src, '/video-editor/?source=' + SOURCE_ID + '&chrome=host');
   assert.equal(player.parentNode, h.document.body);
   h.root.fire('message', {source: frame.contentWindow, origin: h.root.location.origin, data: {type: 'pine-video-editor-export'}});
   assert.equal(saves, 0);
@@ -80,11 +82,13 @@ test('missing audio never silently enables video-only capture and errors stay in
     replayEdit: async opts => { calls.push({...opts}); return {ok: false, detail: 'No captured audio', original_saved: true, where: 'Downloads/recordings/original.mp4'}; }});
   h.api.act('export'); await flush(); captureButton(h).fire('click'); await flush();
   assert.equal(calls[0].video_only, false);
+  assert.equal(calls[0].require_audio, true);
   assert.ok(h.find(n => n.textContent && n.textContent.includes('original saved to Downloads/recordings/original.mp4')));
   assert.equal(h.find(n => n.tagName === 'iframe'), undefined);
   h.find(n => n.type === 'checkbox').checked = true;
   captureButton(h).fire('click'); await flush();
   assert.equal(calls[1].video_only, true);
+  assert.equal(calls[1].require_audio, false);
 });
 
 test('older bridge retains save-to-recordings fallback', async () => {
@@ -93,5 +97,27 @@ test('older bridge retains save-to-recordings fallback', async () => {
     replayExport: async opts => { calls.push(opts); return {ok: true, seconds: 30, where: 'Downloads/recordings'}; }});
   h.api.act('export'); await flush(); captureButton(h).fire('click'); await flush();
   assert.equal(calls.length, 1); assert.equal(calls[0].upload, true);
+  assert.equal(calls[0].require_audio, true);
   assert.equal(h.find(n => n.tagName === 'iframe'), undefined);
+});
+
+test('direct recent export requires the heard mix unless picture only is selected', async () => {
+  const calls = [];
+  const h = setup({replayState: async () => ({running: true, seconds: 60, audio: {state: "capturing"}}),
+    replayEdit: () => { throw new Error("direct export must not open the editor"); },
+    replayExport: async opts => { calls.push({...opts}); return {ok: false, detail: "The recorded mix is unavailable"}; }});
+  h.api.act("export"); await flush();
+  assert.ok(h.find(n => n.textContent === "Includes the mix you heard, with its recorded levels and mutes."));
+  assert.ok(h.find(n => n.textContent === "Picture only - no captured sound"));
+  const direct = h.find(n => n.tagName === "button" && n.className.includes("hc-direct"));
+  direct.fire("click"); await flush();
+  assert.equal(calls[0].seconds, 60);
+  assert.equal(calls[0].video_only, false);
+  assert.equal(calls[0].require_audio, true);
+  assert.equal(calls[0].upload, true);
+  assert.equal(h.find(n => n.tagName === "iframe"), undefined);
+  h.find(n => n.type === "checkbox").checked = true;
+  direct.fire("click"); await flush();
+  assert.equal(calls[1].video_only, true);
+  assert.equal(calls[1].require_audio, false);
 });

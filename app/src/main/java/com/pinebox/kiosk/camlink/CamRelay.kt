@@ -15,6 +15,7 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * [tabrelay] THE PINE CAM'S RELAY: TacoNet on one side, the camera on the other.
@@ -55,6 +56,9 @@ class CamRelay(
     /** true: the camera sees a UDP client (default; dodges its 30 s TCP cut).
      *  false: Transport passes through and the camera streams interleaved. */
     private val udpUpstream: Boolean = true,
+    /** Some camera firmware rejects unsolicited RTSP requests/compound RTCP.
+     * Keep that protocol extension opt-in; the station already sends OPTIONS. */
+    private val sessionKeepalive: Boolean = false,
     private val allow: (InetAddress) -> Boolean = { true },
     private val log: (String) -> Unit = {},
 ) : Closeable {
@@ -224,10 +228,11 @@ class CamRelay(
             }
         }
 
-        fun report(reporter: Int): ByteArray {
+        fun report(reporter: Int, compound: Boolean = false): ByteArray {
             val dlsr = if (lsrAt == 0L) 0 else
                 ((System.currentTimeMillis() - lsrAt) * 65536L / 1000L).toInt()
-            return RtspText.receiverReport(reporter, ssrc, cycles + maxOf(maxSeq, 0), lsr, dlsr)
+            return if (compound) RtspText.receiverCompound(reporter, ssrc, cycles + maxOf(maxSeq, 0), lsr, dlsr)
+                else RtspText.receiverReport(reporter, ssrc, cycles + maxOf(maxSeq, 0), lsr, dlsr)
         }
     }
 
@@ -243,6 +248,8 @@ class CamRelay(
         val socks = ArrayList<Closeable>()
         val reporter = (System.nanoTime() xor 0x5A5A5A5AL).toInt()
         val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        val sessionId = AtomicReference("")
+        val keepaliveReplies = ConcurrentHashMap.newKeySet<String>()
         var cam: Socket? = null
 
         fun toStation(bytes: ByteArray) {
@@ -270,11 +277,25 @@ class CamRelay(
 
             // The relay's receiver reports, as the camera's client, every few seconds.
             Thread({
+                var keepaliveAt = 0L
+                var ownCseq = 1_000_000_000
                 while (live.get() && running) {
                     try { Thread.sleep(RR_EVERY_MS) } catch (_: InterruptedException) { break }
+                    if (!live.get() || !running) break
+                    val session = sessionId.get()
+                    val now = System.currentTimeMillis()
+                    if (sessionKeepalive && session.isNotEmpty() && now - keepaliveAt >= 10_000 && keepaliveReplies.size < 8) {
+                        val cseq = (++ownCseq).toString()
+                        keepaliveReplies.add(cseq)
+                        try {
+                            toCamera(("OPTIONS $cameraBase/live RTSP/1.0\r\nCSeq: $cseq\r\n" +
+                                "Session: $session\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                            keepaliveAt = now
+                        } catch (_: IOException) { break }
+                    }
                     for (tr in tracks.values.toSet()) {
                         try {
-                            val rr = tr.report(reporter)
+                            val rr = tr.report(reporter, sessionKeepalive)
                             val server = tr.server
                             if (tr.udp && server != null) {
                                 tr.rtcp!!.send(DatagramPacket(rr, rr.size, InetSocketAddress(cameraHost, server.second)))
@@ -302,6 +323,11 @@ class CamRelay(
                             }
                             is RtspText.Part.Msg -> {
                                 val m = u.m
+                                if (keepaliveReplies.remove(m.header("CSeq") ?: "")) continue
+                                if (m.status in 200..299) {
+                                    m.header("Session")?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }
+                                        ?.let { sessionId.set(it) }
+                                }
                                 val setup = pending.remove(m.header("CSeq") ?: "")
                                 val t = m.header("Transport") ?: ""
                                 if (setup != null) {

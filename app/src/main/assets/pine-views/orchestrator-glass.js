@@ -100,6 +100,10 @@
   var FACE_MS = 160;
 
   var box = null;
+  var painted = false;
+  var glassRead = null;
+  var s3Read = null;
+  var overview = null;
   var timer = null;
   var faceTimer = null;
   var frame = 0;
@@ -232,12 +236,20 @@
    * is served by the station itself and a bare path is right. Same split
    * every view in this directory carries. */
   function get(path) {
+    var request;
     try {
-      if (root.pineDesktop && root.pineDesktop.get) return root.pineDesktop.get(path);
+      if (root.pineDesktop && root.pineDesktop.get) request = root.pineDesktop.get(path);
     } catch (err) { /* fall through */ }
-    var head = key() ? {Authorization: 'Bearer ' + key()} : {};
-    return root.fetch(where() + path, {headers: head, cache: 'no-store'})
-      .then(function (res) { return res.ok ? res.json() : null; });
+    if (!request) {
+      var head = key() ? {Authorization: 'Bearer ' + key()} : {};
+      request = root.fetch(where() + path, {headers: head, cache: 'no-store'})
+        .then(function (res) { if (!res.ok) throw new Error('Station returned ' + res.status); return res.json(); });
+    }
+    return new Promise(function (resolve, reject) {
+      var clock = root.setTimeout(function () { reject(new Error('The station took longer than 30 seconds to answer ' + path)); }, 30000);
+      Promise.resolve(request).then(function (got) { root.clearTimeout(clock); resolve(got); },
+        function (err) { root.clearTimeout(clock); reject(err); });
+    });
   }
 
   function el(tag, cls, text) {
@@ -438,11 +450,12 @@
   }
 
   function s3Pull() {
-    if (!box) return;
+    if (!box || s3Read) return;
     if (mini) { if (s3Node) s3Node.hidden = true; return; }
+    var opened = box, turn = {}; s3Read = turn;
     get('/api/system3/now').then(function (got) {
-      if (box && got) s3Paint(got);
-    })['catch'](function () { /* the next tick asks again */ });
+      if (box === opened && got) { s3Paint(got); if (overview) overview.update(null, got); }
+    })['catch'](function () { /* the next tick asks again */ }).then(function () { if (s3Read === turn) s3Read = null; });
   }
 
   function esMood(label, category) {
@@ -2131,7 +2144,7 @@
         into.appendChild(warnBox(num(stuck.value, 0) + ' piece'
           + (stuck.value === 1 ? '' : 's') + ' of work stuck in ' + label
           + ', the oldest for ' + secs(held) + '. Work that sits here is '
-          + 'work that was made and is not being heard.'));
+          + (row.key === 'pantry' ? 'work that needs repair or a valid broadcast binding.' : 'work that was made and is not being heard.')));
       } else if (stuck.value) {
         into.appendChild(warnBox(num(stuck.value, 0) + ' piece'
           + (stuck.value === 1 ? '' : 's') + ' of work stuck in ' + label
@@ -2150,13 +2163,31 @@
 
       /* THE CARRY. Both numbers measured, so the subtraction is measured
          too - it is not an estimate and it is not a second source. */
-      if (went.value !== null && came.value !== null) {
+      if (row.key !== 'pantry' && went.value !== null && came.value !== null) {
         pair(into, 'went in and has not come out',
           num(went.value - came.value, 0));
       }
       if (held !== null) {
         pair(into, 'the oldest thing here has waited', secs(held));
         pair(into, 'the station timed it as', heldHit.name);
+      }
+
+      if (row.key === 'pantry') {
+        used.cached = true;
+        used.lifecycle_states = true;
+        used.lifecycle_policy = true;
+        used.lifecycle_counts = true;
+        if (row.cached !== undefined) pair(into, 'cached audio clips', row.cached);
+        var states = row.lifecycle_states || {};
+        ['ready', 'blocked', 'reserved', 'queued', 'repairing', 'expired'].forEach(function (state) {
+          if (states[state] !== undefined) pair(into, state + ' work items', states[state]);
+        });
+        var policy = row.lifecycle_policy || {};
+        if (policy.ordinary_hours !== undefined) pair(into, 'ordinary work expires after', policy.ordinary_hours + ' hours');
+        if (policy.mode) pair(into, 'lifecycle policy mode', policy.mode);
+        var counts = row.lifecycle_counts || {};
+        if (counts.delivered !== undefined) pair(into, 'confirmed deliveries since lifecycle began', counts.delivered);
+        if (counts.retired !== undefined) pair(into, 'retired work items since lifecycle began', counts.retired);
       }
 
       /* [#1211] the doors, the names inside, and what is blocked. */
@@ -2411,6 +2442,7 @@
     box.setAttribute('aria-expanded', mini ? 'false' : 'true');
     var list = box.querySelector('.og-main');
     if (list) list.hidden = !!mini;
+    if (overview) overview.setActive(!mini);
     var av = box.querySelector('.og-avatar');
     if (av) {
       av.setAttribute('aria-label', mini
@@ -2442,6 +2474,7 @@
 
   function paint() {
     if (!box || !last) return;
+    if (overview && !mini) overview.update(last, null);
     var host = box.querySelector('.og-main');   /* [#1186] the LIVE list */
     if (!host) return;
     /* [#1213] folded: two lines of text and not one node of arithmetic. */
@@ -2656,6 +2689,7 @@
         }
       }, 'og-blindfold'));
 
+    painted = true;
     reconcile(host, main);        /* [#1186] the stage goes in, by key */
     host.scrollTop = scroll;
     /* #1220: ...and again after layout. Assigning scrollTop immediately after
@@ -2693,13 +2727,14 @@
   /* ----------------------------------------------------------- the fetch */
 
   function pull() {
-    if (!box) return;                 /* a shut pop-up asks for nothing */
+    if (!box || glassRead) return;    /* one read at a time, including slow stations */
+    var opened = box, turn = {}; glassRead = turn;
     var began = Date.now();
     asks += 1;
     get('/api/orchestrator/glass').then(function (got) {
-      if (!box) return;               /* it closed while we were waiting */
+      if (box !== opened) return;     /* a prior window must not repaint a reopened one */
       lastMs = Date.now() - began;
-      if (!got) { trouble('the station did not answer'); return; }
+      if (!got) { trouble('the station did not answer'); if (overview) overview.fail(); return; }
       last = got;
       /* #1220: the data is fresh either way; the BODY waits until he is
          done. The face and header still move - one line each, and neither
@@ -2711,7 +2746,7 @@
          an ask or airing a round his hand is still over the panel, so
          reading() is true and the answer would be held back behind the very
          press that asked for it. One pass, then the hold stands again. */
-      if (reading() && !forceOnce) {
+      if (painted && reading() && !forceOnce) {
         /* [#1186] and it says so, with a count, rather than silently going
            stale - a surface that is behind and does not admit it is the
            fault this station has been bitten by more than any other. */
@@ -2719,12 +2754,13 @@
         pendingUpdates += 1;
         paintSay(); paintHeader(); paintHeld();
       } else { forceOnce = false; paint(); }   /* [#1211] */
-    })['catch'](function () {
-      if (!box) return;
+    })['catch'](function (err) {
+      if (box !== opened) return;
       forceOnce = false;                        /* [#1211] */
       lastMs = Date.now() - began;
-      trouble('the station could not be reached');
-    });
+      trouble('The station could not be reached: ' + ((err && err.message) || 'request failed'));
+      if (overview) overview.fail();
+    }).then(function () { if (glassRead === turn) glassRead = null; });
   }
 
   function trouble(why) {
@@ -2733,12 +2769,17 @@
     if (!state) return;
     state.innerHTML = '';
     state.appendChild(chip(why, 'og-bad'));
+    var retry = el('button', 'og-retry', 'Retry'); retry.setAttribute('type', 'button');
+    retry.addEventListener('click', function (ev) { if (ev && ev.stopPropagation) ev.stopPropagation(); forceOnce = true; pull(); });
+    state.appendChild(retry);
+    var say = box.querySelector('.og-say-text'); if (say) say.textContent = why;
+    if (!painted) { var main = box.querySelector('.og-main'); if (main) main.textContent = 'Station measurements are unavailable. Press Retry to read them again.'; }
   }
 
   /* --------------------------------------------------- the box and its drag */
 
   function place(node) {
-    var left = 0, top = 0, w = 420, h = 540;
+    var left = 0, top = 0, w = 620, h = 740;
     try {
       var saved = JSON.parse(root.localStorage.getItem(PLACE) || 'null');
       if (saved) { left = saved.left; top = saved.top; w = saved.width || w; h = saved.height || h; }
@@ -2867,7 +2908,7 @@
       close();
     });
     head.appendChild(shut);
-    if (window.pineCloseX) { window.pineCloseX(node, function () { shut.click(); }, {label: 'Close the orchestrator'}); shut.style.display = 'none'; }  // [closex:orch-glass]
+    if (root.pineCloseX) { root.pineCloseX(node, function () { shut.click(); }, {label: 'Close the orchestrator'}); shut.style.display = 'none'; }  // [closex:orch-glass]
     node.appendChild(head);
 
     var say = el('div', 'og-say');
@@ -2915,6 +2956,19 @@
       collapse();
     });
 
+    var visual = el('div', 'og-viz');
+    node.appendChild(visual);
+    if (root.PineOrchViz && root.document.head) overview = root.PineOrchViz.mount(visual, where(), function (id) {
+      open[id] = true;
+      paint();
+      var folds = node.querySelectorAll('[data-fold]');
+      for (var i = 0; i < folds.length; i += 1) {
+        if (folds[i].getAttribute('data-fold') === id) {
+          if (folds[i].scrollIntoView) folds[i].scrollIntoView({block: 'nearest'});
+          break;
+        }
+      }
+    });
     node.appendChild(el('div', 'og-main'));
     node.appendChild(commandLine());               /* [#1211] */
     /* A SIBLING OF <main>, never a child of a view: every view in this
@@ -3021,10 +3075,14 @@
     if (box) return box;
     recall();
     recallMini();          /* [#1213] he left it folded, it comes back folded */
+    if (root.PINE_NATIVE_TOOLS) mini = false;
+    painted = false;
     box = build();
     paintRecovery();
     startRecoveryWatch();
     applyMini();           /* [#1213] */
+    if (last) paint();
+    else box.querySelector('.og-main').appendChild(el('p', 'og-loading', 'Loading station measurements...'));
     frame = 0;
     sayAt = 0;
     paintFace();
@@ -3047,6 +3105,8 @@
   }
 
   function close() {
+    glassRead = null; s3Read = null; painted = false;
+    if (overview) { overview.dispose(); overview = null; }
     /* EVERY CLOCK STOPS AND THE SOUND COMES BACK. A pop-up that keeps a
        timer alive behind a removed node is a poll nobody can see and nobody
        can stop, which is exactly the shape of surface that has starved this
@@ -3460,6 +3520,7 @@
   }
 
   try {
+    if (root.PINE_NATIVE_TOOLS) return;
     if (root.document && root.document.readyState === 'loading') {
       root.document.addEventListener('DOMContentLoaded', plant);
     } else {
@@ -3474,4 +3535,209 @@
     try { if (beat && typeof beat.unref === 'function') beat.unref(); }
     catch (err) { /* a browser timer: nothing to unref */ }
   } catch (err) { /* older host: the desk's own call still mounts it */ }
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* Live 3D station overview. One local Three.js renderer for all eight charts. */
+(function (root) {
+  'use strict';
+  var palette = ['#b94bff', '#fa579c', '#ffc957', '#42dfc3', '#58abff', '#adbcce', '#ff874a', '#98e36a', '#907aff', '#dc798a'];
+  var loading = null;
+  function node(tag, cls, text) {
+    var n = root.document.createElement(tag); n.className = cls || '';
+    if (text != null) n.textContent = text; return n;
+  }
+  function number(v) { return typeof v === 'number' && isFinite(v) && v >= 0 ? v : null; }
+  function metric(label, value, detail) { return {label: label, value: number(value), detail: detail || ''}; }
+  function model(data, air) {
+    data = data || {}; var w = data.waste || {}, p = data.pressure || {}, h = data.visual_history || {};
+    var rooms = Array.isArray(data.rooms) ? data.rooms : [];
+    var keepers = Array.isArray(data.keepers) ? data.keepers : [];
+    var cups = Array.isArray(w.classes) ? w.classes : (Array.isArray(w.by_road) ? w.by_road : []);
+    var rows = [
+      {id: 'tasks', title: 'Orchestrator workload', kind: 'bar', unit: 'active passes',
+       rows: keepers.map(function (k) { return metric(k.label || k.name || k.key || 'Keeper', k.open, 'Passes currently open'); }),
+       note: 'Instrumented tasks only. ' + (Array.isArray(data.live) ? data.live.length : 'Unmeasured') + ' active passes. ' + (data.plan_why || ''), fold: 'now'},
+      {id: 'bank', title: 'Broadcast bank', kind: 'pie', unit: 'minutes',
+       rows: [metric('Rendered ahead', number(w.rendered_ahead_seconds) === null ? null : w.rendered_ahead_seconds / 60), metric('Written only', number(w.written_only_seconds) === null ? null : w.written_only_seconds / 60), metric('Still to make', number(w.missing_seconds) === null ? null : w.missing_seconds / 60)],
+       note: w.bank_say || w.cover_why || 'Coverage of the next 60 minutes of the running order.', fold: 'waste'},
+      {id: 'rooms', title: 'The four rooms', kind: 'bar', unit: 'pieces waiting',
+       rows: rooms.map(function (r) { return metric(r.label || r.name || r.key, r.stuck, (r.why || '') + ' In: ' + show(r.in) + '; out: ' + show(r.out) + '.'); }),
+       note: data.rooms_say || data.rooms_why || 'Current holding counts. Room details include the last ten minutes of flow.', fold: 'rooms'},
+      {id: 'cupboards', title: 'Unheard cupboards', kind: 'pie', unit: 'ready rounds',
+       rows: cups.map(function (r) { return metric(r.name || r.label || r.kind, r.count == null ? r.ready : r.count); }),
+       note: 'Finished rounds by road that have never aired. ' + show(w.never_heard) + ' ready rounds.', fold: 'waste'},
+      {id: 'spark', title: 'DGX Spark pressure', kind: 'bar', unit: 'pressure tier',
+       rows: [metric('Memory tier', p.readable === true ? p.mem_tier : null), metric('GPU tier', p.readable === true ? p.gpu_tier : null)],
+       note: (p.say || 'Host pressure unmeasured.') + ' Free memory: ' + show(p.avail_gb) + ' GB; GPU failures/hour: ' + show((p.nvrm || {}).in_1h) + '; reading age: ' + show(p.heard_seconds) + 's. Pressure tiers are signals, not utilization percentages.', fold: 'pressure'},
+      {id: 'dialogue', title: 'System 3 / dialogue', kind: 'pie', unit: 'conversations', rows: h.readable ? (h.dialogue || {}).rows || [] : [],
+       note: 'Mode: ' + (h.mode || 'unavailable') + '. Retained conversations: ' + show((h.dialogue || {}).conversations) + '; committed dialogue lines: ' + show((h.dialogue || {}).lines) + '. ' + ((air && air.line && (air.line.text || air.line.id)) || 'No current spoken line measured.') + ' ' + (h.basis || h.why || 'History unmeasured.'), fold: 'order'},
+      {id: 'roulette', title: 'Most frequent roulette results', kind: 'pie', unit: 'selected outcomes', rows: h.readable ? h.outcomes || [] : [],
+       note: (h.basis || h.why || 'History unmeasured.') + ' ' + show(h.outcome_total) + ' outcomes; ' + show(h.skipped) + ' unreadable events. Results describe frequency, not operator votes.'},
+      {id: 'dice', title: 'Dice distribution / d100', kind: 'pie', unit: 'recorded dice draws', rows: h.readable ? h.dice || [] : [],
+       note: (h.basis || h.why || 'History unmeasured.') + ' ' + show(h.rolls) + ' draws. Ledger refreshed every 30 seconds.'}
+    ];
+    // An open keeper count is not always present; use the measured live register instead.
+    rows[0].rows = (data.live || []).map(function (t) { return metric(t.label || t.keeper || t.name || t.id || 'Active task', 1, t.say || t.why || 'Open instrumented pass'); });
+    if (!rows[0].rows.length && Array.isArray(data.live)) rows[0].rows = [metric('Active passes', 0)];
+    if (!cups.length && w.never_heard === 0) rows[3].rows = [metric('Ready unheard rounds', 0)];
+    return rows;
+  }
+  function show(v) { return number(v) === null ? 'unmeasured' : String(Math.round(v * 10) / 10); }
+  function three(base) {
+    if (root.THREE) return Promise.resolve(root.THREE);
+    if (loading) return loading;
+    loading = new Promise(function (resolve, reject) {
+      var script = node('script'); script.src = typeof root.pineThreeUrl === 'function' ? root.pineThreeUrl() : base + '/vendor/three.min.js';
+      script.onload = function () { if (root.THREE) resolve(root.THREE); else { loading = null; reject(new Error('Three.js unavailable')); } };
+      script.onerror = function () { loading = null; reject(new Error('Local Three.js could not load')); };
+      root.document.head.appendChild(script);
+    }); return loading;
+  }
+  function mount(host, base, explain) {
+    var header = node('div', 'og-viz-head'); header.appendChild(node('span', '', 'STATION / LIVE 3D'));
+    var pause = node('button', 'og-viz-motion', 'Pause motion'); pause.type = 'button'; header.appendChild(pause);
+    var status = node('div', 'og-viz-status', 'Waiting for measured station data'); status.setAttribute('role', 'status');
+    var scroll = node('div', 'og-viz-scroll'), surface = node('div', 'og-viz-surface'); scroll.appendChild(surface);
+    var detail = node('div', 'og-viz-detail', 'Click a chart or a legend item to inspect it.');
+    detail.setAttribute('role', 'status'); host.appendChild(header); host.appendChild(status); host.appendChild(scroll); host.appendChild(detail);
+    var grid = node('div', 'og-viz-grid'); surface.appendChild(grid);
+    var cards = [], charts = [], renderer = null, T = null, raf = 0, dead = false, active = true;
+    var lostRenderer = null;
+    var reduced = root.matchMedia ? root.matchMedia('(prefers-reduced-motion: reduce)') : null;
+    var paused = !!(reduced && reduced.matches), selected = null, data = null, air = null, signature = '', born = 0, lastFrame = 0;
+    function pauseLabel() { pause.textContent = paused ? 'Resume motion' : 'Pause motion'; pause.setAttribute('aria-pressed', paused ? 'true' : 'false'); }
+    pauseLabel(); pause.addEventListener('click', function () { paused = !paused; pauseLabel(); render(root.performance.now()); });
+    function select(c, row) {
+      var fresh = model(data, air).filter(function (m) { return m.id === c.id; })[0];
+      if (fresh) { if (row) row = fresh.rows.filter(function (r) { return r.label === row.label; })[0]; c = fresh; }
+      selected = {id: c.id, label: row && row.label};
+      var total = c.rows.reduce(function (sum, r) { return sum + (number(r.value) || 0); }, 0);
+      var text = c.title + ': ';
+      if (row) text += row.label + ' — ' + show(row.value) + ' ' + c.unit + (c.kind === 'pie' && total && number(row.value) !== null ? ' (' + (row.value / total * 100).toFixed(1) + '%)' : '') + '. ' + (row.detail || '');
+      detail.textContent = text + ' ' + c.note;
+      if (c.fold) { var btn = node('button', 'og-viz-open', 'Open full details'); btn.type = 'button'; btn.addEventListener('click', function () { explain(c.fold); }); detail.appendChild(btn); }
+    }
+    function releaseCharts() {
+      charts.forEach(function (chart) { chart.group.traverse(function (o) { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); }); charts = [];
+    }
+    function chart(c, index) {
+      var scene = new T.Scene(), camera = new T.PerspectiveCamera(34, 1, .1, 100);
+      camera.position.set(0, 4.3, 6.3); camera.lookAt(0, 0, 0);
+      scene.add(new T.AmbientLight(0xffffff, .65));
+      var light = new T.DirectionalLight(0xffffff, .85); light.position.set(-3, 6, 5); scene.add(light);
+      var group = new T.Group(); scene.add(group);
+      var total = c.rows.reduce(function (sum, r) { return sum + (number(r.value) || 0); }, 0);
+      var angle = 0, max = Math.max.apply(null, c.rows.map(function (r) { return number(r.value) || 0; }).concat([1]));
+      c.rows.forEach(function (r, i) {
+        if (!(r.value > 0)) return;
+        var geo, mesh, middle = 0, span = r.value / total * Math.PI * 2;
+        if (c.kind === 'pie') {
+          var shape = new T.Shape(), radius = 1.5, inner = .63;
+          shape.absarc(0, 0, radius, angle, angle + span, false);
+          shape.absarc(0, 0, inner, angle + span, angle, true); shape.closePath();
+          geo = new T.ExtrudeGeometry(shape, {depth: .42, bevelEnabled: true, bevelThickness: .035, bevelSize: .025, bevelSegments: 1, steps: 1, curveSegments: 24});
+          geo.rotateX(-Math.PI / 2); middle = angle + span / 2; angle += span;
+        } else {
+          geo = new T.BoxGeometry(Math.min(.58, 3.5 / Math.max(c.rows.length, 1)), .12 + r.value / max * 1.8, .7);
+        }
+        mesh = new T.Mesh(geo, new T.MeshStandardMaterial({color: palette[i % palette.length], roughness: .48, metalness: .08}));
+        if (c.kind === 'pie') { mesh.position.set(Math.cos(middle) * .055, 0, -Math.sin(middle) * .055); }
+        else mesh.position.set((i - (c.rows.length - 1) / 2) * Math.min(.78, 3.8 / Math.max(c.rows.length, 1)), (.12 + r.value / max * 1.8) / 2 - .6, 0);
+        mesh.userData.row = r; group.add(mesh);
+      });
+      charts.push({scene: scene, camera: camera, group: group, card: cards[index], model: c});
+    }
+    function update(next, spoken) {
+      if (next) data = next; if (spoken) air = spoken;
+      if (dead) return;
+      var models = model(data, air);
+      status.textContent = data ? 'Station snapshot ' + new Date(data.at * 1000).toLocaleTimeString() + ' · click to inspect' : 'Waiting for measured station data';
+      var nextSignature = JSON.stringify(models.map(function (c) { return {id: c.id, rows: c.rows.map(function (r) { return [r.label, r.value]; })}; }));
+      if (nextSignature === signature) {
+        if (selected) { var c = models.filter(function (m) { return m.id === selected.id; })[0]; if (c) select(c, c.rows.filter(function (r) { return r.label === selected.label; })[0]); }
+        return;
+      }
+      signature = nextSignature;
+      releaseCharts(); grid.textContent = ''; cards = [];
+      models.forEach(function (c, index) {
+        var card = node('section', 'og-viz-card'), title = node('button', 'og-viz-title', c.title); title.type = 'button';
+        title.addEventListener('click', function () { select(c); }); card.appendChild(title);
+        card.appendChild(node('div', 'og-viz-unit', c.unit));
+        var view = node('div', 'og-viz-view'); view.setAttribute('aria-hidden', 'true'); card.appendChild(view);
+        var legend = node('div', 'og-viz-legend');
+        var measured = c.rows.length && c.rows.every(function (r) { return number(r.value) !== null; });
+        var total = c.rows.reduce(function (sum, r) { return sum + (number(r.value) || 0); }, 0);
+        c.rows.forEach(function (r, i) {
+          var button = node('button', 'og-viz-key'); button.type = 'button'; button.style.setProperty('--slice', palette[i % palette.length]);
+          var label = r.label + ' · ' + show(r.value) + (c.kind === 'pie' && total && measured ? ' · ' + (r.value / total * 100).toFixed(1) + '%' : '');
+          button.appendChild(node('span', 'og-viz-dot')); button.appendChild(node('span', '', label)); button.addEventListener('click', function () { select(c, r); }); legend.appendChild(button);
+        });
+        if (!c.rows.length || !measured) legend.appendChild(node('div', 'og-viz-unknown', 'Unmeasured' + (c.rows.length ? ' / partial data' : '')));
+        else if (!total) legend.appendChild(node('div', 'og-viz-unknown', 'Measured zero · no volume to draw'));
+        card.appendChild(legend); grid.appendChild(card); cards.push({view: view, card: card});
+        // Partial pie inputs cannot truthfully represent a whole.
+        if (T && renderer && (c.kind !== 'pie' || measured)) chart(c, index);
+        if (selected && selected.id === c.id) select(c, c.rows.filter(function (r) { return r.label === selected.label; })[0]);
+      });
+      if (!born) born = root.performance.now(); render(root.performance.now());
+    }
+    function render(now) {
+      if (!renderer || !active || root.document.hidden || dead) return;
+      var width = surface.clientWidth || 1, height = surface.offsetHeight || 1;
+      if (renderer.domElement.width !== Math.round(width * renderer.getPixelRatio()) || renderer.domElement.height !== Math.round(height * renderer.getPixelRatio())) renderer.setSize(width, height, false);
+      var rect = surface.getBoundingClientRect(), clip = scroll.getBoundingClientRect();
+      renderer.setScissorTest(false); renderer.clear(); renderer.setScissorTest(true);
+      var elapsed = Math.min(1, (now - born) / 1000), entrance = paused ? 1 : 1 - Math.pow(1 - elapsed, 3);
+      charts.forEach(function (c, i) {
+        var r = c.card.view.getBoundingClientRect();
+        if (r.bottom < clip.top || r.top > clip.bottom) return;
+        renderer.setViewport(r.left - rect.left, height - (r.bottom - rect.top), r.width, r.height);
+        renderer.setScissor(r.left - rect.left, height - (r.bottom - rect.top), r.width, r.height);
+        c.camera.aspect = r.width / Math.max(r.height, 1); c.camera.updateProjectionMatrix();
+        c.group.scale.setScalar(.12 + entrance * .88);
+        c.group.rotation.y = (1 - entrance) * Math.PI * 1.6 + (paused ? 0 : Math.sin(now / 9500 + i) * .16);
+        renderer.render(c.scene, c.camera);
+      });
+    }
+    function tick(now) {
+      if (dead) return; raf = root.requestAnimationFrame(tick);
+      if (now - lastFrame < 50) return; lastFrame = now; render(now);
+    }
+    function pick(event) {
+      if (!renderer) return;
+      var ray = new T.Raycaster(), mouse = new T.Vector2();
+      for (var i = 0; i < charts.length; i++) {
+        var c = charts[i], rect = c.card.view.getBoundingClientRect();
+        if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) continue;
+        mouse.set((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1);
+        ray.setFromCamera(mouse, c.camera); var hits = ray.intersectObjects(c.group.children, false);
+        select(c.model, hits.length ? hits[0].object.userData.row : null); return;
+      }
+    }
+    surface.addEventListener('click', pick);
+    function contextLost(event) { event.preventDefault(); lostRenderer = renderer; renderer = null; status.textContent = '3D context lost · measured legends remain available'; }
+    if (root.requestAnimationFrame && root.document.head) three(base).then(function (lib) {
+      if (dead) return;
+      try {
+        T = lib; renderer = new T.WebGLRenderer({alpha: true, antialias: true, powerPreference: 'low-power'});
+        renderer.setPixelRatio(Math.min(root.devicePixelRatio || 1, 1.25)); renderer.setClearColor(0x000000, 0);
+        renderer.domElement.className = 'og-viz-canvas'; renderer.domElement.setAttribute('aria-hidden', 'true');
+        renderer.domElement.addEventListener('webglcontextlost', contextLost);
+        surface.insertBefore(renderer.domElement, grid); signature = ''; update(data, air); raf = root.requestAnimationFrame(tick);
+      } catch (err) { status.textContent = '3D unavailable · measured legends remain available'; }
+    })['catch'](function () { if (!dead) status.textContent = 'Local Three.js unavailable · measured legends remain available'; });
+    function visibility() {
+      if (raf) { root.cancelAnimationFrame(raf); raf = 0; }
+      if (!dead && active && !root.document.hidden && renderer) raf = root.requestAnimationFrame(tick);
+    }
+    root.document.addEventListener('visibilitychange', visibility);
+    update(null, null);
+    return {update: update, fail: function () { status.textContent = 'Station unreachable ? charts show the last measured snapshot'; }, setActive: function (want) { active = want; host.hidden = !want; visibility(); }, dispose: function () {
+      dead = true; root.document.removeEventListener('visibilitychange', visibility); if (raf) root.cancelAnimationFrame(raf); releaseCharts();
+      if (lostRenderer) { lostRenderer.dispose(); lostRenderer = null; }
+      if (renderer) { renderer.domElement.removeEventListener('webglcontextlost', contextLost); renderer.dispose(); renderer.forceContextLoss(); }
+      host.textContent = '';
+    }};
+  }
+  root.PineOrchViz = {mount: mount, model: model};
 })(typeof window !== 'undefined' ? window : globalThis);

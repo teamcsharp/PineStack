@@ -58,6 +58,7 @@ def setup(owner="", listeners=(), terminals=None):
     if owner:
         ns["_AUDIO_OWNER"].update({"who": owner, "at": time.time()})
     ns["_LISTENER_SEEN"].clear()
+    ns["_PAGE_ACK_EVENTS"].clear()
     for lid, addr, ago in listeners:
         ns["_LISTENER_SEEN"][lid] = {"at": time.time() - ago, "addr": addr}
     SETTINGS["terminals"] = terminals if terminals is not None else {
@@ -126,6 +127,27 @@ check("the row's own listener id is preferred", audio_owner(), "named")
 print("\n== a stale listener does not count as present ==")
 setup(owner="", listeners=[("tab9", TAB, 500)])
 check("a listener past the lease is not 'present'", audio_owner(), "")
+
+print("\n== desktop chrome must never own the dialogue ==")
+rows = {"desktop": {"name": "This app", "play": True, "addr": DESK,
+                    "listener": "desktop-shell", "fallback": True}}
+setup(owner="desktop-shell", listeners=[("desktop-shell", DESK, 0), ("pb-player", DESK, 2)], terminals=rows)
+check("live shell nomination resolves to the embedded player", audio_owner(), "pb-player")
+setup(owner="", listeners=[("desktop-shell", DESK, 0), ("pb-player", DESK, 2)], terminals=rows)
+check("fallback prefers a player even with an explicit shell id", audio_owner(), "pb-player")
+setup(owner="desktop-shell", listeners=[("desktop-shell", DESK, 0)], terminals=rows)
+check("shell alone cannot gag the broadcast", audio_owner(), "")
+setup(owner="old-player", listeners=[("old-player", DESK, 15), ("desktop-shell", DESK, 0), ("new-player", DESK, 1)], terminals=rows)
+check("reload recovery skips the more recent shell heartbeat", audio_owner(), "new-player")
+setup(owner="pb-player", listeners=[("pb-player", DESK, 1), ("desktop-shell", DESK, 0)], terminals=rows)
+check("shell heartbeat cannot replace a live player", audio_owner(), "pb-player")
+setup(owner="sfx-tv-receipt", listeners=[("sfx-tv-receipt", DESK, 0), ("pb-player", DESK, 1)], terminals=rows)
+check("an H3 video receipt cannot own the dialogue", audio_owner(), "pb-player")
+setup(owner="old-player", listeners=[("old-player", DESK, 0), ("new-player", DESK, 2)], terminals=rows)
+ns["_PAGE_ACK_EVENTS"].extend([
+    {"listener_id": "old-player", "at": time.time(), "event": "received", "started": False},
+    {"listener_id": "new-player", "at": time.time(), "event": "playing", "started": True, "muted": True}])
+check("a stale bridge heartbeat cannot outrank advancing playback", audio_owner(), "new-player")
 
 print("\n%s  (%d failure(s))" % ("ALL PASS" if not fails else "FAILURES",
                                 len(fails)))

@@ -122,7 +122,7 @@ async function main() {
   {
     const p = new PineStreamPush({ getWin: () => fakeWin(), fetchImpl: station({ keep: true }).fetchImpl });
     const s = p.verb('run', { fps: 99, width: 5000, quality: 1 });
-    assert.deepStrictEqual([s.fps, s.width, s.quality], [5, 960, 30], 'clamped');
+    assert.deepStrictEqual([s.fps, s.width, s.quality], [60, 960, 30], 'clamped');
     const s2 = p.verb('stop', { why: 'bye' });
     assert.strictEqual(s2.running, false);
     assert.strictEqual(s2.why, 'bye');

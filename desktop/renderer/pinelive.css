@@ -675,3 +675,18 @@
 .pl-tray-audio { width: 100%; margin: 8px 0; }
 .pl-tray-row { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
 .pl-tray-sheet [hidden] { display: none !important; }
+.pl-session-record { flex: 0 0 auto; min-height: 40px; padding: 8px 14px;
+  border: 1px solid #b4515b; border-radius: 8px; background: #351b24;
+  color: #ffced3; font: 600 14px system-ui; cursor: pointer; }
+.pl-session-record.is-recording { background: #8a2538; border-color: #ff6f86; }
+.pl-session-record:disabled { opacity: .6; cursor: wait; }
+.pl-session-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.pl-session-field { display: block; margin: 8px 0; }
+.pl-session-fields input[type=checkbox] { width: 20px; height: 20px; accent-color: #49c8b0; }
+.pl-session-status { overflow-wrap: anywhere; color: #a8d4cf; }
+.pl-session-sheet:focus-within { border-color: #49c8b0; }
+/* PineDrag raises windows up to 2147483078. Keep the session's entire
+   backdrop above that range; raising the inner form cannot lift its parent. */
+.pl-session-back { z-index: 2147483079; }
+.pl-session-downloads { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0; }
+.pl-session-download { color: #65d7c3; }

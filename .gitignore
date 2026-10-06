@@ -45,3 +45,6 @@ keys/
 *.p12
 /*.png
 /tablet-anr-*.zip
+
+# session sandboxes (patch staging copies, 650 MB) - never published
+work/

@@ -1,6 +1,15 @@
 (function (root) {
   'use strict';
-  var opened = null;
+  var opened = null, selectOpenedTab = null;
+  function stopMedia(media) {
+    // Independently clean each resource: a decoder failure must not keep
+    // the popup alive or leave the gallery's broadcast hold in place.
+    try { media.autoplay = false; media.loop = false; media.muted = true; } catch (e) { /* disposed */ }
+    try { media.pause(); } catch (e) { /* decoder already gone */ }
+    try { media.removeAttribute('src'); } catch (e) { /* disposed */ }
+    try { media.querySelectorAll('source').forEach(function (source) { source.removeAttribute('src'); }); } catch (e) { /* no sources */ }
+    try { media.load(); } catch (e) { /* decoder already gone */ }
+  }
   function make(tag, cls, text) {
     var n = document.createElement(tag); n.className = cls || '';
     if (text !== undefined) n.textContent = text;
@@ -262,9 +271,17 @@
     }
     return copyByHand(text);
   }
-  function open(initial, gallery) {
+  function open(initial, gallery, options) {
+    options = options || {};
+    var activeTab = options.tab === 'supercut' ? 'supercut' : 'h3', supercutUi = null;
+    // The modal is hidden in PiP: it must not acquire an audio hold.
+    if ((document.body.classList.contains('pine-pip') && !root.PINE_NATIVE_TOOLS)) {
+      if (opened) opened();
+      return;
+    }
     if (opened) opened();
     var veil = make('div', 'pine-voice-ad-popup'); veil.id = 'pineVoiceAdPopup';
+    if (root.PINE_NATIVE_TOOLS) veil.classList.add('pip-popup-visible');
     var box = make('section', 'pine-voice-ad-card');
     box.setAttribute('role', 'dialog'); box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-label', gallery ? 'Pine Box Gallery' : 'Pine Box generated ads');
@@ -365,7 +382,7 @@
       ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
       ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief'],
       /* [h3-overview] */
-      ['kind', 'Kind', 'input', 'blank: these words. overview: a technical overview at a whiteboard - the model pitches the release-log feature {feature} rolls ({releaselog} is its entry)']];
+      ['kind', 'Kind', 'input', 'blank: these words. plotline: act out the current radio plot. overview: a technical overview at a whiteboard - the model pitches the release-log feature {feature} rolls ({releaselog} is its entry)']];
     var pInputs = {}, pLabels = {};
     P_FIELDS.forEach(function (f) {
       var label = make('label', 'pav-pr-field'), input = make(f[2]);
@@ -515,7 +532,7 @@
       name: ['Preset name', 'what this preset is called - type a new name, then Save as new to keep it as its own preset'],
       speech: ['What they say', 'the words spoken, exactly as written - {station} is the station\'s name'],
       goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too'],
-      kind: ['Kind', 'blank: what you typed above. overview: a technical overview - the model pitches a rolled changelog feature at a whiteboard']};
+      kind: ['Kind', 'blank: what you typed above. plotline: the active radio plot. overview: a technical overview - the model pitches a rolled changelog feature at a whiteboard']};
     var pMode = 'simple';
     try { pMode = root.localStorage.getItem('pinePromptMode') === 'advanced' ? 'advanced' : 'simple'; } catch (e) { /* default */ }
     var pModeBtn = pBtn('', 'c:settings--adjust', '', function () { setPromptMode(pMode === 'simple' ? 'advanced' : 'simple'); });
@@ -548,7 +565,8 @@
     var pUseNext = pBtn('The next hourly render is told these words, once', 'c:time', 'Use next hour', useNextHour);
     var pRevert = pBtn('Put back the saved words', 'c:renew', 'Revert', revertPreset);
     var pDelete = pBtn('Delete this preset', 'c:trash-can', 'Delete', deletePreset);
-    pActions.append(pSave, pSaveNew, pUseNext, pRevert, pDelete);
+    var pPlotGenerate = pBtn('Write and queue a video from the current radio plot act', 'c:video', 'Generate plot video', generatePlotVideo);
+    pActions.append(pSave, pSaveNew, pUseNext, pPlotGenerate, pRevert, pDelete);
     var pNote = make('p', 'pav-pr-note'); pNote.setAttribute('role', 'status');
     var pHoursHead = make('b', 'pav-pr-hours-head', 'Recent hours'), pHours = make('div', 'pav-pr-hours');
     pScreen.append(pTop, pNextLine, pCycle, pOdds, pForm, pActions, pNote, pHoursHead, pHours);
@@ -583,10 +601,13 @@
       pStash(); pShow(Number(pPick.value) || 0);
     });
     function paintEditState() {
+      if (pView && pState && pState.activeplot !== undefined) (pView.presets || []).forEach(function (p) { if (p.kind === "plotline") p.available = !!(pState.activeplot && pState.activeplot.id); });
       var dirty = pDirty(), p = pCurrent();
       pSave.disabled = pBusy || !dirty; pRevert.disabled = !dirty; pSaveNew.disabled = pBusy;
-      pUseNext.disabled = pBusy || !p; pDelete.disabled = pBusy || !p || ((pView && pView.presets) || []).length <= 1;
-      pActive.disabled = pBusy || !p || !!(pState && p && pState.active === p.id);
+      pPlotGenerate.hidden = !p || p.kind !== 'plotline';
+      pPlotGenerate.disabled = pBusy || !p || p.available === false || pDirty();
+      pUseNext.disabled = pBusy || !p || p.available === false; pDelete.disabled = pBusy || !p || ((pView && pView.presets) || []).length <= 1;
+      pActive.disabled = pBusy || !p || p.available === false || !!(pState && p && pState.active === p.id);
       pActive.lastChild.textContent = pState && p && pState.active === p.id ? 'Active' : 'Set active';
       pDelete.lastChild.textContent = p && pDeleteArmed === p.id ? 'Tap again to delete' : 'Delete';
       var pOpt = pPick.querySelector('option[value="' + pIndex + '"]');
@@ -594,7 +615,7 @@
     }
     function presetLabel(p, at) {
       var odds = ((pView && pView.odds) || [])[at] || {};
-      return p.name + (pState && pState.active === p.id ? ' (active)' : '')
+      return p.name + (p.available === false ? ' (start a radio plot to use)' : '') + (pState && pState.active === p.id ? ' (active)' : '')
         + (pState && pState.dice ? (odds.off ? ' - sits out' : odds.share != null ? ' - ' + odds.share + '%' : '') : '')
         + (pDrafts[p.id] && at !== pIndex ? ' - edited' : '');
     }
@@ -617,7 +638,7 @@
       var rnd = make('option', '', (pState && pState.dice ? '\u2713 ' : '') + 'Random - each hour System 3 rolls a saved preset'
         + (pState && pState.dice ? ' (on)' : ''));
       rnd.value = 'random'; pPick.appendChild(rnd);
-      presets.forEach(function (p, at) { var o = make('option', '', presetLabel(p, at)); o.value = String(at); pPick.appendChild(o); });
+      presets.forEach(function (p, at) { var o = make('option', '', presetLabel(p, at)); o.value = String(at); o.disabled = p.available === false; pPick.appendChild(o); });
       pPick.value = String(pIndex);
       pCount.textContent = presets.length ? (pIndex + 1) + ' of ' + presets.length : 'no presets';
       var p = pCurrent(), s = pState || {}, odds = ((pView && pView.odds) || [])[pIndex] || {};
@@ -694,6 +715,16 @@
         if (!gone) pNote.textContent = 'Not saved: ' + ((err && err.message) || err);
         return null;
       }).finally(function () { pBusy = false; if (!gone) paintEditState(); });
+    }
+    function generatePlotVideo() {
+      var p = pCurrent();
+      if (pBusy || !p || p.available === false || pDirty()) return;
+      pBusy = true; paintEditState(); pNote.textContent = 'Writing a scene from the current plot act...';
+      root.pineDesktop.post('/api/h3/plotline/generate', {preset_id: p.id}).then(function (got) {
+        if (!gone) pNote.textContent = got && got.queue_id ? 'Plot video queued: ' + got.script.scene + ', act ' + got.script.plot.act + '. ' + got.script.speech : 'No H3 job was confirmed.';
+      }).catch(function (err) {
+        if (!gone) pNote.textContent = 'Could not generate plot video: ' + ((err && err.message) || err);
+      }).finally(function () { pBusy = false; if (!gone) { paintEditState(); loadPrompts(true); } });
     }
     function setDice(on) {
       return pPost('/api/h3/prompts/dice', {on: !!on}, on ? 'Dice on: each hour System 3 rolls one of the saved presets.'
@@ -1348,9 +1379,49 @@
     });
     var external = make('a', 'pine-voice-ad-open', 'Open media'); external.target = '_blank'; external.rel = 'noopener';
     actions.appendChild(external); actions.appendChild(command('Close ad viewer', 'c:close--filled', close)); box.appendChild(actions);
+    /* One studio: the existing H3 controls remain in their original card. */
+    Array.from(box.children).forEach(function (child) { child.classList.add('pav-h3-content'); });
+    var tabs = make('div', 'pav-tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', 'Media studio');
+    function tabButton(name, value) {
+      var b = make('button', '', name); b.type = 'button'; b.setAttribute('role', 'tab');
+      b.id = value === 'supercut' ? 'pavSupercutTab' : 'pavH3Tab'; b.setAttribute('aria-controls', value === 'supercut' ? 'pavSupercutPanel' : 'pavH3Panel');
+      b.addEventListener('click', function () { selectTab(value); });
+      b.addEventListener('keydown', function (event) {
+        if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+          event.preventDefault(); var nextTab = activeTab === 'h3' ? 'supercut' : 'h3'; selectTab(nextTab);
+          (nextTab === 'h3' ? h3Tab : supercutTab).focus();
+        }
+      });
+      tabs.appendChild(b); return b;
+    }
+    var supercutTab = tabButton('Supercuts', 'supercut'), h3Tab = tabButton('H3 / Comfy renders', 'h3');
+    box.insertBefore(tabs, box.firstChild);
+    stage.id = 'pavH3Panel'; stage.setAttribute('role', 'tabpanel'); stage.setAttribute('aria-labelledby', h3Tab.id);
+    if (!root.pineCloseX) { var hubClose = make('button', 'pav-hub-close', '?'); hubClose.type = 'button'; hubClose.setAttribute('aria-label', 'Close media studio'); hubClose.addEventListener('click', close); tabs.appendChild(hubClose); }
+    function selectTab(value) {
+      if (gone) return;
+      activeTab = value === 'supercut' ? 'supercut' : 'h3';
+      if (activeTab === 'supercut') {
+        if (gallery && !pScreen.hidden) { pStash(); pScreen.hidden = true; box.classList.remove('pav-on-prompts'); pButton.setAttribute('aria-expanded', 'false'); }
+        stage.querySelectorAll('video').forEach(function (media) { try { media.pause(); } catch (e) { /* decoder gone */ } });
+        if (duckApi && duckApi.release) duckApi.release('pine-box-gallery'); duckApi = null;
+        if (!supercutUi && root.PineSupercutReview) {
+          supercutUi = root.PineSupercutReview.mount(box, options.supercut || null, {selectTab: selectTab});
+          supercutUi.panel.id = 'pavSupercutPanel'; supercutUi.panel.setAttribute('role', 'tabpanel'); supercutUi.panel.setAttribute('aria-labelledby', supercutTab.id);
+        }
+      } else {
+        if (gallery && root.PineDuck && typeof root.PineDuck.hold === 'function' && !duckApi) { duckApi = root.PineDuck; duckApi.hold('pine-box-gallery', 0.05, veil); }
+      }
+      box.classList.toggle('pav-supercut-view', activeTab === 'supercut');
+      supercutTab.setAttribute('aria-selected', String(activeTab === 'supercut')); h3Tab.setAttribute('aria-selected', String(activeTab === 'h3'));
+      supercutTab.tabIndex = activeTab === 'supercut' ? 0 : -1; h3Tab.tabIndex = activeTab === 'h3' ? 0 : -1;
+      if (supercutUi) supercutUi.setActive(activeTab === 'supercut');
+    }
+    selectOpenedTab = selectTab;
     veil.appendChild(box); document.body.appendChild(veil);
+    selectTab(activeTab);
     if (window.pineCloseX) { window.pineCloseX(box, function () { close(); }, {label: 'Close the ad viewer'}); }  // [closex:ad-viewer]
-    if (gallery && root.PineDuck && typeof root.PineDuck.hold === 'function') {
+    if (gallery && activeTab === 'h3' && !duckApi && root.PineDuck && typeof root.PineDuck.hold === 'function') {
       duckApi = root.PineDuck;
       duckApi.hold('pine-box-gallery', 0.05, veil);
     }
@@ -1367,21 +1438,31 @@
       }
     }
     document.addEventListener('keydown', keys, true);
-    function close() {
+    function close(immediate) {
+      if (gone) return;
       gone = true; revision++; clearInterval(crawl); clearInterval(h3Timer);
+      if (supercutUi) { supercutUi.dispose(); supercutUi = null; }
+      selectOpenedTab = null;
+      stage.querySelectorAll('video').forEach(stopMedia);
       clearInterval(pTimer); pBackOff();                               /* [h3-prompts] */
       clearTimeout(exportTimer);
       if (rollTag) { try { rollTag.dispose(); } catch (e) { /* gone */ } rollTag = null; }   /* [ad-roll] */
       var rollPop = document.getElementById('pavRollPop'); if (rollPop) rollPop.remove();
       /* [vcrfx: the video goes off the way it came on] */
       var vcrMedia = stage.querySelector('video.pav-media');
-      if (root.PineVcr && vcrMedia && vcrMedia.style.visibility === 'visible' && vcrMedia.isConnected) {
+      if (immediate !== true && root.PineVcr && vcrMedia && vcrMedia.style.visibility === 'visible' && vcrMedia.isConnected) {
         var vcrDispose = disposeMedia;
         disposeMedia = function () {};
         try { vcrMedia.pause(); } catch (e) { /* it stops with the veil */ }
-        root.PineVcr.out(vcrMedia).then(function () { vcrDispose(); veil.remove(); });
-      } else { disposeMedia(); veil.remove(); }
-      if (duckApi && typeof duckApi.release === 'function') duckApi.release('pine-box-gallery');
+        var finished = false, closeTimer;
+        function finishClose() {
+          if (finished) return; finished = true; clearTimeout(closeTimer);
+          try { vcrDispose(); } catch (e) { /* already disposed */ } finally { veil.remove(); }
+        }
+        closeTimer = setTimeout(finishClose, 1000);
+        try { Promise.resolve(root.PineVcr.out(vcrMedia)).then(finishClose, finishClose); } catch (e) { finishClose(); }
+      } else { try { disposeMedia(); } catch (e) { /* remaining cleanup still runs */ } finally { veil.remove(); } }
+      if (duckApi && typeof duckApi.release === 'function') { try { duckApi.release('pine-box-gallery'); } catch (e) { /* remaining cleanup still runs */ } }
       duckApi = null;
       if (posterObserver) posterObserver.disconnect(); posterQueue = [];
       document.removeEventListener('keydown', keys, true); opened = null;
@@ -1476,6 +1557,7 @@
         .finally(function () { if (!gone && current === revision) save.disabled = false; });
     }
     function paint(fromStrip) {
+      if (gone) return;
       var current = ++revision;
       disposeMedia(); disposeMedia = function () {}; clearTimeout(exportTimer); stage.replaceChildren();
       var row = rows[index], file = mediaFile(row), scene = null, frame = 0, timer = 0;
@@ -1534,6 +1616,9 @@
       }
       function failed(words) {
         if (gone || current !== revision) return;
+        // Hiding a failed/late frame does not stop its audio. Stop the
+        // failed attempt before presenting the retry control.
+        if (isVideo) { try { media.pause(); } catch (e) { /* decoder failed */ } }
         clearTimeout(timer); media.style.visibility = 'hidden'; background(true);
         play.disabled = false; play.title = 'Retry Pine Box ad'; play.setAttribute('aria-label', play.title);
         status.textContent = words;
@@ -1551,10 +1636,14 @@
           if (media.readyState >= 2 && media.videoWidth > 0) reveal();
         });
         media.addEventListener('playing', function () {
+          if (gone || activeTab !== 'h3' || current !== revision || (document.body.classList.contains('pine-pip') && !root.PINE_NATIVE_TOOLS)) {
+            media.pause(); return;
+          }
           if (media.requestVideoFrameCallback) frame = media.requestVideoFrameCallback(reveal);
           else if (media.readyState >= 2 && media.videoWidth > 0) reveal();
         });
         function startMedia() {
+          if (gone || activeTab !== 'h3' || current !== revision || (document.body.classList.contains('pine-pip') && !root.PINE_NATIVE_TOOLS)) return;
           if (!signatures[file]) { failed('Media access is unavailable. Close and reopen this ad to refresh its file link.'); return; }
           status.textContent = 'Loading video...'; play.disabled = true;
           clearTimeout(timer);
@@ -1577,9 +1666,9 @@
       }
       disposeMedia = function () {
         clearTimeout(timer); document.removeEventListener('visibilitychange', visibility);
-        if (frame && media.cancelVideoFrameCallback) media.cancelVideoFrameCallback(frame);
-        if (isVideo) { media.pause(); media.removeAttribute('src'); media.load(); }
-        if (scene) scene.dispose();
+        if (frame && media.cancelVideoFrameCallback) { try { media.cancelVideoFrameCallback(frame); } catch (e) { /* already cancelled */ } }
+        if (isVideo) stopMedia(media);
+        if (scene) { try { scene.dispose(); } catch (e) { /* already disposed */ } }
       };
     }
     previous.disabled = true; next.disabled = true;
@@ -1597,7 +1686,7 @@
         }
       }
       if (rows.length) paint(); else if (!loadFailed) status.textContent = 'No completed media in the gallery yet.';
-      if (gallery) motion.focus();
+      if (gallery && activeTab === 'h3') motion.focus();
     });
     actions.insertBefore(command('Refresh gallery', 'c:renew', function () {
       if (loading) return;
@@ -1606,7 +1695,7 @@
       loadPage().then(function () { if (!gone && rows.length) paint(); });
     }), external);
     if (gallery) crawl = setInterval(function () {
-      if (gone || document.hidden || motion.dataset.paused || Date.now() < pausedUntil || loading || loadFailed) return;
+      if (gone || activeTab !== 'h3' || document.hidden || motion.dataset.paused || Date.now() < pausedUntil || loading || loadFailed) return;
       strip.scrollLeft += 1;
       if (strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 3) {
         if (stripStart + 80 < rows.length) { stripStart += 40; paintStrip(false); }
@@ -1615,7 +1704,10 @@
       }
     }, 40);
   }
-  root.PineAdViewer = {open: open, openGallery: function () { open(null, true); }, close: function () { if (opened) opened(); }, mediaFile: mediaFile,
+  root.PineAdViewer = {open: open, openGallery: function () { open(null, true); },
+    openSupercuts: function (initial) { open(null, true, {tab: 'supercut', supercut: initial || null}); },
+    selectTab: function (tab) { if (selectOpenedTab) selectOpenedTab(tab); else open(null, true, {tab: tab}); }, close: function () { if (opened) opened(); },
+    recover: function () { if (opened) opened(true); }, mediaFile: mediaFile,
     usedWords: usedWords,                                              /* [h3-prompts] the words a video was told */
     rollRows: rollRows};                                               /* [ad-roll] what the header's roll plays */
   if (typeof module !== 'undefined') module.exports = root.PineAdViewer;

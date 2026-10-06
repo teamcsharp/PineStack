@@ -1,0 +1,18 @@
+/* Same pane, the complete typeset Gazette; the original script stays mounted. */
+.sp-gazette { grid-row:2; grid-column:1; z-index:5; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); min-width:0; min-height:0; overflow:hidden; border:1px solid var(--sp-line,#35414c); border-radius:7px; background:var(--sp-bg,#101419); }
+.sp-gazette[hidden], .sp-gazette-title[hidden], .sp-gazette-shelf[hidden] { display:none!important; }
+.sp-gazette-on .sp-script-title-row > .sp-scripthead, .sp-gazette-on .sp-prompt-dock { display:none; }
+.sp-gazette-title { flex:1 1 0; min-width:0; min-height:32px; padding:5px 8px; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--sp-text,#edf3f5); font-size:12px; font-weight:650; touch-action:none; cursor:ew-resize; }
+.sp-gazette-toggle[aria-pressed="true"] { color:var(--sp-on,#65c7da); border-color:var(--sp-on,#65c7da); background:#193940; }
+.sp-gazette-bar, .sp-gazette-styles, .sp-gazette-shelf { display:flex; align-items:center; min-width:0; gap:4px; padding:5px 6px; background:var(--sp-panel,#1c242c); border-bottom:1px solid var(--sp-line,#35414c); }
+.sp-gazette-bar button, .sp-gazette-refresh { flex:0 0 32px; width:32px; min-height:32px; padding:0; }
+.sp-gazette-scrub { flex:1 1 0; min-width:24px; width:100%; height:32px; padding:0; accent-color:var(--sp-on,#65c7da); touch-action:pan-x; }
+.sp-gazette-count { flex:0 0 auto; font:10px/1.2 ui-monospace,monospace; color:var(--sp-muted,#8fa0ad); white-space:nowrap; }
+.sp-gazette-issues { flex:1 1 0; min-width:0; width:100%; min-height:36px; padding:4px; color:var(--sp-text,#edf3f5); background:var(--sp-bg,#101419); }
+.sp-gazette-styles button { min-height:30px; font-size:11px; padding:3px 8px; }
+.sp-gazette-styles button[aria-pressed="true"] { color:var(--sp-on,#65c7da); border-color:var(--sp-on,#65c7da); }
+.sp-gazette-status { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; color:var(--sp-muted,#8fa0ad); }
+.sp-gazette-frame { grid-row:4; border:0; width:100%; height:100%; min-height:0; background:#f7f4e9; }
+@media(max-width:700px) { .sp-gazette-count { max-width:46px; overflow:hidden; } .sp-gazette-bar { gap:2px; padding:3px; } .sp-gazette-styles button { padding:3px 6px; } }
+
+@media(max-width:900px){.pine-view-host.open.sp-page.sp-gazette-on,.sp-page.sp-gazette-on{grid-template-rows:minmax(0,1fr);overflow:hidden;}.sp-page.sp-gazette-on>.sp-left{display:none;}.sp-page.sp-gazette-on>.sp-right{grid-row:1;grid-column:1;min-height:0;}}

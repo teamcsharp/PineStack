@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PineViz</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #020a26; overflow: hidden; font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #help { position: fixed; left: 12px; bottom: 10px; color: #9fb7dc; font: 11px/1.5 system-ui, sans-serif; opacity: .55; pointer-events: none; }
+  body.bare #help, body.bare .pineviz-radio, body.bare .pineviz-selector { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="help">click the background to cycle · 1-0 modes · P palette · ` HUD · O overlay · ?demo=scene&amp;palette=neon&amp;quality=ultra&amp;provider=mic|external&amp;ws=url&amp;bare=1</div>
+<script src="../../vendor/three.min.js"></script>
+<script src="core/PineViz.js"></script>
+<script src="core/Renderer.js"></script>
+<script src="core/VisualizerManager.js"></script>
+<script src="audio/Providers.js"></script>
+<script src="ui/Overlay.js"></script>
+<script src="visualizers/_shared.js"></script>
+<script src="visualizers/01-SmoothWave.js"></script>
+<script src="visualizers/02-ParticleFlow.js"></script>
+<script src="visualizers/03-LineSpectrum.js"></script>
+<script src="visualizers/04-GeometricSpace.js"></script>
+<script src="visualizers/05-SpeedLines.js"></script>
+<script src="visualizers/06-AnimeInk.js"></script>
+<script src="visualizers/07-AudioBars.js"></script>
+<script src="visualizers/08-LiquidGlass.js"></script>
+<script src="visualizers/09-RetroGrid.js"></script>
+<script src="visualizers/10-ShapeBurst.js"></script>
+<script>
+(function () {
+  const q = new URLSearchParams(location.search);
+  if (q.get('bare')) document.body.classList.add('bare');
+  const stage = document.getElementById('stage');
+  const provider = q.get('provider') === 'mic' ? new PineViz.MicrophoneProvider()
+    : q.get('provider') === 'external' ? new PineViz.ExternalProvider({ url: q.get('ws') || '' })
+    : new PineViz.DemoProvider({ hold: q.get('demo') || null });
+  const manager = PineViz.mount(stage, { palette: q.get('palette') || 'playstation', quality: q.get('quality') || 'high', mode: q.get('mode') || undefined, provider, transition: q.get('transition') || 'crossfade' });
+  const overlay = new PineViz.RadioOverlay(stage, { program: 'The Pine Box Hour', host: 'Dill and Skip', track: 'Steamed Shrimp Break', artist: 'The Polish Ambassador', caller: '', status: 'Live' });
+  const selector = new PineViz.VisualizerSelector(stage, manager, { alwaysShow: !!q.get('selector') });
+  const hud = new PineViz.DebugHUD(stage, manager, { production: !!q.get('production'), show: !!q.get('hud') });
+  manager.on((kind, value, m) => {
+    if (kind === 'frame') overlay.update(value);
+    if (kind === 'mode') { const def = m.modes.find(x => x.id === value); if (def) overlay.notify(String(def.index).padStart(2, '0') + ' ' + def.name); }
+  });
+  window.addEventListener('keydown', e => { if (e.key === 'o' || e.key === 'O') overlay.show(overlay.root.style.display === 'none'); });
+  window.pineViz = { manager, overlay, selector, hud, provider };
+})();
+</script>
+</body>
+</html>

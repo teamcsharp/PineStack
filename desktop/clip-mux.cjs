@@ -42,11 +42,9 @@ const FFMPEG_LIKELY = [
   '/usr/local/bin/ffmpeg'
 ];
 
-/* Round both dimensions DOWN to even. See the note beside its use in
- * planArgs: libx264 refuses odd dimensions under yuv420p and reports it
- * as a generic encoder failure. Down rather than up, because padding
- * adds a one-pixel band of black that shows on a screen recording. */
-const EVEN = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+/* H.264 4:2:0 requires even dimensions. Pad by at most one pixel so every
+ * native source pixel survives; scaling or rounding down blurs/crops text. */
+const EVEN = 'pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:color=black';
 
 /* SAYING WHAT COLOUR THE FILE IS.
  *
@@ -91,9 +89,28 @@ function findFfmpeg(configured) {
     found: false, tried };
 }
 
-function run(exe, args, timeoutMs) {
+/* [pip-export-bar] ffmpeg's -progress report, line by line, as seconds written so far.
+ * out_time_us and out_time_ms are both microseconds (ffmpeg's own quirk); out_time is a clock. */
+function progressFeed(onProgress) {
+  let rest = '';
+  return chunk => {
+    rest += String(chunk);
+    const lines = rest.split(/\r?\n/); rest = lines.pop();
+    for (const line of lines) {
+      const micro = /^out_time_(?:us|ms)=(\d+)\s*$/.exec(line);
+      const clock = micro ? null : /^out_time=(\d+):(\d+):(\d+(?:\.\d+)?)\s*$/.exec(line);
+      const seconds = micro ? Number(micro[1]) / 1e6 : clock ? Number(clock[1]) * 3600 + Number(clock[2]) * 60 + Number(clock[3]) : null;
+      if (seconds !== null && Number.isFinite(seconds)) { try { onProgress(seconds); } catch (_) { /* a listener's slip never stops the encode */ } }
+    }
+  };
+}
+
+function run(exe, args, timeoutMs, onProgress) {
+  const told = typeof onProgress === 'function' ? onProgress : null;
+  /* [pip-export-bar] with a listener, ffmpeg writes its clock to stdout and nothing else goes there */
+  const spawnArgs = told ? ['-progress', 'pipe:1', '-nostats', ...args] : args;
   return new Promise((resolve, reject) => {
-    execFile(exe, args, { maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs || 300000 },
+    const worker = execFile(exe, spawnArgs, { windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs || 300000 },
       (error, stdout, stderr) => {
         const said = String(stderr || '') + String(stdout || '');
         if (error) {
@@ -103,6 +120,12 @@ function run(exe, args, timeoutMs) {
         }
         resolve(said);
       });
+    if (told && worker?.stdout) worker.stdout.on('data', progressFeed(told));
+    // Exports yield CPU time to the live display/audio when the host is busy.
+    // A driver/policy that refuses priority changes must not break an export.
+    try {
+      if (worker?.pid) os.setPriority(worker.pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
+    } catch (error) { /* best effort for a worker that may already have exited */ }
   });
 }
 
@@ -115,10 +138,57 @@ function lastReal(text) {
    * "at least one of its streams received no packets" - while the sentence
    * that says WHY sits several lines above it. Two lines was enough to know
    * that something had failed and never enough to know what. */
-  const said = lines.slice(-6);
+  const causes = lines.filter(line => /InitializeEncoder|Cannot load|No capable|unsupported|not supported|Unknown encoder|No such file|Permission denied|Frame Dimension|Error initializing|Error opening|Invalid data/i.test(line));
+  const said = [...new Set([...causes.slice(0, 2), ...lines.slice(-6)])];
   const useful = said.filter(
     (l) => !/^(ffmpeg version|built with|configuration:)/.test(l));
-  return (useful.length ? useful : said).join(' | ').slice(0, 600);
+  return (useful.length ? useful : said).join(' | ').slice(0, 900);
+}
+
+/* Probe a real frame, not just the encoder list: a compiled hardware encoder
+ * can still lack a driver/device. Share probes across concurrent exports. */
+const encoderProbes = new Map();
+const HARDWARE_ENCODERS = ['h264_nvenc', 'h264_qsv', 'h264_amf'];
+function encoderArgs(encoder) {
+  if (encoder === 'h264_nvenc') return ['-c:v', encoder, '-preset', 'p5', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0'];
+  if (encoder === 'h264_qsv') return ['-c:v', encoder, '-preset', 'medium', '-global_quality', '18'];
+  if (encoder === 'h264_amf') return ['-c:v', encoder, '-quality', 'quality', '-rc', 'cqp', '-qp_i', '18', '-qp_p', '18', '-qp_b', '20'];
+  return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18'];
+}
+async function availableEncoders(exe, options) {
+  const mode = String((options || {}).encoder || 'auto');
+  if (mode === 'cpu' || mode === 'libx264') return { encoders: ['libx264'], failures: [] };
+  const key = exe + ':' + mode;
+  if (!encoderProbes.has(key)) encoderProbes.set(key, (async () => {
+    const encoders = [], failures = [];
+    const candidates = HARDWARE_ENCODERS.includes(mode) ? [mode] : HARDWARE_ENCODERS;
+    for (const encoder of candidates) {
+      try {
+        await run(exe, ['-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi',
+          '-i', 'color=c=black:s=640x360:r=60', '-frames:v', '1', '-an',
+          ...encoderArgs(encoder), '-pix_fmt', 'yuv420p', '-f', 'null', '-'], 15000);
+        encoders.push(encoder);
+        break; // One working GPU plus the CPU fallback is enough; do not probe idle vendors.
+      } catch (error) { failures.push(encoder + ': ' + error.message); }
+    }
+    return { encoders: [...encoders, 'libx264'], failures };
+  })());
+  return encoderProbes.get(key);
+}
+async function encodeVideo(exe, build, options) {
+  const available = await availableEncoders(exe, options);
+  const failures = [];
+  for (const encoder of available.encoders) {
+    try {
+      await run(exe, build(encoder), (options || {}).timeoutMs || 600000, (options || {}).onProgress);
+      return { encoder, hardware: encoder !== 'libx264',
+        fallback_detail: [...(encoder === 'libx264' ? available.failures : []), ...failures].join(' | '), probe_failures: available.failures };
+    } catch (error) {
+      failures.push(encoder + ': ' + error.message);
+      // Retry the SAME inputs and audio graph with the next encoder.
+    }
+  }
+  throw new Error('The recording could not be encoded: ' + failures.join(' | '));
 }
 
 function dbToLinear(db) {
@@ -135,7 +205,8 @@ function dbToLinear(db) {
  * Split out and exported so the filter graph can be read - and tested -
  * without a tablet, a recording, or ffmpeg itself.
  *
- * @param plan.video        path to the silent mp4
+ * @param plan.video        path to the mp4
+ * @param plan.embeddedAudio keep the captured playback track from this mp4
  * @param plan.broadcast    {path, offset} or null
  * @param plan.mic          {path, offset} or null
  * @param plan.inPoint      seconds into the video
@@ -154,8 +225,17 @@ function planArgs(plan) {
   const sources = [];
   let index = 1;
 
+  if (plan.embeddedAudio) {
+    const chain = ['atrim=start=' + inAt.toFixed(3) + ':end=' + outAt.toFixed(3), 'asetpts=PTS-(' + inAt.toFixed(3) + ')/TB'];
+    const gain = dbToLinear((plan.gains || {}).broadcast);
+    if (gain !== 1) chain.push('volume=' + gain.toFixed(4));
+    if (plan.mono) chain.push('aformat=channel_layouts=mono');
+    parts.push('[0:a]' + chain.join(',') + '[broadcast]');
+    sources.push('broadcast');
+  }
+
   for (const [name, track] of [['broadcast', plan.broadcast], ['mic', plan.mic]]) {
-    if (!track || !track.path) continue;
+    if (!track || !track.path || (plan.embeddedAudio && name === 'broadcast')) continue;
     const offset = Number(track.offset) || 0;
     args.push('-i', track.path);
     const gain = dbToLinear((plan.gains || {})[name]);
@@ -188,11 +268,8 @@ function planArgs(plan) {
    * size the operator dragged it to - measured at 1983x1234 on the run that
    * found this - so roughly half of all window sizes would have failed. The
    * tablet is 1340x800 and would never have shown it. */
-  /* THE CROP GOES BEFORE THE EVEN-ROUNDING, so what is rounded is the
-   * cropped picture rather than the whole frame. The renderer has already
-   * clamped the box inside the source and rounded it - it is the only side
-   * that knows the video's real dimensions - and EVEN behind it is the belt
-   * to that braces. */
+  /* Crop first, then pad only the missing even edge. The source pixels
+   * retain their size and the last native row/column survives. */
   const cut = [];
   const crop = plan.crop;
   if (crop && Number(crop.w) > 0 && Number(crop.h) > 0) {
@@ -239,7 +316,8 @@ function planArgs(plan) {
     cut.push('unsharp=5:5:0.8:5:5:0.0');
   }
   parts.push('[0:v]trim=start=' + inAt.toFixed(3) + ':end=' + outAt.toFixed(3)
-    + ',setpts=PTS-STARTPTS,' + (cut.length ? cut.join(',') + ',' : '')
+    + ',' + (plan.embeddedAudio ? 'setpts=PTS-(' + inAt.toFixed(3) + ')/TB' : 'setpts=PTS-STARTPTS')
+    + ',' + (cut.length ? cut.join(',') + ',' : '')
     + EVEN + '[v]');
 
   let audioOut = '';
@@ -265,7 +343,7 @@ function planArgs(plan) {
   if (audioOut) {
     args.push('-map', audioOut);
     args.push('-c:a', 'aac', '-b:a', '192k');
-    if (plan.mono || sources.length === 1) args.push('-ac', '1');
+    if (plan.mono || (sources.length === 1 && !plan.embeddedAudio)) args.push('-ac', '1');
   } else {
     args.push('-an');
   }
@@ -273,7 +351,7 @@ function planArgs(plan) {
    * is the tag and not a conversion - but without it the tag was being
    * dropped on the way out and the file became a guess again. */
   args.push(...SAY_COLOUR);
-  args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+  args.push(...encoderArgs(plan.encoder),
     /* yuv420p or the file will not play in half the things it is sent to,
      * including Windows' own preview. */
     '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
@@ -283,9 +361,9 @@ function planArgs(plan) {
 
 async function mux(plan, options) {
   const tool = findFfmpeg((options || {}).ffmpeg);
-  const args = planArgs(plan);
+  let encoding;
   try {
-    await run(tool.path, args, 600000);
+    encoding = await encodeVideo(tool.path, encoder => planArgs({ ...plan, encoder }), options);
   } catch (error) {
     if (!tool.found) {
       throw new Error('ffmpeg was not found on this machine, so the sound '
@@ -296,15 +374,14 @@ async function mux(plan, options) {
   let bytes = 0;
   try { bytes = fs.statSync(plan.out).size; } catch (error) { bytes = 0; }
   if (!bytes) throw new Error('ffmpeg finished but wrote nothing');
-  return { ok: true, path: plan.out, bytes, ffmpeg: tool.path };
+  return { ok: true, path: plan.out, bytes, ffmpeg: tool.path, encoding };
 }
 
 /* A place to park the three pieces of one recording while the operator
  * decides what to do with them. One folder per recording so a second
  * recording cannot half-overwrite the first. */
 function stash() {
-  const dir = path.join(os.tmpdir(), 'pinebox-clip-' + Date.now());
-  fs.mkdirSync(dir, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinebox-clip-'));
   return dir;
 }
 
@@ -342,10 +419,10 @@ async function fromFrames({ dir, pattern, fps, out }, options) {
   return { ok: true, path: out, bytes };
 }
 
-module.exports = { planArgs, mux, findFfmpeg, dbToLinear, stash, forget, lastReal,
+module.exports = { planArgs, mux, findFfmpeg, dbToLinear, stash, forget, lastReal, progressFeed,
   /* #1182: the screen ring runs its own concat and its own frame pull, and
    * it must use THIS runner - the one that turns ffmpeg's wall of chatter
    * into the one line that says why it refused. A second execFile beside it
    * would report exit codes, which name nothing. */
-  run,
+  run, encoderArgs, availableEncoders, encodeVideo,
   fromFrames };

@@ -41,13 +41,14 @@ ROUTES (install):
 from __future__ import annotations
 
 import hmac
+import asyncio
 import threading
 import time
 from typing import Any, Callable
 
 try:   # module level: the routes' annotations are resolved against these globals
     from fastapi import Header, HTTPException, Request
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
 except Exception:  # noqa: BLE001  (a test without fastapi still imports the logic)
     Header = HTTPException = Request = JSONResponse = Response = None  # type: ignore
 
@@ -56,7 +57,7 @@ MAX_BYTES = 700_000      # one JPEG; a 960 px screen at q90 is ~250 kB
 VIEWER_S = 12.0          # a viewer who fetched within this is watching
 CHECKIN_S = 20.0         # [pinestream-choose] a screen whose agent asked within this is there
 SOURCES = {"pinetab": "the PineTab", "pineapp": "the Pine app"}
-LIMITS = {"stream_fps": (1, 5, 2), "stream_width": (320, 960, 640),
+LIMITS = {"stream_fps": (1, 60, 30), "stream_width": (320, 960, 640),
           "stream_quality": (30, 90, 60)}
 PREVIEW_KEY = "pinestream-preview"
 
@@ -113,6 +114,8 @@ class PineStream:
         self._flips_fn = flips
         self.clock = clock
         self.lock = threading.Lock()
+        self.revision = 0
+        self.subscribers = {}
         self.viewers: dict[str, float] = {}
         self.frames_total = 0
         self.sign: Callable[[str], str] = lambda key: ""
@@ -152,7 +155,15 @@ class PineStream:
             return 0
 
     def choice(self) -> dict[str, Any]:
-        return clamp_choice(self.settings())
+        choice = clamp_choice(self.settings())
+        try:
+            import pinelive
+            session = getattr(pinelive.PL, 'session', None)
+            if session and session.screen_wanted():
+                choice.update(on=True, source='pinetab')
+        except ImportError:
+            pass
+        return choice
 
     def _drop_if_off(self, on: bool) -> None:
         if not on and (self.jpeg or self.source):
@@ -201,7 +212,52 @@ class PineStream:
                 self.size = jpeg_size(body)
             elif self.jpeg or self.private:
                 self.at = now          # unchanged screen / still private: still here
+        if body or private:
+            self.notify()
         return 200, dict(out, keep=True, say="")
+
+    def notify(self) -> None:
+        with self.lock:
+            self.revision += 1
+            subscribers = list(self.subscribers.values())
+        for loop, event in subscribers:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
+
+    async def live_frames(self, allowed: Callable[[], bool], who: str = ""):
+        """One latest frame per subscriber, with no queue of old video."""
+        event = asyncio.Event()
+        key = object()
+        with self.lock:
+            self.subscribers[key] = (asyncio.get_running_loop(), event)
+        last = -1
+        previous_state = ""
+        try:
+            while allowed():
+                self.seen(who)
+                event.clear()
+                jpeg, state = self.frame()
+                if state == "off":
+                    break
+                with self.lock:
+                    revision, at = self.revision, self.at
+                if jpeg and (revision != last or state != previous_state):
+                    last, previous_state = revision, state
+                    self.seen(who)
+                    yield (b"--pineframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                           + str(len(jpeg)).encode() + b"\r\nX-PineStream-Sequence: "
+                           + str(revision).encode() + b"\r\nX-PineStream-At: "
+                           + str(int(at * 1000)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
+                    continue
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            with self.lock:
+                self.subscribers.pop(key, None)
 
     # -- the viewers' road ----------------------------------------------------------
     def picture(self) -> str:
@@ -246,6 +302,8 @@ class PineStream:
         """What a tune page needs: whether to show the window, what is in it,
         and the switch's flips (so a page replays each one on its CRT)."""
         c = self.choice()
+        # Recording can keep the source capturing while public display is off.
+        may = bool(may and clamp_choice(self.settings())['on'])
         state = self.picture() if may else "off"
         return {"show": bool(may and c["on"]), "state": state,
                 "fps": c["fps"], "source": c["source"],
@@ -335,6 +393,7 @@ def mine_for(t: str, public: bool) -> dict[str, Any]:
             may = not public            # the house; its reads were checked by the caller
         ans = PS.viewer(may)
         ans["frame"] = "/api/pinestream/frame.jpg" + ("?t=" + t if t else "")
+        ans["stream"] = "/api/pinestream/live.mjpg" + ("?t=" + t if t else "")
         return ans
     except Exception:  # noqa: BLE001
         return {"show": False, "state": "off", "switch": {"on": False, "flips": 0, "yours": False}}
@@ -373,6 +432,33 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
             return ""
 
     no_store = {"Cache-Control": "no-store"}
+
+    @app.get("/api/pinestream/live.mjpg")
+    async def pinestream_live_get(request: Request, t: str = "", s: str = "",
+                                  authorization: str | None = Header(default=None)) -> Any:
+        public = request.headers.get("x-pinebox-public") == "1"
+        who = ""
+        if t:
+            if not listen_ok(t):
+                raise HTTPException(status_code=403, detail="that tune-in link is not live")
+            who = "t:" + (tag_of(t) or t[-12:])
+        elif s and not public:
+            expected = sign(PREVIEW_KEY)
+            if not (expected and hmac.compare_digest(s, expected)):
+                raise HTTPException(status_code=403, detail="that preview link is not this station's")
+        else:
+            if public:
+                raise HTTPException(status_code=403, detail="a tune-in link is required here")
+            read_auth(authorization)
+            who = "h:" + str(getattr(request.client, "host", "") or "")
+        def allowed() -> bool:
+            return bool((not t or listen_ok(t)) and
+                        (not (t or public) or clamp_choice(PS.settings())["on"]))
+        if not allowed() or PS.picture() == "off":
+            return Response(status_code=404, headers=no_store)
+        return StreamingResponse(PS.live_frames(allowed, who),
+                                 media_type="multipart/x-mixed-replace; boundary=pineframe",
+                                 headers={**no_store, "X-Accel-Buffering": "no"})
 
     @app.post("/api/pinestream/frame")
     async def pinestream_frame_post(request: Request, source: str = "", private: int = 0,
@@ -419,6 +505,8 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
             read_auth(authorization)
             who = "h:" + str(getattr(request.client, "host", "") or "")
         jpeg, state = PS.frame()
+        if t and not clamp_choice(PS.settings())['on']:
+            return Response(status_code=404, headers=dict(no_store, **{'X-PineStream': 'off'}))
         if jpeg is None:
             return Response(status_code=404, headers=dict(no_store, **{"X-PineStream": state}))
         PS.seen(who)

@@ -15,7 +15,7 @@ test('a live process pair with no first frame is actively rebuilt', () => {
   assert.equal(why, 'no first frame arrived');
 });
 
-test('a process pair that stops producing frames is actively rebuilt', () => {
+test('a stalled frame pipe is rebuilt when its recorder no longer answers', async () => {
   const mirror = new Mirror();
   mirror.running = true;
   mirror.pipeAt = 1000;
@@ -24,8 +24,10 @@ test('a process pair that stops producing frames is actively rebuilt', () => {
   mirror.lastFrameAt = 2000;
   let why = '';
   mirror.rebuild = value => { why = value; };
-  assert.equal(mirror.health(7001), true);
-  assert.equal(why, 'frame pipe stalled');
+  mirror.recorderAlive = async () => false;
+  assert.equal(mirror.health(7001), false);
+  await Promise.resolve();
+  assert.equal(why, 'frame pipe stalled: the tablet recorder is not answering');
 });
 
 test('a slow local viewer drops stale frames instead of growing a queue', () => {

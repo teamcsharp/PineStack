@@ -1,0 +1,15 @@
+{
+  "_about": "PineViz presets. Each visualizer's adjustable properties; the common eight apply to every mode, the rest are the mode's own. PresetManager.load() takes this shape; the HUD edits it live and keeps the operator's values in localStorage under pineviz.presets.",
+  "_common": { "intensity": 1, "speed": 1, "audioSensitivity": 1, "smoothing": 1, "bloom": 0.5, "opacity": 1, "complexity": 1, "motionAmount": 1 },
+  "smooth-wave": { "ribbons": 6, "width": 1, "bloom": 0.55 },
+  "particle-flow": { "particles": 24000, "size": 1, "bloom": 0.6 },
+  "line-spectrum": { "lines": 34, "indicators": 28, "bloom": 0.45 },
+  "geometric-space": { "objects": 26, "glass": 1, "bloom": 0.5 },
+  "speed-lines": { "streaks": 520, "trail": 0.82, "bloom": 0.5 },
+  "anime-ink": { "ink": 1, "bloom": 0.2 },
+  "audio-bars": { "columns": 80, "height": 1, "bloom": 0.55 },
+  "liquid-glass": { "droplets": 18, "thickness": 1, "bloom": 0.45 },
+  "retro-grid": { "density": 1, "fog": 1, "bloom": 0.6 },
+  "shape-burst": { "symbols": 360, "trail": 0.55, "bloom": 0.5 },
+  "_palettes": ["playstation", "neon", "mono", "radioNight"]
+}

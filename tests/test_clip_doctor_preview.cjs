@@ -1,0 +1,92 @@
+const {app, BrowserWindow, ipcMain} = require('electron');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const http = require('node:http');
+const assert = require('node:assert/strict');
+const {spawnSync} = require('node:child_process');
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Keep test playback active when other automation windows cover this fixture.
+app.commandLine.appendSwitch('disable-background-media-suspend');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'pine-clip-doctor-qa-'));
+app.setPath('userData', path.join(temp, 'profile'));
+const fixture = path.join(temp, 'clip.mp4');
+const encoded = spawnSync(process.env.FFMPEG_BIN || 'ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24', '-t', '4', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-y', fixture], {windowsHide: true});
+assert.equal(encoded.status, 0, encoded.stderr?.toString());
+const bytes = fs.readFileSync(fixture);
+const server = http.createServer((req, res) => {
+  if (!req.url.startsWith('/fixture.mp4')) {res.writeHead(404);res.end();return;}
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', bytes.length);
+  res.end(bytes);
+});
+let mode = 'clip', resolveCue, picks = 0;
+const deadline = setTimeout(() => app.exit(1), 60000);
+app.whenReady().then(async () => {
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const cfg = {baseUrl: 'http://127.0.0.1:' + server.address().port, pip: {}};
+  const clip = () => ({ok: true, clip: {url: '/fixture.mp4?pick=' + (++picks), sting: 'Fixture clip ' + picks}});
+  ipcMain.handle('agent:get', () => ({verdict: 'Ready', book: {video_playable: 1, rows: 1}, steps: [], share: {present: true}}));
+  ipcMain.handle('agent:post', (_event, route) => {
+    if (route !== '/api/sfx/video/cue') return {ok: true};
+    if (mode === 'pending') return new Promise(resolve => {resolveCue = resolve;});
+    if (mode === 'missing') return {ok: true, clip: {url: '/missing.mp4', sting: 'Missing clip'}};
+    if (mode === 'empty') return {ok: false, say: 'No video clips available'};
+    return clip();
+  });
+  const manager = require('../desktop/pip-tools-window.cjs').install({BrowserWindow, ipcMain, getWindow: () => null,
+    rendererDir: path.resolve(__dirname, '../desktop/renderer'), preload: path.resolve(__dirname, '../desktop/preload.js'),
+    readConfig: () => cfg, writeConfig: value => Object.assign(cfg, value)});
+  manager.open();
+  const win = manager.getWindow();
+  await new Promise(resolve => win.webContents.once('did-finish-load', resolve));
+  const evaluate = code => win.webContents.executeJavaScript(code);
+  await evaluate('pineToolsReady');
+  await evaluate("PinePipPopups.select('module:PineClipDoctor')");
+  await evaluate("window.__previewEvents=[];for(const name of ['play','pause','abort','emptied','error','playing'])document.querySelector('.cd-preview-video').addEventListener(name,()=>__previewEvents.push({name,time:performance.now(),src:document.querySelector('.cd-preview-video').getAttribute('src')}))");
+  const click = () => evaluate("document.querySelector('.cd-btn[data-act=try]').click()");
+  const reading = () => evaluate(`(()=>{const v=document.querySelector('.cd-preview-video'),r=v.getBoundingClientRect();return {shown:document.getElementById('pineClipDoctor').classList.contains('show'),hidden:document.querySelector('.cd-preview').hidden,time:v.currentTime,decoded:v.videoWidth>0,paused:v.paused,controls:v.controls,src:v.getAttribute('src'),width:r.width,height:r.height,status:document.querySelector('.cd-out').textContent,guests:document.querySelectorAll('webview').length,tv:typeof PineSfxTv}})()`);
+  async function until(predicate) {let value;for(let i=0;i<60;i++){await wait(100);value=await reading();if(predicate(value))return value;}throw Error('Preview did not reach expected state: '+JSON.stringify(value)+'; events='+JSON.stringify(await evaluate('window.__previewEvents')));}
+  await click();
+  const playing = await until(r => r.decoded && r.time > .2);
+  assert.equal(playing.controls, true);
+  assert.equal(playing.hidden, false);
+  assert.ok(playing.width > 600 && playing.height > 180, 'Preview fills the native tool pane');
+  assert.equal(playing.tv, 'undefined', 'Preview does not load the separate SFX television');
+  assert.equal(playing.guests, 0);
+  await wait(1100);
+  assert.equal((await reading()).shown, true, 'Doctor stays open after the old 900 ms timeout');
+  const first = (await reading()).src;
+  await click();
+  const second = await until(r => r.decoded && r.time > .2 && r.src !== first);
+  assert.equal(second.shown, true);
+  await until(r => /Finished/.test(r.status));
+  assert.equal((await reading()).shown, true, 'Ending a clip leaves its replay controls visible');
+  await evaluate("document.querySelector('.cd-preview-video').play()");
+  await until(r => r.time > .2 && !r.paused);
+  await evaluate('PinePipPopups.clear()');
+  const closed = await reading();
+  assert.equal(closed.src, null, 'Closing releases the decoder and media request');
+  assert.equal(closed.paused, true);
+  mode = 'pending';
+  await evaluate("PinePipPopups.select('module:PineClipDoctor')");
+  await click();
+  for(let i=0;!resolveCue&&i<40;i++)await wait(25);
+  assert.ok(resolveCue);
+  await evaluate('PinePipPopups.clear()');
+  resolveCue(clip());
+  await wait(100);
+  assert.equal((await reading()).src, null, 'A delayed clip cannot start after the tool closes');
+  mode = 'missing';
+  await evaluate("PinePipPopups.select('module:PineClipDoctor')");
+  await click();
+  await until(r => /could not/.test(r.status));
+  mode = 'empty';
+  await click();
+  const empty = await until(r => /No video/.test(r.status));
+  assert.equal(empty.hidden, true, 'No clip does not retain the previous picture');
+  fs.writeFileSync(path.join(temp, 'result.json'), JSON.stringify({playing, second, empty}, null, 2));
+  console.log('Clip Doctor: decoded inline video, pane size, controls, replay, repeated picks, close cleanup, delayed response and media failure passed');
+  win.destroy();server.close();clearTimeout(deadline);app.exit(0);
+}).catch(error => {console.error(error);server.close();clearTimeout(deadline);app.exit(1);});

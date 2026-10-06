@@ -99,3 +99,15 @@
   overflow-y: auto;
 }
 .cd-out[hidden] { display: none !important; }
+
+/* A selected test clip stays in the doctor instead of opening another TV. */
+.cd-preview{margin:0 12px 12px;min-width:0;overflow:hidden;background:#050709;border:1px solid #35414c;border-radius:8px;}
+.cd-preview[hidden]{display:none!important;}
+.cd-preview-title{padding:6px 10px;color:#cfe0e6;font-size:12px;}
+.cd-preview-video{display:block;width:100%;height:300px;max-height:46vh;object-fit:contain;background:#050709;}
+body.pine-native-tools .cd-back.pip-popup-visible{padding:0!important;}
+body.pine-native-tools .cd-back.pip-popup-visible>.cd-box{display:flex;flex-direction:column;width:100%!important;height:100%;max-height:none!important;box-sizing:border-box;margin:0;}
+body.pine-native-tools .cd-box>.cd-bar,body.pine-native-tools .cd-box>.cd-verdict,body.pine-native-tools .cd-box>.cd-steps,body.pine-native-tools .cd-box>.cd-counts,body.pine-native-tools .cd-box>.cd-row,body.pine-native-tools .cd-box>.cd-out{flex:none;}
+body.pine-native-tools .cd-preview{display:flex;flex-direction:column;flex:1;min-height:180px;}
+body.pine-native-tools .cd-preview-title{flex:none;}
+body.pine-native-tools .cd-preview-video{flex:1;min-height:140px;height:100%;max-height:none;}

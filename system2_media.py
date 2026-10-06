@@ -384,6 +384,31 @@ class System2Media:
             self.last_refusal = "the produced spot was not published (floor, deadline or the box declined it)"
         return said
 
+    async def _s3_spot_stamp(self, take):
+        """[s3-produced] The produced spot's own System 3 node, or None.
+
+        The same call the booth's single lines make at the microphone
+        (road ad_spot), bound to the spot's words. A planner that cannot
+        answer does not hold the spot: it airs, and the ledger says rogue
+        exactly as it did before."""
+        h = self.host
+        direct = getattr(h, "system3_direct_line", None)
+        text = str((take or {}).get("text") or "")
+        if not callable(direct) or not text.strip():
+            return None
+        try:
+            handle = await direct(road="ad_spot", who="dj", dj=h.dj_settings(),
+                                  context="a produced spot", text=text[:600], bank=True)
+            if handle is None or not getattr(handle, "active", False):
+                return None
+            bind = getattr(h, "system3_bind_line", None)
+            if callable(bind):
+                bind(handle, text)
+            stamp = getattr(handle, "stamp", None)
+            return dict(stamp) if isinstance(stamp, dict) and stamp.get("conversation_id") else None
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _deliver_produced(self, resolved, entry, on_handoff, allowed):
         h = self.host
         owned = await h._floor_take("a System2 produced ad")
@@ -394,6 +419,7 @@ class System2Media:
                     or not allowed()):
                 return False
             take = current["takes"][0]
+            stamp = await self._s3_spot_stamp(take)      # [s3-produced] before the clock is read
             now = time.time()
             route = str(h._RADIO.get("voice_to") or "box")
             to_box = route in ("box", "both")
@@ -408,6 +434,11 @@ class System2Media:
             row = {"id": rid, "text": take["text"], "remember_text": take["text"],
                    "voice": take["voice"], "who": "dj", "kind": "ad",
                    "from": 0.0, "until": take["seconds"], "aired": "held"}
+            if stamp:                                    # [s3-produced] the row names its node
+                row["system3"] = stamp
+                remember = getattr(h, "_s3_line_remember", None)
+                if callable(remember):
+                    remember(rid, stamp, "dj", str(take["text"] or ""))
             clip = {"url": take["url"], "text": take["text"], "voice": take["voice"],
                     "speech": True, "kind": "ad", "row_id": rid,
                     "stream": {"length": take["seconds"], "rows": [row]}, "ready_round": entry}

@@ -1,0 +1,6 @@
+﻿const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),{composition}=require('../desktop/renderer/system3-entry-replay.js');
+const conversation={turns:[{turn_id:'t0',index:0},{turn_id:'t1',index:1},{turn_id:'t2',index:2}],decision_events:[{event_id:'root',turn_id:'',turn_index:-1},{event_id:'zero',turn_id:'t0',turn_index:0},{event_id:'one',turn_id:'t1',turn_index:1},{event_id:'future',turn_id:'t2',turn_index:2}]};
+test('conversation rollout stops at the selected turn',()=>assert.deepEqual(composition(conversation,'t1').events.map(e=>e.event_id),['root','zero','one']));
+test('selected-line scope excludes other turns',()=>assert.deepEqual(composition(conversation,'t1','line').events.map(e=>e.event_id),['root','one']));
+test('missing recordings are reported',()=>assert.throws(()=>composition(conversation,'absent'),/No recorded turn/));
+test('real recorded candidates and dice are retained',()=>{const fixture=JSON.parse(fs.readFileSync(require('node:path').join(__dirname,'./fixtures/system3-entry-composition.json'),'utf8'));const link=fixture.origin.nodes.find(n=>n.node==='conversation');const got=composition(fixture.conversation,link.turn_id);assert(got.events.length>0);assert(got.events.every(e=>!e.turn_id||e.turn_index<=got.target.index));assert(got.events.every(e=>fixture.conversation.decision_events.includes(e)));});

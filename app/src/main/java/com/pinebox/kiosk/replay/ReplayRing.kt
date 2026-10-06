@@ -374,17 +374,8 @@ class ReplayRing(private val holdSeconds: Int = 60) {
      * wrapped to zero - so it fits if EITHER of those runs is long enough on
      * its own.
      */
-    private fun fits(size: Int): Boolean {
-        if (count == 0) return size <= blob.size
-        val oldest = marks[first].at
-        return if (head >= oldest) {
-            /* At the head, or wrapped to the front - and wrapping is only
-             * safe as far as the oldest packet still held. */
-            blob.size - head >= size || oldest >= size
-        } else {
-            oldest - head >= size
-        }
-    }
+    private fun fits(size: Int): Boolean = ReplayBlobSpace.fits(
+        blob.size, head, if (count > 0) marks[first].at else 0, count, size)
 
     private fun dropOldest() {
         wrote -= marks[first].size
@@ -521,14 +512,14 @@ class ReplayRing(private val holdSeconds: Int = 60) {
      *   asked for - the ring holds what it holds, and saying 30 when 11 were
      *   written would be a lie the operator only discovers on playback.
      */
-    fun save(out: File, want: Double, allowVideoOnly: Boolean = false, back: Double = 0.0): Double {
+    fun save(out: File, want: Double, allowVideoOnly: Boolean = false, back: Double = 0.0, frozenVideo: Boolean = false): Double {
         lastSavedAudio = JSONObject().put("source", "android-playback-mix").put("present", false)
             .put("source_scope", "eligible-device-media").put("device_volume_applied", false)
             .put("complete", false).put("state", "unavailable")
             .put("detail", "No replay window has been selected yet.")
         // Copy the selected encoded video under its short lock, then do disk
         // I/O unlocked. Audio capture uses an independent ring throughout.
-        val snapshot = synchronized(this) { videoSnapshot(want, back) }
+        val snapshot = synchronized(this) { videoSnapshot(want, back, frozenVideo) }
         val fmt = snapshot.first
         val video = snapshot.second
         val zero = video.first().timeUs
@@ -591,6 +582,11 @@ class ReplayRing(private val holdSeconds: Int = 60) {
             .put("audio_led_epoch", audioLedEpoch)
         check(complete || allowVideoOnly) { detail }
 
+        // Validate all AVC framing before entering the vendor/native writer.
+        // A malformed old history fails safely and leaves the previous cache.
+        val capacity = maxOf(video.maxOf { ReplayAvcSample.requiredCapacity(it.data, it.offset, it.size) },
+            capturedAudio.maxOfOrNull { it.data.size } ?: 0)
+        val scratch = ReplayMuxBuffer(capacity)
         var muxer: MediaMuxer? = null
         var success = false
         try {
@@ -603,9 +599,14 @@ class ReplayRing(private val holdSeconds: Int = 60) {
             while (v < video.size || (audioTrack >= 0 && a < capturedAudio.size)) {
                 val chooseAudio = audioTrack >= 0 && a < capturedAudio.size &&
                     (v >= video.size || capturedAudio[a].timeUs <= video[v].timeUs)
-                val packet = if (chooseAudio) capturedAudio[a++] else video[v++]
-                info.set(0, packet.data.size, packet.timeUs - zero, packet.flags)
-                muxer.writeSampleData(if (chooseAudio) audioTrack else videoTrack, ByteBuffer.wrap(packet.data), info)
+                val packet = if (chooseAudio) {
+                    val audioPacket = capturedAudio[a++]
+                    ReplayMuxSample(audioPacket.timeUs, audioPacket.data, 0, audioPacket.data.size, audioPacket.flags)
+                } else video[v++]
+                val bytes = if (chooseAudio) scratch.sample(packet.data, packet.offset, packet.size)
+                    else scratch.video(packet.data, packet.offset, packet.size)
+                info.set(0, bytes.remaining(), packet.timeUs - zero, packet.flags)
+                muxer.writeSampleData(if (chooseAudio) audioTrack else videoTrack, bytes, info)
             }
             muxer.stop()
             success = true
@@ -616,7 +617,7 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         return (newest - zero) / 1_000_000.0
     }
 
-    private fun videoSnapshot(want: Double, back: Double = 0.0): Pair<MediaFormat, List<ReplayAudioPacket>> {
+    private fun videoSnapshot(want: Double, back: Double = 0.0, frozen: Boolean = false): Pair<MediaFormat, List<ReplayMuxSample>> {
         val fmt = format ?: throw IllegalStateException("the encoder has not started yet")
         if (count < 2) throw IllegalStateException("nothing has been recorded yet")
 
@@ -655,10 +656,10 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         }
         if (stop <= start) stop = Math.min(count - 1, start + 1)
 
-        val packets = ArrayList<ReplayAudioPacket>(stop - start + 1)
+        val packets = ArrayList<ReplayMuxSample>(stop - start + 1)
         for (i in start..stop) {
             val mark = marks[(first + i) % marks.size]
-            packets.add(ReplayAudioPacket(mark.timeUs, blob.copyOfRange(mark.at, mark.at + mark.size), mark.flags))
+            packets.add(ReplayMuxSample.snapshot(mark.timeUs, blob, mark.at, mark.size, mark.flags, frozen))
         }
         lastSavedEndBack = (newest - packets[packets.size - 1].timeUs) / 1_000_000.0
         return Pair(fmt, packets)

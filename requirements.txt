@@ -47,3 +47,6 @@ fpdf2==2.8.8
 # what makes it the right answer on aarch64. EPUB, zip, docx and plain text
 # need nothing at all beyond the stdlib.
 pypdf==6.18.0
+
+# Original PDF book pages, rendered lazily; prebuilt PDFium wheels on aarch64.
+pypdfium2==5.13.0

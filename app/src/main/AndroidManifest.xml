@@ -4,6 +4,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- CamLink's ConnectivityManager.requestNetwork requires this normal
+         permission in addition to the Wi-Fi and privileged settings grants. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- PINE APP RECORDER. The rolling recording is a background system task
          on this terminal, not something an activity happens to be doing, so
@@ -104,6 +107,12 @@
          without. Reading a service dump is gated on DUMP, which is
          signature|privileged, and this APK is platform-signed. -->
     <uses-permission android:name="android.permission.DUMP"
+        tools:ignore="ProtectedPermissions" />
+    <!-- The mirror encoder lease must prove root's screenrecord process has
+         exited before replay can allocate the same vendor encoder. Android's
+         meminfo binder requires DUMP plus PACKAGE_USAGE_STATS even for this
+         platform-signed app; only the named native recorder is inspected. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
     <!-- THE GALLERY ON THE GLASS. Every five minutes the terminal hangs
          whatever the station is currently selling on both the home screen
@@ -365,6 +374,19 @@
             android:permission="com.pinebox.kiosk.permission.STANDBY">
             <intent-filter>
                 <action android:name="com.pinebox.kiosk.action.SET_STANDBY" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The desktop mirror borrows only the replay VIDEO encoder.
+             Ordered replies verify release; expiry waits for ScreenRecorder
+             to disappear before replay can resume. Audio/ring are retained. -->
+        <receiver
+            android:name=".replay.MirrorLeaseReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="com.pinebox.kiosk.permission.STANDBY">
+            <intent-filter>
+                <action android:name="com.pinebox.kiosk.action.MIRROR_ENCODER_LEASE" />
             </intent-filter>
         </receiver>
 

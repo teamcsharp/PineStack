@@ -90,6 +90,261 @@ class ScreenReplay(private val context: Context) {
 
     val isRunning: Boolean get() = running.get()
 
+    /* The M9 vendor encoder panics with replay and adb screenrecord together.
+     * This gate applies to every start road, including SCREEN_ON/onResume.
+     * The ring and playback-audio capture remain intact while video is held. */
+    private val mirrorEncoderLease = MirrorEncoderLease()
+    private var mirrorLeaseTimer: java.util.Timer? = null
+    private var videoReleaseError: String? = null
+    private var deferredVideoStart = false
+    private var mirrorHistoryPending = false
+    private val historyWriter = ReplayCacheWriter({ keepHistory() })
+    private val mirrorProofWorkers = java.util.concurrent.Executors.newFixedThreadPool(3) { task ->
+        Thread(task, "mirror-encoder-proof").apply { isDaemon = true }
+    }
+    private var externalReplayTimer: java.util.Timer? = null
+    private val mirrorLeasePrefs = context.getSharedPreferences("mirror-encoder-lease", Context.MODE_PRIVATE)
+
+    init {
+        JpegMirrorCapture.initialize(context)
+        val owner = mirrorLeasePrefs.getString("owner", "").orEmpty()
+        val left = (mirrorLeasePrefs.getLong("until_wall_ms", 0L) - System.currentTimeMillis())
+            .coerceIn(0L, MirrorEncoderLease.MAX_TTL_MS)
+        if (mirrorEncoderLease.restore(owner, android.os.SystemClock.elapsedRealtime() + left,
+                mirrorLeasePrefs.getBoolean("restore_video", false))) armMirrorLeaseExpiry()
+    }
+
+    /** Commit before acknowledging acquisition so an app restart cannot
+     * forget the guard while adb's recorder is allocating its hardware codec. */
+    private fun persistMirrorLease(): Boolean = mirrorLeasePrefs.edit()
+        .putString("owner", mirrorEncoderLease.owner)
+        .putLong("until_wall_ms", System.currentTimeMillis() +
+            (mirrorEncoderLease.untilMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+        .putBoolean("restore_video", mirrorEncoderLease.resumeWanted).commit()
+
+    @Synchronized
+    fun mirrorLease(operation: String, owner: String, ttlMs: Long,
+                    jpegWidth: Int = 0, jpegHeight: Int = 0,
+                    jpegQuality: Int = 50, jpegFps: Int = 12, jpegStreamId: String = ""): JSONObject {
+        val now = android.os.SystemClock.elapsedRealtime()
+        var accepted = true
+        var detail: String? = null
+        when (operation) {
+            "acquire" -> {
+                accepted = mirrorEncoderLease.acquire(owner, now, ttlMs, running.get() || deferredVideoStart)
+                if (accepted) {
+                    val saved = persistMirrorLease()
+                    stop(keepAudio = true, deferHistory = true)
+                    val jpegReleased = stopOwnedJpegCapture(owner)
+                    accepted = saved && replayVideoReleased() && jpegReleased
+                    detail = if (!saved) "the encoder hold could not be saved for app restart"
+                        else if (!jpegReleased) "the previous JPEG capture resources have not released" else videoReleaseError
+                    if (accepted && externalScreenRecorderActive() != false) {
+                        accepted = false
+                        detail = "an external screen recorder is still active or could not be checked"
+                    }
+                    armMirrorLeaseExpiry()
+                } else detail = "the mirror encoder is held by another owner or the owner is invalid"
+            }
+            "renew" -> {
+                accepted = mirrorEncoderLease.renew(owner, now, ttlMs)
+                if (accepted) {
+                    accepted = persistMirrorLease()
+                    armMirrorLeaseExpiry()
+                    if (!accepted) detail = "the renewed encoder hold could not be saved"
+                } else detail = "this mirror no longer owns the encoder hold"
+            }
+            "jpeg_start" -> {
+                if (!mirrorEncoderLease.ownsCurrent(owner, now)) {
+                    accepted = false
+                    detail = "JPEG capture requires the current exact encoder-hold owner"
+                } else if (!persistMirrorLease()) {
+                    accepted = false
+                    detail = "the JPEG capture hold could not be saved for app restart"
+                } else if (!replayVideoReleased()) {
+                    accepted = false
+                    detail = "the replay video resources have not released"
+                } else if (!JpegMirrorCapture.isReleased()) {
+                    accepted = false
+                    detail = "the previous JPEG capture has not released; stop it before restarting"
+                } else if (externalScreenRecorderActive() != false) {
+                    accepted = false
+                    detail = "an external capture is still active or could not be checked"
+                } else if (!mirrorEncoderLease.ownsCurrent(owner, android.os.SystemClock.elapsedRealtime())) {
+                    accepted = false
+                    detail = "the JPEG capture owner expired during the capture-ownership proof"
+                } else {
+                    val result = JpegMirrorCapture.start(owner, jpegStreamId, jpegWidth, jpegHeight, jpegQuality, jpegFps)
+                    accepted = result.optBoolean("ok")
+                    if (!accepted) detail = result.optString("detail", "JPEG capture did not start")
+                }
+                if (mirrorEncoderLease.held) armMirrorLeaseExpiry()
+            }
+            "jpeg_stop" -> {
+                if (!mirrorEncoderLease.held || owner != mirrorEncoderLease.owner) {
+                    accepted = false
+                    detail = "JPEG capture stop requires the exact encoder-hold owner"
+                } else {
+                    val result = JpegMirrorCapture.stopExactOwner(owner, jpegStreamId)
+                    accepted = result.optBoolean("ok") && result.optBoolean("jpeg_released")
+                    if (!accepted) detail = result.optString("detail", "JPEG capture resources have not released")
+                }
+            }
+            "release" -> {
+                if (mirrorEncoderLease.held) {
+                    if (owner != mirrorEncoderLease.owner) {
+                        accepted = false
+                        detail = "this mirror does not own the encoder hold"
+                    } else {
+                        val jpegReleased = stopOwnedJpegCapture(owner)
+                        val restore = if (jpegReleased) mirrorEncoderLease.release(owner,
+                            externalScreenRecorderActive(), JpegMirrorCapture.isReleased()) else null
+                        if (restore == null) {
+                            accepted = false
+                            detail = if (!jpegReleased) "JPEG capture resources have not released" else
+                                "the external screen recorder has not been confirmed stopped"
+                            armMirrorLeaseExpiry()
+                        } else restoreMirrorReplay(restore)
+                    }
+                }
+            }
+            "status" -> Unit
+            "probe" -> return mirrorEncoderProof().put("ok", true)
+                .put("held", mirrorEncoderLease.held).put("owner", mirrorEncoderLease.owner)
+                .put("video_running", running.get()).put("audio", audioStatus())
+            else -> { accepted = false; detail = "unknown mirror lease operation" }
+        }
+        val answer = JSONObject().put("ok", accepted)
+            .put("held", mirrorEncoderLease.held)
+            .put("owner", mirrorEncoderLease.owner)
+            .put("expires_in_ms", (mirrorEncoderLease.untilMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+            .put("video_running", running.get())
+            .put("video_released", replayVideoReleased())
+            .put("restore_replay", mirrorEncoderLease.resumeWanted)
+            .put("seconds", ring.seconds())
+            .put("audio", audioStatus())
+            .put("detail", detail ?: JSONObject.NULL)
+        val jpeg = JpegMirrorCapture.status()
+        for (key in listOf("jpeg_running", "jpeg_released", "jpeg_owner", "jpeg_stream_id", "jpeg_socket", "width", "height", "fps", "jpeg_quality", "jpeg_frames", "jpeg_since_frame_ms", "jpeg_compress_ms", "jpeg_resources", "jpeg_image_callbacks", "jpeg_drain_attempts", "jpeg_acquired_images", "jpeg_empty_reads", "jpeg_error")) {
+            if (jpeg.has(key)) answer.put(key, jpeg.opt(key))
+        }
+        return answer
+    }
+
+    private fun replayVideoReleased(): Boolean = !running.get() && codec == null &&
+        display == null && surface == null && videoReleaseError == null && worker?.isAlive != true
+
+    private fun stopOwnedJpegCapture(owner: String): Boolean {
+        if (JpegMirrorCapture.isReleased()) return true
+        val answer = JpegMirrorCapture.stopOwned(owner)
+        return answer.optBoolean("jpeg_released") && JpegMirrorCapture.isReleased()
+    }
+
+    private fun armMirrorLeaseExpiry() {
+        mirrorLeaseTimer?.cancel()
+        mirrorLeaseTimer = null
+        if (!mirrorEncoderLease.held) return
+        val delay = (mirrorEncoderLease.untilMs - android.os.SystemClock.elapsedRealtime())
+            .coerceAtLeast(2_000L)
+        val timer = java.util.Timer("mirror-encoder-expiry", true)
+        timer.schedule(object : java.util.TimerTask() {
+            override fun run() = expireMirrorLease()
+        }, delay)
+        mirrorLeaseTimer = timer
+    }
+
+    @Synchronized
+    private fun expireMirrorLease() {
+        if (!mirrorEncoderLease.held) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        // A renewed deadline must not let an old timer stop the current JPEG.
+        if (now < mirrorEncoderLease.untilMs) { armMirrorLeaseExpiry(); return }
+        if (!stopOwnedJpegCapture(mirrorEncoderLease.owner)) { armMirrorLeaseExpiry(); return }
+        val restore = mirrorEncoderLease.expire(now, externalScreenRecorderActive(),
+            JpegMirrorCapture.isReleased())
+        if (restore == null) armMirrorLeaseExpiry()
+        else restoreMirrorReplay(restore)
+    }
+
+    private fun restoreMirrorReplay(restore: Boolean) {
+        if (!persistMirrorLease()) Log.w(TAG, "the cleared mirror hold could not be saved; stale disk hold stays conservative")
+        mirrorLeaseTimer?.cancel()
+        mirrorLeaseTimer = null
+        val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (restore && power?.isInteractive == true && !com.pinebox.kiosk.kiosk.Standby.active) {
+            // Acknowledging release must not wait for codec allocation or
+            // a second ownership probe. Retry performs all the same guards.
+            deferredVideoStart = true
+            armExternalReplayRetry()
+        }
+    }
+
+    private fun armExternalReplayRetry() {
+        externalReplayTimer?.cancel()
+        val timer = java.util.Timer("replay-external-encoder", true)
+        timer.schedule(object : java.util.TimerTask() {
+            override fun run() = retryExternalReplay()
+        }, 2_000L)
+        externalReplayTimer = timer
+    }
+
+    @Synchronized
+    private fun retryExternalReplay() {
+        externalReplayTimer = null
+        if (!deferredVideoStart || mirrorEncoderLease.held) return
+        val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (power?.isInteractive != true || com.pinebox.kiosk.kiosk.Standby.active) return
+        start()
+    }
+
+    /** Use the platform-granted DUMP permission, not an optimistic pidof from
+     * an app UID whose /proc visibility can hide root's screenrecord. Keep the
+     * hold on timeout, permission refusal, or an unrecognised vendor dump. */
+    private fun mirrorEncoderProof(): JSONObject {
+        // Independent read-only dumps run together so a stalled vendor service
+        // cannot consume the ordered broadcast deadline three times over.
+        val checks = listOf(
+            java.util.concurrent.Callable<Boolean?> { nativeDump("SurfaceFlinger")?.let { MirrorEncoderLease.parseExternalRecorder(it) } },
+            java.util.concurrent.Callable<Boolean?> { nativeDump("meminfo", "screenrecord")?.let { MirrorEncoderLease.parseRecorderProcess(it) } },
+            java.util.concurrent.Callable<Boolean?> { nativeDump("media.resource_manager")?.let { MirrorEncoderLease.parseVideoEncoders(it) } }
+        )
+        val values = try {
+            mirrorProofWorkers.invokeAll(checks, 3500, java.util.concurrent.TimeUnit.MILLISECONDS).map { result ->
+                try { if (result.isCancelled) null else result.get() } catch (_: Exception) { null }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            listOf<Boolean?>(null, null, null)
+        }
+        return JSONObject().put("compositor", values[0] ?: JSONObject.NULL)
+            .put("recorder_process", values[1] ?: JSONObject.NULL)
+            .put("video_encoder", values[2] ?: JSONObject.NULL)
+    }
+
+    private fun externalScreenRecorderActive(): Boolean? {
+        val proof = mirrorEncoderProof()
+        val keys = listOf("compositor", "recorder_process", "video_encoder")
+        if (keys.any { proof.opt(it) == true }) return true
+        return if (keys.all { proof.opt(it) == false }) false else null
+    }
+
+    private fun nativeDump(vararg args: String): String? {
+        val output = try { File.createTempFile("mirror-encoder-", ".txt", context.cacheDir) }
+        catch (error: Exception) { return null }
+        var process: Process? = null
+        return try {
+            process = ProcessBuilder(listOf("/system/bin/dumpsys") + args.toList())
+                .redirectErrorStream(true).redirectOutput(output).start()
+            if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) ||
+                process.exitValue() != 0 || output.length() > 2_000_000L) null
+            else output.readText()
+        } catch (error: Exception) { null }
+        finally {
+            process?.destroy()
+            output.delete()
+        }
+    }
+
     fun seconds(): Double = ring.seconds()
     fun bytes(): Int = ring.bytes()
 
@@ -128,7 +383,35 @@ class ScreenReplay(private val context: Context) {
 
     @Synchronized
     fun start(): String? {
+        if (mirrorEncoderLease.held) {
+            // Service startup/screen-on may request video after a cold hold
+            // was acquired. Remember that request without allocating a codec.
+            mirrorEncoderLease.requestResume()
+            return if (persistMirrorLease()) null else "the deferred replay start could not be saved"
+        }
+        if (!JpegMirrorCapture.isReleased()) {
+            deferredVideoStart = true
+            armExternalReplayRetry()
+            return null
+        }
+        if ((codec != null || display != null || surface != null || worker?.isAlive == true) && !running.get()) return "the previous replay encoder has not released"
         if (running.get()) { audioCapture.start(); return null }
+        if (mirrorHistoryPending || historyWriter.hasPending) {
+            deferredVideoStart = true
+            armExternalReplayRetry()
+            return "waiting for the frozen replay history cache to finish"
+        }
+        /* A kiosk process can restart while root's adb recorder survives.
+         * Reconstruct exclusion from the compositor before allocating ANY
+         * encoder, even when the in-memory lease died with the old process. */
+        if (externalScreenRecorderActive() != false) {
+            deferredVideoStart = true
+            armExternalReplayRetry()
+            return "waiting for the external screen recorder to release the encoder"
+        }
+        deferredVideoStart = false
+        externalReplayTimer?.cancel()
+        externalReplayTimer = null
         try {
             val window = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val real = android.graphics.Point()
@@ -173,11 +456,11 @@ class ScreenReplay(private val context: Context) {
             sessionStartedUs = System.nanoTime() / 1000
 
             val encoder = MediaCodec.createEncoderByType(MIME)
+            codec = encoder
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val input = encoder.createInputSurface()
-            encoder.start()
-            codec = encoder
             surface = input
+            encoder.start()
 
             val manager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
             /* AUTO_MIRROR against the real display: this is what
@@ -219,7 +502,7 @@ class ScreenReplay(private val context: Context) {
         } catch (err: Exception) {
             lastError = err.message ?: err.toString()
             Log.w(TAG, "replay would not start: " + lastError)
-            stop()
+            stop(keepAudio = true)
             return lastError
         }
     }
@@ -274,6 +557,16 @@ class ScreenReplay(private val context: Context) {
     @Synchronized
     fun prime() {
         if (running.get()) return
+        if (mirrorHistoryPending || historyWriter.hasPending) { audioCapture.start(); return }
+        if (mirrorEncoderLease.held) {
+            // Software-only cold history restore: ByteArray/MediaExtractor.
+            // The held branch returns before any video encoder start road;
+            // start() independently retains lease + external ownership guards.
+            ring.size(q.bitrate)
+            if (ring.seconds() <= 0.0) restore()
+            audioCapture.start()
+            return
+        }
         ring.size(q.bitrate)
         if (ring.seconds() <= 0.0) restore()
         /* [#1225] AND THE SOUND STARTS HERE, not when the screen lights
@@ -302,8 +595,9 @@ class ScreenReplay(private val context: Context) {
      * through leaves the previous cache intact rather than a half file that
      * reads as corruption.
      */
-    @Synchronized
-    private fun keep() {
+    private fun keep() = historyWriter.flush()
+
+    private fun keepHistory() {
         /* [rec-quality] only Standard is cached: a cache is restored into a
          * Standard ring after a restart, and two frame sizes in one ring cut
          * files a player cannot open. */
@@ -314,10 +608,11 @@ class ScreenReplay(private val context: Context) {
         val part = File(real.parentFile, "history.part")
         try {
             part.delete()
-            ring.save(part, held + 1.0, allowVideoOnly = true)
+            ring.save(part, held + 1.0, allowVideoOnly = true,
+                frozenVideo = !running.get() && worker?.isAlive != true)
             if (part.length() > 0L) {
-                real.delete()
-                if (!part.renameTo(real)) part.delete()
+                // Atomic same-directory replacement preserves the old cache on failure.
+                android.system.Os.rename(part.absolutePath, real.absolutePath)
                 Log.i(TAG, "history cached: " + held.toInt() + "s, "
                     + (real.length() / 1024) + " kB")
             }
@@ -354,19 +649,30 @@ class ScreenReplay(private val context: Context) {
     fun stopVideo() = stop(keepAudio = true)
 
     @Synchronized
-    fun stop(keepAudio: Boolean = false) {
+    fun stop(keepAudio: Boolean = false, deferHistory: Boolean = false) {
         val was = running.get()
         running.set(false)
-        if (!keepAudio) audioCapture.stop()                    // [#1225]
-        try { display?.release() } catch (err: Exception) { /* gone */ }
+        if (!keepAudio) {
+            if (mirrorEncoderLease.held) stopOwnedJpegCapture(mirrorEncoderLease.owner)
+            mirrorEncoderLease.cancelResume()
+            persistMirrorLease()
+            deferredVideoStart = false
+            externalReplayTimer?.cancel()
+            externalReplayTimer = null
+            audioCapture.stop()                               // [#1225]
+        }
+        videoReleaseError = null
+        try { display?.release(); display = null }
+        catch (err: Exception) { videoReleaseError = "the replay display did not release: " + err.message }
         try { worker?.join(1500) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
-        worker = null
         try { codec?.stop() } catch (err: Exception) { /* gone */ }
-        try { codec?.release() } catch (err: Exception) { /* gone */ }
-        try { surface?.release() } catch (err: Exception) { /* gone */ }
-        display = null
-        codec = null
-        surface = null
+        try { codec?.release(); codec = null }
+        catch (err: Exception) { videoReleaseError = "the replay encoder did not release: " + err.message }
+        try { surface?.release(); surface = null }
+        catch (err: Exception) { videoReleaseError = "the replay surface did not release: " + err.message }
+        try { worker?.join(250) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+        if (worker?.isAlive == true) videoReleaseError = "the replay drain is still closing"
+        else worker = null
         /* THE RING IS NOT CLEARED. Stopping happens when the screen goes off,
          * and the half-minute before that is exactly what somebody will want
          * when they pick the tablet up again.
@@ -375,10 +681,26 @@ class ScreenReplay(private val context: Context) {
          * rather than a buffer: the app goes away on every deploy, every
          * crash and whenever Android reclaims it, and "pull from it at any
          * time" has to survive all three. */
-        if (was) keep()
+        if (deferHistory) {
+            if (was) mirrorHistoryPending = true
+        } else if (was || mirrorHistoryPending || historyWriter.hasPending) {
+            mirrorHistoryPending = false
+            keep() // Flush even though mirror acquire already stopped video.
+        }
+    }
+
+    /** Called after the ordered ACK has been delivered. The same atomic
+     * history cache is retained without holding the encoder control lock. */
+    fun cacheMirrorHistoryAsync() {
+        synchronized(this) {
+            if (!mirrorHistoryPending) return
+            historyWriter.enqueue()
+            mirrorHistoryPending = false
+        }
     }
 
     /** Write the history now, without stopping - for a deliberate shutdown. */
+    @Synchronized
     fun flush() = keep()
 
     /**
@@ -412,7 +734,7 @@ class ScreenReplay(private val context: Context) {
          * used to take the sound down with the picture, so the tablet
          * stopped capturing every time another app came forward. */
         stop(keepAudio = true)
-        ring.letGo()
+        historyWriter.invalidate { ring.letGo() }
         Log.i(TAG, "#1182T standing down: the ring is on disk and its memory is "
             + "back with the heap")
     }
@@ -547,9 +869,11 @@ class ScreenReplay(private val context: Context) {
         val was = running.get()
         level = 0                                   // keep() writes nothing above Standard
         stop(keepAudio = true)
-        try { cacheFile().delete() } catch (err: Exception) { /* nothing cached */ }
-        ring.reset()
-        level = l
+        historyWriter.invalidate {
+            try { cacheFile().delete() } catch (err: Exception) { /* nothing cached */ }
+            ring.reset()
+            level = l
+        }
         levelUntil = if (l > 0) System.currentTimeMillis() + OPT_IN_MS else 0L
         Log.i(TAG, "[rec-quality] " + q.label + " (" + why + ")")
         armRevert()

@@ -43,6 +43,7 @@
   var busy = false;
   var shown = false;
   var live = false;
+  var cameraReading = null;
 
   /* #1470: THE NATIVE PICTURE. On the tablet the kiosk offers
    * pineDesktop.pineCam(verb, arg): an ExoPlayer on a SurfaceView above
@@ -450,9 +451,94 @@
     setTimeout(go, 1500);                    /* a still that never lands does not hold the stream back */
     img.src = stillUrl();
   }
+  // The floating tools shell keeps the camera panel available while offline.
+  // The main station retains its existing hide/restore behavior.
+  function nativeReading(got) {
+    if (!root.PINE_NATIVE_TOOLS || !box) return;
+    var status = document.getElementById('pineCamOffline');
+    if (!status) {
+      status = document.createElement('section');
+      status.id = 'pineCamOffline';
+      status.className = 'pine-cam-offline';
+      status.setAttribute('role', 'status');
+      var title = document.createElement('strong');
+      title.textContent = 'Pine Cam is offline';
+      var note = document.createElement('p');
+      note.className = 'pine-cam-offline-note';
+      var retry = document.createElement('button');
+      retry.type = 'button';
+      retry.textContent = 'Reconnect camera';
+      retry.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        retry.disabled = true;
+        note.textContent = 'Requesting a camera reconnect?';
+        Promise.resolve(post('/api/pinelink/connect', {})).then(function (reply) {
+          note.textContent = reply && reply.say || 'Reconnect requested. Waiting for the camera.';
+          look();
+        }, function (error) {
+          note.textContent = error.message || 'The station did not answer.';
+        }).finally(function () { retry.disabled = false; });
+      });
+      var diagnose = document.createElement('button');
+      diagnose.type = 'button';
+      diagnose.textContent = 'Connection diagnostics';
+      var details = document.createElement('p');
+      details.className = 'pine-cam-offline-details';
+      details.hidden = true;
+      diagnose.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        diagnose.disabled = true;
+        details.hidden = false;
+        details.textContent = 'Reading the tablet camera connection?';
+        // Read the tablet relay directly. The older USB-radio ladder cannot
+        // diagnose the secondary Wi-Fi connection on the PineTab.
+        Promise.resolve(ask('/api/pinelink/relay')).then(function (reading) {
+          var report = reading && reading.report;
+          if (!report || !report.link) {
+            details.textContent = 'The station has no tablet camera report yet.';
+            return;
+          }
+          var link = report.link;
+          details.textContent = 'Tablet: ' + (report.ip || 'unknown')
+            + '\nCamera Wi-Fi: ' + (link.joined ? 'joined' : link.state || 'not joined')
+            + (link.why ? '\n' + link.why : '')
+            + '\nRelay: ' + (report.relay && report.relay.listening ? 'listening' : 'not listening')
+            + '\nJoin attempts: ' + Number(link.attempts || 0)
+            + '\nReport age: ' + (reading.report_age_s == null ? 'unknown' : reading.report_age_s + 's')
+            + '\nRelay preference: ' + (reading.pref || 'unknown');
+        }, function (error) {
+          details.textContent = error.message || 'The station did not answer.';
+        }).finally(function () { diagnose.disabled = false; });
+      });
+      status.append(title, note, retry, diagnose, details);
+      box.appendChild(status);
+    }
+    status.hidden = live;
+    if (!live) {
+      status.querySelector('.pine-cam-offline-note').textContent = got &&
+        (got.why || got.source && got.source.why) || 'Checking the camera connection?';
+      setBare(false);
+      setRound(false);
+    }
+    var img = document.getElementById('pineCamImg');
+    if (img) {
+      img.hidden = !live;
+      if (!live) {
+        img.removeAttribute('src');
+        img.__mjpeg = '';
+        img.__mjpegNext = '';
+      }
+    }
+    ['pineCamBoxRec', 'pineCamFold', 'pineCamHdr'].forEach(function (id) {
+      var button = document.getElementById(id);
+      if (button) button.disabled = !live;
+    });
+  }
+
   function paintFrame() {
     var img = document.getElementById('pineCamImg');
     if (!img || !shown) return;
+    if (root.PINE_NATIVE_TOOLS && !live) { nativeReading(cameraReading);return; }
     var m = mjpegUrl();
     if (m && Date.now() - mjpegFailedAt > 5000) {
       if (img.__mjpeg !== m && img.__mjpegNext !== m) mjpegStart(img, m);
@@ -470,6 +556,7 @@
   var VIEW_KEY = 'pineCamView';
   var viewRestored = false;
   var viewRestoring = false;
+  var resumePending = false;
   function viewSave() {
     if (viewRestoring) return;
     try { localStorage.setItem(VIEW_KEY, JSON.stringify({open: !!shown, bare: !!bare, at: Date.now()})); }
@@ -488,6 +575,7 @@
 
   function open(wantBare) {
     build();
+    resumePending = false;
     shown = true;
     box.hidden = false;
     /* [cam-pop] "whenever I bring up the pinecam's screen, it actually shows
@@ -498,7 +586,8 @@
        line opened inside. The box takes its final shape first, then comes
        on; a restore hands its own header state in rather than changing it a
        moment later. */
-    setBare(typeof wantBare === 'boolean' ? wantBare : BARE_DEFAULT);   /* just the window, until asked */
+    setBare(root.PINE_NATIVE_TOOLS ? false : typeof wantBare === 'boolean' ? wantBare : BARE_DEFAULT);
+    if (root.PINE_NATIVE_TOOLS) { setRound(false);nativeReading(cameraReading); }   /* just the window, until asked */
     vcrBox(true);                          /* [vcrfx] dot -> line -> picture */
     paintFrame();
     if (!frameTimer) frameTimer = setInterval(paintFrame, FRAME_MS);
@@ -507,7 +596,12 @@
     viewSave();                            /* [cam-restore] */
   }
 
-  function close() {
+  function close(forReconnect) {
+    // A lost link hides stale footage but preserves the operator's viewing
+    // preference. Explicit dismissal also cancels a pending restoration.
+    var reconnect = forReconnect === true;
+    resumePending = reconnect;
+    viewRestored = !reconnect;
     cropRadialClose(false);                /* [pincrop] no menu over a closed box */
     cropDrawClose(false);
     nativeStop();                          /* #1470: before the box goes */
@@ -516,7 +610,7 @@
     if (box) vcrBox(false);                /* [vcrfx] picture -> line -> dot, then hidden */
     if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
     repaintPicture();
-    viewSave();                            /* [cam-restore] */
+    if (!reconnect) viewSave();            /* [cam-restore] */
   }
 
   function toggle() { if (shown) { close(); } else { open(); } }
@@ -659,6 +753,8 @@
       posterShown(false);
       nativeBox();                         /* the box may have moved while asked */
       battNativeKey = '';                  /* [cambattery] a new surface: tell it again */
+      routeNativeKey = '';
+      pathPaint(routeState);
       paintBatteryNative(battModel(batt));
     }, function () { nativeAsked = false; });
   }
@@ -1308,7 +1404,7 @@
 
   function look() {
     Promise.resolve(ask('/api/pinelink/state')).then(function (got) {
-      var was = live;
+      var was = live;cameraReading = got;
       /* `fresh` is the supervisor's own heartbeat: a state file is a file,
        * and a stale one claiming "live" is exactly the lie this has to
        * avoid. Both, or it is not there. */
@@ -1356,7 +1452,7 @@
       } else if (ann > announceSeen) {
         announceSeen = ann;
         showToast(live);
-      } else if (!was && live && !waiting) {
+      } else if (!was && live && !waiting && !resumePending) {
         showToast(true);
       }
       if (got) polled = true;
@@ -1384,7 +1480,8 @@
       /* If it goes while the view is open, say so rather than freezing on
        * the last frame - a still picture of a camera that has gone is the
        * worst of both. */
-      if (was && !live && shown) { close(); }
+      if (root.PINE_NATIVE_TOOLS && shown) { nativeReading(got);if (live && !was) paintFrame(); }
+      else if (!live && shown) { close(true); }
     }).catch(function () { /* the station will be asked again in 5s */ });
   }
 
@@ -2179,14 +2276,33 @@
   }
 
   function pathPaint(got) {
+    routeState = got;
     var el = document.getElementById('pineCamPath');
-    if (!el) return;
     var src = got && got.source;
     var text = live ? pathSay(src) : '';
-    el.hidden = !text;
-    el.textContent = text;
-    el.title = text ? String((src && src.why) || text) : '';
+    var use = live && src ? (src.running || src.use) : '';
+    var route = use === 'tablet' ? 'tablet' : use === 'dongle' ? 'spark' : '';
+    var title = route === 'tablet' ? 'Camera connected through PineTab'
+      : route === 'spark' ? 'Camera connected directly to Spark' : '';
+    if (el) {
+      el.hidden = !route;
+      if (el.getAttribute('data-route') !== route) {
+        el.setAttribute('data-route', route);
+        el.innerHTML = route === 'tablet'
+          ? '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M10 18h4"/></svg>'
+          : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7l9-5 9 5v10l-9 5-9-5zM3 7l9 5 9-5M12 12v10"/></svg>';
+      }
+      el.title = title + (text ? ' · ' + text : '');
+      el.setAttribute('aria-label', title);
+    }
+    if (nativeOn) {
+      var arg = {route: route};
+      var key = JSON.stringify(arg);
+      if (key !== routeNativeKey) { routeNativeKey = key; nativeAsk('route', arg); }
+    }
   }
+  var routeState = null;
+  var routeNativeKey = '';
 
   /* [tabrelay] "Relay through the PineTab: auto / always / never". */
   function relayBtn(pref, tip) {

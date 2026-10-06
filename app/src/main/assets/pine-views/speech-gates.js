@@ -146,10 +146,47 @@
     return sec;
   }
 
+  /* [flow-ledger] EVERY REJECTION, IN ONE LIST (#1570). "If the rejection system
+   * is off, why is there still rejection occurring? I want to be able to see
+   * and approve each and every rejection." The editorial switches above never
+   * covered the checks below them. Each row is one line or round a check
+   * wanted to refuse: "let through" means System 3 was asked and it aired,
+   * "refused" means it did not - and Approve says a refused line now. */
+  function ledgerSection() {
+    var f = (ui.data && ui.data.flow) || {};
+    var rows = f.rows || [];
+    var sec = make('section', 'sg-gate');
+    sec.appendChild(make('b', '', 'Rejections'));
+    var refused = rows.filter(function (r) { return !r.passed; }).length;
+    sec.appendChild(make('p', 'sg-says', 'Every line or round a check wanted to refuse, newest first. Flow is '
+      + (f.open ? 'open: a check asks System 3 instead of refusing.' : 'closed: every check refuses as before.')
+      + ' Showing ' + rows.length + ', ' + refused + ' of them refused.'));
+    if (!rows.length) sec.appendChild(make('p', 'sg-says', 'Nothing has been refused or let through since the station started.'));
+    rows.forEach(function (r) {
+      var row = make('div', 'sg-ledger-row');
+      var when = new Date(Number(r.at || 0) * 1000).toLocaleTimeString();
+      var state = r.passed ? 'let through' : (r.approved ? 'approved' : 'refused');
+      row.appendChild(make('b', '', when + ' - ' + state + ' - ' + String(r.gate || '').replace(/_/g, ' ')
+        + (r.road ? ' - ' + r.road : '') + (r.who ? ' - ' + r.who : '')));
+      row.appendChild(make('p', 'sg-says', String(r.why || '')));
+      if (r.text) row.appendChild(make('p', 'sg-says', '"' + String(r.text) + '"'));
+      if (!r.passed && !r.approved && r.text && String(r.gate || '').indexOf('round:') !== 0) {
+        var b = make('button', '', 'Approve: say it now');
+        b.type = 'button';
+        b.title = 'Says this refused line now, in its own voice. No check is asked again.';
+        b.addEventListener('click', function () { post('/api/flow-ledger/approve', {n: r.n}, 'Approved: it is going out.'); });
+        row.appendChild(b);
+      }
+      sec.appendChild(row);
+    });
+    return sec;
+  }
+
   function paint() {
     if (!ui.body) return;
     ui.body.replaceChildren();
     ui.body.appendChild(contentSection());
+    ui.body.appendChild(ledgerSection());
     ((ui.data && ui.data.gates) || []).forEach(function (g) { ui.body.appendChild(gateSection(g)); });
     var more = make('section', 'sg-gate');
     more.appendChild(make('b', '', 'Edited elsewhere'));

@@ -58,7 +58,7 @@
  *    (dj_names, app.py:25275), so the wall follows a cast change with no
  *    request of its own.
  *
- * There is not one timer in this file. It is driven entirely by tick(),
+ * There is no polling timer in this file. It is driven entirely by tick(),
  * which the view calls from the shared 250ms interpolation beat - the
  * single-poller rule (app.py:154692), which this view is the biggest risk
  * to, because 38 concurrent requests in flight to this station measured a
@@ -80,6 +80,8 @@
    * tick. This is what stops a 404 turning into a request loop. */
   const FAIL_REST_MS = 60000;
   const RETRY_MS = 250;
+  const REQUEST_TIMEOUT_MS = 20000;
+  const walls = new Set();
 
   /* No Range means the whole file is on the wire before a frame shows, so
    * length is a hard limit rather than a preference. A WAN 5B clip off
@@ -249,12 +251,15 @@
     const clock = typeof settings.now === "function" ? settings.now : Date.now;
     const maxBytes = Number(settings.maxBytes) > 0 ? Number(settings.maxBytes) : MAX_BYTES;
     const maxClipMs = Number(settings.maxClipMs) > 0 ? Number(settings.maxClipMs) : MAX_CLIP_MS;
+    const requestTimeoutMs = Number(settings.requestTimeoutMs) > 0
+      ? Number(settings.requestTimeoutMs) : REQUEST_TIMEOUT_MS;
 
     let shelf = [];
     let names = {};
     let current = null;      /* {file, clip, activity, label, at} */
     let upcoming = null;
     let loading = false;
+    let loadRequest = null;
     let fetching = null;
     let fetched = false;
     let lastRefresh = -Infinity;
@@ -263,6 +268,9 @@
     let error = "";
     let note = "";
     let revision = 0;
+    let loadVersion = 0;
+    let refreshVersion = 0;
+    let recovering = null;
     const failed = new Map();
 
     const at = () => {
@@ -273,6 +281,26 @@
     function release(row) {
       if (!row || !row.clip) return;
       try { releaseClip(row.clip); } catch (err) { /* a leak beats a crash */ }
+    }
+
+    // A bridge can resolve after recovery, or never resolve at all. Do
+    // not let that strand loading=true or retain its eventual blob.
+    function bounded(task, late) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          settled = true;
+          reject(new Error("The video wall request timed out."));
+        }, requestTimeoutMs);
+        if (timer && typeof timer.unref === "function") timer.unref();
+        Promise.resolve().then(task).then(value => {
+          if (settled) { if (late) late(value); return; }
+          settled = true; clearTimeout(timer); resolve(value);
+        }, reason => {
+          if (settled) return;
+          settled = true; clearTimeout(timer); reject(reason);
+        });
+      });
     }
 
     const eligible = (name) => name !== (current && current.file)
@@ -307,16 +335,16 @@
       const row = candidate();
       if (!row) return;
       loading = true;
-      Promise.resolve()
-        .then(() => (row.kind === "still"
+      const version = ++loadVersion;
+      loadRequest = bounded(() => (row.kind === "still"
           /* Straight off the route. The gallery serves images with open
            * read auth and no Range problem, so there is nothing to
            * download whole and nothing to revoke afterwards. */
           ? {src: CLIP + encodeURIComponent(row.file), bytes: 1, still: true}
-          : fetchClip(CLIP + encodeURIComponent(row.file))))
+          : fetchClip(CLIP + encodeURIComponent(row.file))), clip => release({clip}))
         .then((clip) => {
           const held = { ...row, clip, at: at() };
-          if (destroyed) { release(held); return; }
+          if (destroyed || version !== loadVersion) { release(held); return; }
           const bytes = Number(clip && clip.bytes);
           /* An empty file is the failure that looks most like success:
            * the request is 200, the element is handed a valid object URL,
@@ -338,12 +366,13 @@
           else upcoming = held;
         })
         .catch((reason) => {
-          if (destroyed) return;
+          if (destroyed || version !== loadVersion) return;
           failed.set(row.file, at());
           retryAt = at() + RETRY_MS;
           note = String((reason && reason.message) || "That clip is unavailable.");
         })
         .finally(() => {
+          if (version !== loadVersion) return;
           loading = false;
           /* A success may go straight on to fill the second slot. A
            * FAILURE waits for the next tick, so even an instant 404 on
@@ -357,10 +386,10 @@
       if (fetching) return fetching;
       if (!force && at() - lastRefresh < REFRESH_MS) return Promise.resolve();
       lastRefresh = at();
-      fetching = Promise.resolve()
-        .then(() => get(CATALOGUE))
+      const version = ++refreshVersion;
+      fetching = bounded(() => get(CATALOGUE))
         .then((payload) => {
-          if (destroyed) return;
+          if (destroyed || version !== refreshVersion) return;
           shelf = catalogue(payload, at(), names);
           fetched = true;
           error = "";
@@ -373,13 +402,13 @@
           pump();
         })
         .catch((reason) => {
-          if (destroyed) return;
+          if (destroyed || version !== refreshVersion) return;
           /* ComfyUI being down is the common case and it must not take
            * the wall with it: whatever is already playing keeps playing,
            * and the reason is on screen rather than in a console. */
           error = String((reason && reason.message) || "The gallery is unavailable.");
         })
-        .finally(() => { fetching = null; });
+        .finally(() => { if (version === refreshVersion) fetching = null; });
       return fetching;
     }
 
@@ -420,7 +449,7 @@
       };
     }
 
-    return {
+    const controller = {
       /* Driven from the view's shared beat. No timer of its own. */
       tick(stamp) {
         if (destroyed || paused) return state();
@@ -433,6 +462,21 @@
       refresh,
       advance,
       state,
+      recover() {
+        if (destroyed) return Promise.resolve(state());
+        if (recovering) return recovering;
+        // Invalidate both bridges before releasing local media. Their
+        // late results can never replace the newly selected picture.
+        loadVersion += 1; refreshVersion += 1;
+        loading = false; loadRequest = null; fetching = null;
+        release(current); release(upcoming);
+        current = null; upcoming = null; revision += 1;
+        failed.clear(); retryAt = 0; lastRefresh = -Infinity;
+        error = ""; note = "";
+        recovering = refresh(true).then(() => loadRequest)
+          .then(() => state()).finally(() => { recovering = null; });
+        return recovering;
+      },
 
       /* WHAT THE WALL IS ALLOWED TO SHOW.
        *
@@ -452,6 +496,8 @@
         if (want === mode) return want;
         mode = want;
         paused = false;
+        loadVersion += 1; loading = false;
+        release(upcoming); upcoming = null;
         /* The pool has changed under the current picture, so let it go and
          * draw again from the new one - otherwise "stills" keeps showing
          * the clip that was already up until it happens to end. */
@@ -481,15 +527,21 @@
       shelf() { return shelf.slice(); },
       destroy() {
         destroyed = true;
+        loadVersion += 1; refreshVersion += 1;
+        loading = false; loadRequest = null; fetching = null;
+        walls.delete(controller);
         release(current); release(upcoming);
         current = null; upcoming = null;
         shelf = []; failed.clear();
       }
     };
+    walls.add(controller);
+    return controller;
   }
 
   const api = { create, catalogue, activityOf, weightAt, weighted, usableName,
-    MAX_BYTES, HALF_LIFE_MS, WEIGHT_FLOOR };
+    recoverAll: () => Promise.all([...walls].map(wall => wall.recover())),
+    MAX_BYTES, HALF_LIFE_MS, WEIGHT_FLOOR, REQUEST_TIMEOUT_MS };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PineVideoWall = api;
 })(typeof window !== "undefined" ? window : globalThis);

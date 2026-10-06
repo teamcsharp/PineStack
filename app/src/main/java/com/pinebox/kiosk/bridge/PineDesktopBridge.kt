@@ -1366,6 +1366,11 @@ class PineDesktopBridge(
                     }
                 }
                 when (want) {
+                    "cue", "cue-warm" -> {
+                        val clip = args.optJSONObject(1) ?: JSONObject()
+                        wall.cue(clip.optString("id"), clip.optString("url"),
+                            clip.optDouble("seconds", 0.0), clip.optLong("at"), want == "cue-warm")
+                    }
                     "on" -> {
                         val vcr = args.optJSONObject(1)?.optBoolean("vcr", true) ?: true   // [vcrfx] the CRT, natively
                         wall.veil(false, vcr); wall.start(vcr)
@@ -1459,6 +1464,7 @@ class PineDesktopBridge(
                     "menu" -> cam.menu(arg?.optBoolean("on", true) ?: true)
                     "free" -> cam.free()
                     "battery" -> cam.battery(arg ?: JSONObject())         // [cambattery]
+                    "route" -> cam.route(arg ?: JSONObject())
                     "full" -> cam.showFullScreen()
                     "window" -> cam.showWindowed()
                     "state" -> Unit

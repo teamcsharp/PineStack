@@ -55,6 +55,39 @@ function pineSpeakPlainly(api) {
 
 contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   readConfig: () => ipcRenderer.invoke("config:read"),
+  pipPosition: (value) => ipcRenderer.invoke('pip:position', value),
+  pipSource: (value) => ipcRenderer.invoke('pip:source', value),
+  pipWindowControl: (value) => ipcRenderer.invoke('pip:windowControl', value),
+  onPipAction: (callback) => ipcRenderer.on('pip:action', (_event, value) => callback(value)),
+  pipToolsOpen: want => ipcRenderer.invoke('pip:tools-open',want),
+  pipToolsScenes: () => ipcRenderer.invoke('pip:tools-scenes'),
+  pipToolsAsset: route => ipcRenderer.invoke('pip:tools-asset',route),
+  pipToolsBundle: key => ipcRenderer.invoke('pip:tools-bundle',key),
+  pipToolsInit: () => ipcRenderer.invoke('pip:tools-init'),
+  pipToolsSystem3Assets: () => ipcRenderer.invoke('pip:tools-system3-assets'),
+  pipToolsWatch: on => ipcRenderer.send('pip:tools-watch',on),
+  pipToolsFeed: payload => ipcRenderer.send('pip:tools-feed',payload),
+  onPipToolsFeed: callback => ipcRenderer.on('pip:tools-feed',(_event,payload)=>callback(payload)),
+  onPipToolsWatch: callback => ipcRenderer.on('pip:tools-watch',(_event,on)=>callback(on)),
+  pipState: () => ipcRenderer.invoke('pip:state'),
+  pipEnter: () => ipcRenderer.invoke('pip:enter'),
+  pipExit: () => ipcRenderer.invoke('pip:exit'),
+  pipUpdate: (value) => ipcRenderer.invoke('pip:update', value),
+  pipMenu: (playback) => ipcRenderer.invoke('pip:menu', playback),
+  /* [pip-shift] the shell says the window is about to change; the page covers itself and answers */
+  onPipShift: (callback) => ipcRenderer.on('pip:shift', (_event, value) => callback(value)),
+  pipShiftHeard: (id) => ipcRenderer.send('pip:shift-heard', id),
+  pipShiftCovered: (id) => ipcRenderer.send('pip:shift-covered', id),
+  audioMixerGet: () => ipcRenderer.invoke('audio-mixer:get'),
+  audioMixerSet: values => ipcRenderer.invoke('audio-mixer:set',values),
+  stationToolsState: () => ipcRenderer.invoke('station-troubleshooter:state'),
+  stationToolsRun: action => ipcRenderer.invoke('station-troubleshooter:run',action),
+  onStationToolsState: callback => {const fn=(_e,state)=>callback(state);ipcRenderer.on('station-troubleshooter:state',fn);return()=>ipcRenderer.removeListener('station-troubleshooter:state',fn);},
+  audioMixerOpen: () => ipcRenderer.invoke('audio-mixer:open'),
+  troubleshootStation: action => ipcRenderer.invoke('station-troubleshooter:open', action),
+  troubleshootProgress: (value) => ipcRenderer.send('station-troubleshooter:progress', value),
+  onPipState: (callback) => ipcRenderer.on('pip:state', (_event, value) => callback(value)),
+  onPipPlayback: (callback) => ipcRenderer.on('pip:playback', (_event, value) => callback(value)),
   writeConfig: (cfg) => ipcRenderer.invoke("config:write", cfg),
   /* [#1224] DICTATION, FROM A file:// PAGE TO A STATION ON THE LAN.
    * The bytes and the reply go through the shell because the renderer's
@@ -84,6 +117,9 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   onPinetabProgress: (callback) => ipcRenderer.on("pinetab-progress", (_event, data) => callback(data)),
   discoverKey: () => ipcRenderer.invoke("agent:discover-key"),
   get: (route) => ipcRenderer.invoke("agent:get", route),
+  lensPreview: () => ipcRenderer.invoke('pinelens:preview'),
+  lensSave: (value) => ipcRenderer.invoke('pinelens:save', value),
+  lensState: () => ipcRenderer.invoke('pinelens:state'),
   post: (route, body) => ipcRenderer.invoke("agent:post", route, body),
   put: (route, body) => ipcRenderer.invoke("agent:put", route, body),
   del: (route, body) => ipcRenderer.invoke("agent:del", route, body),
@@ -126,7 +162,10 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
    * renderer/screen-ring.js and nothing else. replayPush is also the tell
    * that this is the desk: the tablet's bridge has no such name. */
   replayState: () => ipcRenderer.invoke("replay:state"),
+  tabletReplayExport: want => ipcRenderer.invoke('tablet:replay-export',want),
   replayExport: (want) => ipcRenderer.invoke("replay:export", want),
+  /* [pip-export-bar] every step of an export this window asked for: {view, stage, ratio|null, at, ...} */
+  onReplayProgress: (callback) => ipcRenderer.on("replay:progress", (_event, note) => callback(note)),
   replayFrames: (want) => ipcRenderer.invoke("replay:frames", want),
   replayEdit: (want) => ipcRenderer.invoke("replay:edit", want),
   replayHold: (seconds) => ipcRenderer.invoke("replay:hold", seconds),
@@ -148,6 +187,10 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
    * knows whether a silent recording is this platform's limit (Electron
    * captures application audio on Windows only) or a gesture it never got. */
   replaySource: () => ipcRenderer.invoke("replay:source"),
+  // Select one of this app's own frames before an audio-only display request.
+  replayAudioTarget: target => ipcRenderer.invoke("replay:audio-target", target),
+  replayAudioSources: () => ipcRenderer.invoke("replay:audio-sources"),
+  onReplayAudioSourcesChanged: callback => ipcRenderer.on("replay-audio-sources-changed", (_event, catalog) => callback(catalog)),
   /* #1182d: the main process asking the recorder to close the piece it is
    * on, so a cut can reach all the way to now. */
   onReplayFlush: (callback) => ipcRenderer.on("replay-flush", () => callback()),
@@ -281,6 +324,7 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   /* The camera in a window of its own, streamed - the tablet keeps the
    * station on its screen. */
   cameraOpen: (want) => ipcRenderer.invoke("camera:open", want),
+  cameraPip: (want) => ipcRenderer.invoke("camera:pip", want),
   /* Waking the tablet from here, because a WebView on a sleeping tablet is
    * not running and cannot wake itself. */
   tabletWake: (want) => ipcRenderer.invoke("tablet:wake", want),

@@ -23,7 +23,8 @@
   var BG_MS = 10000;          /* [fc-design] off screen, the latest conversation is still fetched and kept */
   var ui = {pane: null, on: false, live: true, key: '', flowKey: '', timer: 0, busy: false,
             shown: {}, body: null, status: null, keyBox: null, liveBtn: null, recent: null, reveal: -1,
-            mode: 'technical', follow: true, cache: {}, lastFlow: null, autoAt: 0, modeBtn: null, followBtn: null};
+            mode: 'technical', follow: true, cache: {}, lastFlow: null, autoAt: 0, modeBtn: null, followBtn: null,
+            playback: null, feedLeave: null, request: 0, liveLine: '', unfold: null, unfoldTimer: 0, actionRow: null};
   try { if (root.localStorage && root.localStorage.getItem('pine.fc.mode') === 'design') ui.mode = 'design'; } catch (e) { /* no storage */ }
 
   /* ------------------------------------------------------------ roads */
@@ -73,14 +74,7 @@
   function die(value, delay) {
     var d = make('span', 'fc-die', '?');
     var final = value == null ? '–' : String(value);
-    root.setTimeout(function () {
-      var t0 = Date.now();
-      (function spin() {
-        if (Date.now() - t0 >= 900) { d.textContent = final; d.classList.add('landed'); return; }
-        d.textContent = String(1 + Math.floor(Math.random() * 100));
-        root.setTimeout(spin, 55);
-      }());
-    }, delay || 0);
+    d.textContent = final; d.classList.add('landed');
     d.title = value == null ? 'no random number: a pinned or single-choice draw' : 'd100 ' + final;
     return d;
   }
@@ -145,13 +139,70 @@
     key.title = 'Copy this conversation\'s key';
     key.addEventListener('click', function () { copy(String(n.id).split(':')[1]); });
     box.appendChild(key);
+    if (n.properties) box.appendChild(rouletteOptions(n));
     return box;
+  }
+  function rouletteOptions(n) {
+    var panel = make('div', 'fc-roulette');
+    if (n.previous_revision) panel.appendChild(make('b', 'fc-sub', 'Previous failed revision'));
+    (n.stages || []).forEach(function (st) {
+      var candidates = st.candidates || [];
+      var group = make('section', 'fc-wheel');
+      group.appendChild(make('b', 'fc-sub', (st.stage || 'options') + ' - ' + candidates.length + ' eligible'));
+      var reel = make('div', 'fc-reel');
+      reel.setAttribute('tabindex', '0'); reel.setAttribute('aria-label', 'Recorded ' + (n.family || '') + ' options');
+      var selectedRow = null;
+      candidates.forEach(function (c) {
+        var selected = c.id === st.selected;
+        var item = make('div', 'fc-option' + (selected ? ' selected' : ''));
+        item.appendChild(make('b', '', (selected ? 'Selected: ' : '') + (c.label || c.id)));
+        item.appendChild(make('span', 'fc-sub', 'weight ' + c.weight + (c.p != null ? ' | ' + pct(c.p) : '')));
+        if (c.text) item.appendChild(make('p', '', c.text));
+        if (c.why) item.appendChild(make('span', 'fc-sub', Array.isArray(c.why) ? c.why.join('; ') : String(c.why)));
+        reel.appendChild(item); if (selected) selectedRow = item;
+      });
+      group.appendChild(reel);
+      if (selectedRow) root.setTimeout(function () { reel.scrollTop = selectedRow.offsetTop - reel.firstElementChild.offsetTop; }, 0);
+      if (candidates.length) {
+        var replay = make('button', 'fc-btn', 'Scroll recorded options'); replay.type = 'button';
+        replay.addEventListener('click', function (e) {
+          e.stopPropagation();
+          reel.scrollTop = 0;
+          var i = 0; replay.disabled = true;
+          function next() {
+            if (!reel.isConnected) { replay.disabled = false; return; }
+            if (i < reel.children.length) {
+              reel.scrollTop = reel.children[i++].offsetTop - reel.firstElementChild.offsetTop;
+              root.setTimeout(next, 220);
+            } else {
+              if (selectedRow) reel.scrollTop = selectedRow.offsetTop - reel.firstElementChild.offsetTop;
+              replay.disabled = false;
+            }
+          }
+          next();
+        });
+        group.appendChild(replay);
+        if (candidates.length > 1 && !(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+          root.setTimeout(function () { if (replay.isConnected) replay.click(); }, 300);
+        }
+      }
+      (st.excluded || []).forEach(function (c) {
+        group.appendChild(make('div', 'fc-option excluded', 'Excluded: ' + (c.label || c.id) + ' | ' + (Array.isArray(c.why) ? c.why.join('; ') : c.why || '') + (c.text ? ' | ' + c.text : '')));
+      });
+      panel.appendChild(group);
+    });
+    if (n.selected && n.selected.text) panel.appendChild(make('p', 'fc-command', n.selected.text));
+    if (n.properties && Object.keys(n.properties).length) {
+      var details = make('details', 'fc-properties'); details.appendChild(make('summary', '', 'Node properties and changes'));
+      details.appendChild(make('pre', '', JSON.stringify(n.properties, null, 2))); panel.appendChild(details);
+    }
+    return panel;
   }
   function decisionNode(n, delay) {
     var row = make('div', 'fc-decision');
     var dia = make('div', 'fc-node fc-diamond' + (n.fixed ? ' fixed' : ''));
     var inner = make('div', 'fc-dia-in');
-    inner.appendChild(make('b', '', n.family || 'roll'));
+    inner.appendChild(make('b', '', n.family === 'GRAPH' ? n.kind || 'GRAPH' : n.family || 'roll'));
     inner.appendChild(die(n.dice, delay + 200));
     if (n.odds != null) inner.appendChild(make('span', 'fc-sub', 'at ' + pct(n.odds)));
     dia.appendChild(inner);
@@ -163,13 +214,7 @@
       if (n.winner.why && n.winner.why.length) w.title = n.winner.why.join('; ');
       side.appendChild(w);
     }
-    (n.losers || []).forEach(function (l, i) {
-      var b = make('div', 'fc-branch lose', cut(l.label, 60) + (l.p != null ? '  ' + pct(l.p) : ''));
-      b.style.animationDelay = (delay + 260 + i * 90) + 'ms';
-      side.appendChild(b);
-    });
-    if (n.more) side.appendChild(make('div', 'fc-branch more', '+' + n.more + ' more not taken'));
-    if (n.excluded) side.appendChild(make('div', 'fc-branch more', n.excluded + ' could not come up'));
+    side.appendChild(rouletteOptions(n));
     if ((n.path || []).length > 1) side.appendChild(make('div', 'fc-path', n.path.join(' › ')));
     row.appendChild(side);
     return row;
@@ -182,6 +227,8 @@
     (n.codes || []).forEach(function (c) { top.appendChild(codeChip(c, n)); });
     box.appendChild(top);
     box.appendChild(make('p', n.said ? 'fc-said' : 'fc-asked', n.said ? '“' + cut(n.said, 320) + '”' : cut(n.asked, 260)));
+    replyTrail(box, n);
+    if (n.properties) box.appendChild(rouletteOptions(n));
     return box;
   }
   function plainNode(n, cls, label, text) {
@@ -237,23 +284,66 @@
     function rankOf(n) { return n.type === 'start' ? 0 : n.type === 'decision' ? 1 : n.type === 'turn' ? 2 : n.type === 'end' ? 4 : 3; }
     var out = nodes.map(function (n, i) { return {n: n, g: groupOf(n), r: rankOf(n), s: n.type === 'decision' ? (n.seq || 0) : (n.at || 0), i: i}; });
     out.sort(function (a, b) { return a.g - b.g || a.r - b.r || a.s - b.s || a.i - b.i; });
+    flow.__nodeGroups = {};
+    out.forEach(function (x) { flow.__nodeGroups[x.n.id] = x.g; });
     flow.__ordered = out.map(function (x) { return x.n; });
     flow.__orderedOf = nodes;
     return flow.__ordered;
   }
+  /* The technical chart unfolds the actions of the clock-selected reply. Older
+     turns remain landed; later replies stay hidden until they actually speak. */
+  function stopUnfold() {
+    if (ui.unfoldTimer) root.clearTimeout(ui.unfoldTimer);
+    ui.unfoldTimer = 0;
+  }
   function revealUpTo(flow) {
-    /* live: up to the turn going out now (and what comes straight after it); otherwise all */
     var nodes = ordered(flow);
-    if (!ui.live || !flow.now_turn) return nodes.length;
-    var at = -1;
-    for (var i = 0; i < nodes.length; i += 1) if (nodes[i].type === 'turn' && nodes[i].now) at = i;
-    if (at < 0) return nodes.length;
-    for (var j = at + 1; j < nodes.length && (nodes[j].type === 'gate' || nodes[j].type === 'step'); j += 1) at = j;
-    return at + 1;
+    if (!ui.live || !flow.now_turn) { stopUnfold(); ui.unfold = null; return nodes.length; }
+    var at = nodes.findIndex(function (n) { return n.type === 'turn' && n.now; });
+    if (at < 0) { stopUnfold(); ui.unfold = null; return nodes.length; }
+    var last = at;
+    while (last + 1 < nodes.length && (nodes[last + 1].type === 'gate' || nodes[last + 1].type === 'step')
+      && flow.__nodeGroups[nodes[last + 1].id] === nodes[at].index) last += 1;
+    if (ui.mode !== 'technical') { stopUnfold(); return last + 1; }
+    var first = nodes.findIndex(function (n) { return flow.__nodeGroups[n.id] === nodes[at].index; });
+    if (first < 0) first = at;
+    // Round-wide planning belongs to the first reply; later replies retain it above.
+    if (!nodes.slice(0, at).some(function (n) { return n.type === 'turn'; })) {
+      var planning = nodes.findIndex(function (n) { return n.type !== 'start'; });
+      if (planning >= 0) first = Math.min(first, planning);
+    }
+    var token = flow.key + '/' + (stripLine() || flow.now_turn);
+    var now = Date.now(), value = ui.playback, stream = value && value.station && value.station.stream_now;
+    var row = value && value.now, timed = stream && (stream.rows || []).find(function (r) { return String(r.id) === stripLine(); });
+    timed = timed || row;
+    var duration = timed && Number(timed.until) - Number(timed.from);
+    var budget = duration > 0 ? Math.max(1000, Math.min(6000, duration * 350)) : 3000;
+    var run = ui.unfold;
+    if (!run || run.token !== token) run = ui.unfold = {token: token, elapsed: 0, stamp: now, count: 0};
+    var paused = value && value.station && value.station.paused === true;
+    if (!paused && !run.paused) run.elapsed += Math.max(0, now - run.stamp);
+    run.stamp = now; run.paused = paused;
+    if (stream && timed && stream.at != null && timed.from != null && value.at != null) {
+      // Shared feed timestamps are milliseconds, including in the independent tools window.
+      var playhead = Number(value.at) - Number(stream.at) * 1000 - Number(timed.from) * 1000;
+      if (Number.isFinite(playhead) && !paused) run.elapsed = Math.max(run.elapsed, playhead);
+    }
+    var count = last - first + 1;
+    run.count = Math.max(run.count, Math.min(count, 1 + Math.floor(Math.max(0, run.elapsed) / budget * count)));
+    run.first = first; run.last = last; run.turn = nodes[at].index;
+    stopUnfold();
+    if (run.count < count && !paused && ui.on && !document.hidden) {
+      ui.unfoldTimer = root.setTimeout(function () {
+        ui.unfoldTimer = 0;
+        if (ui.on && ui.live && ui.mode === 'technical' && ui.lastFlow) paint(ui.lastFlow);
+      }, 160);
+    }
+    return Math.min(last + 1, first + run.count);
   }
   /* [fc-oneway] what the chart follows: the turn on air, else the last turn that
      aired - never the "planned - not aired yet" end, which is where it kept jumping */
   function followTarget() {
+    if (ui.live && ui.mode === 'technical' && ui.actionRow && ui.actionRow.isConnected && !ui.actionRow.hidden) return ui.actionRow;
     if (ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden) return ui.nowRow;
     return ui.airedRow && ui.airedRow.isConnected && !ui.airedRow.hidden ? ui.airedRow : null;
   }
@@ -264,12 +354,15 @@
     if (flow.key) ui.cache[flow.key] = flow;
     var fresh = ui.mode === 'design' ? paintDesign(flow) : paintTech(flow);
     var c = flow.counts || {};
+    var speaking = (flow.nodes || []).find(function (n) { return n.type === 'turn' && n.now; });
     say('#' + flow.key + ' · ' + (flow.road || '') + ' · ' + (c.decisions || 0) + ' draws · ' + (c.turns || 0)
       + ' turns (' + (c.aired || 0) + ' aired) · ' + (c.candidates_lost || 0) + ' candidates beaten'
+      + (ui.live && speaking ? ' \u00b7 speaking: ' + (speaking.who || speaking.seat || '') + ' \u00b7 turn ' + (speaking.index + 1) : '')
       + (ui.follow ? '' : ' · not following - tap Follow'));
     if (ui.wantJump || (fresh && ui.follow)) {
       ui.wantJump = false;
-      root.setTimeout(scrollNow, Math.min(fresh, ANIMATE_LAST) * STAGGER_MS + 40);
+      var body = ui.body;
+      root.setTimeout(function () { if (ui.on && ui.body === body && ui.follow) scrollNow(); }, Math.min(fresh, ANIMATE_LAST) * STAGGER_MS + 40);
     }
   }
   /* [fc-design] "its blank atm": a conversation is hundreds of draws, and every new
@@ -278,7 +371,8 @@
      rows animate now; the rest are there at once. */
   var ANIMATE_LAST = 8;
   function paintTech(flow) {
-    if (flow.key !== ui.flowKey || ui.paintedMode !== 'technical') {
+    if (flow.key !== ui.flowKey || ui.paintedMode !== 'technical' || ui.techRevision !== flow.revision) {
+      ui.techRevision = flow.revision;
       ui.body.textContent = '';
       ui.shown = {};
       ui.flowKey = flow.key;
@@ -288,17 +382,23 @@
     }
     var nodes = ordered(flow);                                           /* [fc-oneway] */
     var upto = revealUpTo(flow);
+    ui.nowRow = null; ui.airedRow = null; ui.actionRow = null;
     var news = 0;
     nodes.forEach(function (n, i) { if (i < upto && !ui.shown[n.id]) news += 1; });
     var fresh = 0;
+    var visibleRows = new Set(nodes.slice(0, upto).map(function (n) { return ui.shown[n.id]; }).filter(Boolean));
     nodes.forEach(function (n, i) {
       var had = ui.shown[n.id];
-      if (i >= upto) { if (had) had.hidden = true; return; }
+      if (i >= upto) { if (had && !visibleRows.has(had)) had.hidden = true; return; }
       if (had && n.type === 'turn' && n.now) ui.nowRow = had;            /* [air-jump-any] */
       if (had && n.type === 'turn' && (n.said || n.aired_at)) ui.airedRow = had;   /* [fc-oneway] */
       if (had) {
         had.hidden = false;
-        if (n.type === 'turn') {
+        if (n.type === 'decision' && JSON.stringify(had.__node) !== JSON.stringify(n)) {
+          had.replaceChild(decisionNode(n, 0), had.querySelector('.fc-decision')); had.__node = n;
+        }
+        if (n.type === 'turn' && JSON.stringify(had.__node) !== JSON.stringify(n)) {
+          had.__node = n;
           var repl = nodeFor(n, 0);
           had.replaceChild(repl, had.querySelector('.fc-node'));
         }
@@ -327,12 +427,21 @@
       }
       ui.body.appendChild(row);
       ui.shown[n.id] = row;
+      row.dataset.nodeId = n.id;
       row.__node = n;                                                     /* [fc-inspect] */
       ui.prevSig = sig; ui.prevRow = row;
       if (n.type === 'turn' && n.now) ui.nowRow = row;                    /* [air-jump-any] */
       if (n.type === 'turn' && (n.said || n.aired_at)) ui.airedRow = row;   /* [fc-oneway] */
       fresh += 1;
     });
+    nodes.forEach(function (n, i) {
+      var row = ui.shown[n.id]; if (!row) return;
+      var active = ui.live && !!flow.now_turn && ui.unfold && i >= ui.unfold.first && i <= ui.unfold.last && i < upto;
+      row.classList.toggle('fc-current-action', active);
+      row.classList.remove('fc-active-step');
+      if (active) ui.actionRow = row;
+    });
+    if (ui.actionRow) ui.actionRow.classList.add('fc-active-step');
     return fresh;
   }
 
@@ -363,6 +472,10 @@
     var out = [];
     function add(k, v) { if (v != null && v !== '' && !(Array.isArray(v) && !v.length)) out.push([k, v]); }
     add('node', n.id);
+    add('properties and changes', n.properties);
+    add('recorded stages, options and exclusions', n.stages);
+    add('selected command', n.selected);
+    add('state before', n.state_before); add('state after', n.state_after);
     if (n.type === 'decision') {
       add('family', (n.family || '') + (FAMILY[n.family] ? ' - ' + FAMILY[n.family] : ''));
       add('drawn from', (n.path || []).join(' › '));
@@ -379,6 +492,9 @@
       add('role', rl === 'initiator' ? 'Initiator' : rl === 'rebuttal' ? 'Rebuttal' : rl === 'topic' ? 'Topic Change' : 'Reply');
       add('speaker', (n.who || '') + (n.seat ? '  (seat ' + n.seat + ')' : ''));
       add('asked to', n.asked); add('said', n.said); add('feeling', n.feeling);
+      add('answers', n.reply_to ? n.reply_to.name + ' · turn ' + (n.reply_to.index + 1) : '');
+      add('turn credit', n.turn_credit ? '+1 · mainline turn restored' : '');
+      add('exchange', n.cast_reaction ? 'Cast reaction' : n.returns_to_topic ? 'Topic instigator resumes' : n.inner_reply ? 'Inner reply chain' : 'Mainline');
       add('leg', [n.leg, n.place].filter(Boolean).join(' / '));
       add('line codes', (n.codes || []).join(', '));
       add('aired', n.aired_at ? new Date(n.aired_at * 1000).toLocaleTimeString() : 'not yet - planned');
@@ -482,9 +598,10 @@
     var o = odds(n);
     row.appendChild(make('span', 'fd-dia-odds', o ? '(' + o + ')' : ''));
     var w = n.winner ? n.winner.label : (n.path || []).slice(-1)[0] || n.label;
-    row.appendChild(make('span', 'fd-dia-label', (n.family || 'roll') + ': ' + cut(w, 80)));
+    row.appendChild(make('span', 'fd-dia-label', (n.family === 'GRAPH' ? n.kind || 'GRAPH' : n.family || 'roll') + ': ' + cut(w, 80)));
     row.title = (n.path || []).join(' › ') + (n.of ? '  ·  ' + n.of + ' in the drum' : '')
       + ((n.losers || []).length ? '\nbeat: ' + n.losers.map(function (l) { return l.label + (l.p != null ? ' ' + pct(l.p) : ''); }).join(' | ') : '');
+    row.appendChild(rouletteOptions(n));
     return row;
   }
   function designBox(t, label, role) {
@@ -502,20 +619,43 @@
     (t.codes || []).forEach(function (c) { head.appendChild(codeChip(c, t)); });
     box.appendChild(head);
     box.appendChild(make('p', spoken && t.said ? 'fd-said' : 'fd-asked', spoken && t.said ? '“' + cut(t.said, 300) + '”' : cut(t.asked, 220)));
+    replyTrail(box, t);
+    if (t.properties) box.appendChild(rouletteOptions(t));
     return box;
+  }
+  function replyTrail(box, t) {
+    box.dataset.turnId = t.turn_id || '';
+    if (!t.reply_to) return;
+    var line = make('p', 'fc-sub', (t.cast_reaction ? 'Cast reaction → ' : t.returns_to_topic ? 'Return to topic · answers ' : t.inner_reply ? 'Inner reply → ' : 'Answers ')
+      + t.reply_to.name + ' · turn ' + (t.reply_to.index + 1) + (t.turn_credit ? ' · +1 turn restored' : ''));
+    line.title = 'Response link: ' + t.reply_to.turn_id;
+    var jump = make('button', 'fc-code', 'View answered turn');
+    jump.type = 'button';
+    jump.onclick = function (e) {
+      e.stopPropagation();
+      var target = Array.prototype.find.call(ui.body.querySelectorAll('[data-turn-id]'), function (n) {
+        return n.dataset.turnId === t.reply_to.turn_id;
+      });
+      if (target) {
+        ui.autoAt = Date.now(); target.scrollIntoView({block: 'center'});
+        target.classList.add('fc-flash'); root.setTimeout(function () { target.classList.remove('fc-flash'); }, 1400);
+      }
+    };
+    line.appendChild(document.createTextNode(' ')); line.appendChild(jump);
+    box.appendChild(line);
   }
   function paintDesign(flow) {
     var nodes = ordered(flow);                                           /* [fc-oneway] */
     var upto = revealUpTo(flow);
-    var turns = [], byTurn = {};
+    var turns = [], byTurn = {}, globalDecisions = [];
     nodes.forEach(function (n, i) {
       if (i >= upto) return;
       if (n.type === 'turn') turns.push(n);
-      else if (n.type === 'decision' && DESIGN_DICE[n.family] && n.turn_index >= 0) {
+      else if (n.type === 'decision' && n.turn_index >= 0) {
         (byTurn[n.turn_index] = byTurn[n.turn_index] || []).push(n);
-      }
+      } else if (n.type === 'decision') globalDecisions.push(n);
     });
-    var sig = flow.key + '|' + turns.map(function (t) { return t.index + (t.said ? 's' : '') + (t.now ? 'n' : ''); }).join(',');
+    var sig = JSON.stringify(nodes.slice(0, upto)) + '|' + flow.key + '|' + flow.revision + '|' + turns.map(function (t) { return t.index + (t.said ? 's' : '') + (t.now ? 'n' : ''); }).join(',');
     if (sig === ui.designSig && ui.paintedMode === 'design') return 0;
     var before = ui.designCount || 0;
     var sameFlow = ui.flowKey === flow.key && ui.paintedMode === 'design';
@@ -529,6 +669,8 @@
     var chart = make('div', 'fd-chart');
     var start = nodes[0] && nodes[0].type === 'start' ? nodes[0] : null;
     if (start) chart.appendChild(make('div', 'fd-title', cut([start.road, start.topic].filter(Boolean).join(' · '), 200)));
+    globalDecisions.forEach(function (d) { chart.appendChild(designDiamond(d)); });
+    if (start && start.properties) chart.appendChild(rouletteOptions(start));
     var chapter = 0, replyN = 0, chain = null;
     turns.forEach(function (t, k) {
       var role = k === 0 ? 'initiator' : roleOf(t);       /* a chain always opens on its Initiator */
@@ -578,7 +720,7 @@
      stops the following; scrolling back to either, Follow, Live or the strip's tap
      starts it again. Never a timed re-follow. */
   function onScroll() {
-    if (Date.now() - ui.autoAt < 900) return;
+    if (Date.now() - ui.autoAt < 900 && Date.now() > (ui.handScrollUntil || 0)) return;
     var b = ui.body;
     var atEnd = b.scrollHeight - b.scrollTop - b.clientHeight < 140;
     var act = followTarget();                                  /* [fc-oneway] */
@@ -602,7 +744,9 @@
       ui.live = true; ui.flowKey = ''; ui.nowRow = null;
       if (ui.liveBtn) ui.liveBtn.setAttribute('aria-pressed', 'true');
     }
+    ui.request += 1; ui.busy = false;
     ui.jumpLid = /^[0-9a-f]{6,32}$/i.test(String(lid || '')) ? String(lid).toLowerCase() : '';
+    ui.liveLine = stripLine();
     ui.fallbackFor = '';
     ui.wantJump = true;
     setFollow(true);
@@ -610,90 +754,56 @@
     tick();
     return true;
   }
-  /* [air-jump-any] "its blank atm": what is on air has no System 3 conversation (a
-     board clip, a record), so Live showed nothing. Live now shows, in order: the
-     conversation of the line the strip was tapped on (by its line code, with that
-     line's turn marked), the last conversation that aired live, the newest one. */
-  /* [fc-stay] "Why does this collapse back instead of stay open and continue going to
-     the next message?" (the operator, 2026-10-01). /api/flow/now knows only a line
-     announced on its own; while a streamed round plays it says "nothing is on air",
-     and every two seconds the chart fell back to the NEWEST conversation - a one-line
-     board clip - dropping the one being heard. Live now follows the line the strip is
-     playing (its conversation, its turn marked, tiles revealed as it advances); a
-     strip line with no conversation (a clip) leaves the open conversation open. The
-     newest conversation is only a first paint, never a replacement. */
-  var NO_FLOW = {}, noFlowN = 0;
   function stripLine() {
+    var value = ui.playback || (root.PineStationFeed && root.PineStationFeed.latest && root.PineStationFeed.latest());
     var lid = '';
-    try { lid = ui.lineSource ? String(ui.lineSource() || '').toLowerCase() : ''; } catch (e) { lid = ''; }
+    if (value && Object.prototype.hasOwnProperty.call(value, 'now')) lid = String(value.now && value.now.id || '').toLowerCase();
+    else try { lid = ui.lineSource ? String(ui.lineSource() || '').toLowerCase() : ''; } catch (e) { lid = ''; }
     return /^[0-9a-f]{6,32}$/.test(lid) ? lid : '';
   }
-  function fallbackShow(why) {
-    var lid = ui.jumpLid || stripLine();
-    if (lid && !NO_FLOW[lid]) {
-      get('/api/flow/' + encodeURIComponent(lid)).then(function (f) {
-        if (!ui.on || !ui.live) return;
-        if (f && f.nodes) {
-          ui.jumpLid = '';
-          paint(f);
-          say(why + ' - following the line in the strip (#' + f.key + ')');
-        } else {
-          markNoFlow(lid); keepShown(why);
-        }
-      }, function () { markNoFlow(lid); keepShown(why); });
-      return;
-    }
-    keepShown(why);
+  function receivePlayback(value) {
+    ui.playback = value;
+    if (!ui.on || !ui.live) return;
+    var lid = stripLine();
+    if (lid !== ui.liveLine) {
+      ui.liveLine = lid; ui.request += 1; ui.busy = false;
+      stopUnfold(); ui.unfold = null; ui.actionRow = null; ui.nowRow = null;
+      if (ui.body) ui.body.querySelectorAll('.fc-current-action,.fc-active-step,.fc-turn.now').forEach(function (n) { n.classList.remove('fc-current-action', 'fc-active-step', 'now'); });
+      say(lid ? 'Reading recorded actions for #' + lid : 'Waiting for the next speaking reply');
+      tick();
+    } else if (ui.lastFlow && ui.unfold && ui.unfold.count <= ui.unfold.last - ui.unfold.first) paint(ui.lastFlow);
   }
-  function markNoFlow(lid) {
-    if (noFlowN > 600) { NO_FLOW = {}; noFlowN = 0; }
-    NO_FLOW[lid] = 1; noFlowN += 1;
-    if (ui.jumpLid === lid) ui.jumpLid = '';
-  }
-  function keepShown(why) {
-    if (ui.flowKey) {                                   /* stay: refresh what is open, now and then */
-      if (Date.now() - (ui.keptAt || 0) < 6000) return;
-      ui.keptAt = Date.now();
-      var key = ui.flowKey;
-      get('/api/flow/' + encodeURIComponent(key)).then(function (f) {
-        if (ui.on && ui.live && f && f.nodes && f.key === ui.flowKey) paint(f);
-      }, function () { /* the next pass tries again */ });
-      return;
-    }
-    firstPaint(why);
-  }
-  function firstPaint(why) {
-    var keys = [ui.lastLive, ui.recentFirst].filter(function (k, i, a) { return k && a.indexOf(k) === i; });
-    var want = keys.join('|');
-    if (ui.fallbackFor === want) return;
-    ui.fallbackFor = want;
-    (function tryNext(i) {
-      if (i >= keys.length) { if (!ui.flowKey) say(why); return; }
-      get('/api/flow/' + encodeURIComponent(keys[i])).then(function (f) {
-        if (!ui.on || !ui.live) return;
-        if (!(f && f.nodes)) { tryNext(i + 1); return; }
-        if (ui.flowKey) return;                         /* the strip's line got there first */
-        var which = keys[i] === ui.lastLive ? 'the last conversation that aired' : 'the newest conversation';
-        paint(f);
-        say(why + ' - showing ' + which + ' (#' + f.key + ')');
-      }, function () { tryNext(i + 1); });
-    }(0));
-  }
-
   function tick() {
-    if (!ui.on || ui.busy) return;
-    ui.busy = true;
-    var path = ui.live ? '/api/flow/now' : '/api/flow/' + encodeURIComponent(ui.key);
+    if (!ui.on) return;
+    var live = ui.live, key = ui.key, lid = live ? (stripLine() || ui.jumpLid || '') : '';
+    if (live && !lid && ui.playback && Object.prototype.hasOwnProperty.call(ui.playback, 'now')) {
+      say('Waiting for the next speaking reply'); return;
+    }
+    var path = live ? (lid ? '/api/flow/' + encodeURIComponent(lid) : '/api/flow/now') : '/api/flow/' + encodeURIComponent(key);
+    if (ui.busy === path) return;
+    ui.busy = path;
+    var ticket = ++ui.request;
     get(path).then(function (d) {
-      if (!ui.on) return;
-      if (ui.live) {
-        if (d && d.live && d.flow) { ui.lastLive = d.flow.key; ui.fallbackFor = ''; paint(d.flow); }
-        else fallbackShow(d && d.why ? d.why : 'nothing is on air');
-      } else if (d && d.nodes) {
-        paint(d);
-      }
-    }, function (err) { say(String((err && err.message) || err)); })
-      .then(function () { ui.busy = false; });
+      if (!ui.on || ticket !== ui.request || live !== ui.live || (!live && key !== ui.key) || (live && stripLine() && stripLine() !== lid)) return;
+      var flow = live && !lid ? d && d.live && d.flow : d;
+      if (flow && flow.nodes) {
+        if (live) {
+          var turns = flow.nodes.filter(function (n) { return n.type === 'turn'; });
+          var turn = turns.find(function (n) { return (n.codes || []).indexOf(lid) >= 0; }) || turns.find(function (n) { return n.now; });
+          if (lid && !turn) { say('Waiting for recorded actions for #' + lid); return; }
+          if (lid && turn) {
+            flow.now_turn = turn.turn_id || turn.id;
+            turns.forEach(function (n) { n.now = n === turn; });
+            var row = ui.playback && ui.playback.now;
+            if (row && String(row.id) === lid && row.text) turn.said = String(row.text);
+          }
+          ui.lastLive = flow.key; ui.jumpLid = '';
+        }
+        paint(flow);
+      } else say(d && d.why || 'Waiting for the speaking reply recorded flow');
+    }, function (err) {
+      if (ui.on && ticket === ui.request) say(live && lid ? 'Waiting for recorded actions for #' + lid : String(err && err.message || err));
+    }).then(function () { if (ticket === ui.request) ui.busy = false; });
   }
 
   function loadRecent() {
@@ -715,7 +825,7 @@
   function openKey(key) {
     key = String(key || '').trim().replace(/^#/, '').toLowerCase();
     if (!/^[0-9a-f]{6,32}$/.test(key)) { say('a key is hex: a conversation\'s 16 or a line\'s code'); return; }
-    ui.live = false;
+    ui.live = false; ui.request += 1; ui.busy = false; stopUnfold(); ui.unfold = null; ui.actionRow = null;
     ui.key = key;
     ui.flowKey = '';
     if (ui.liveBtn) ui.liveBtn.setAttribute('aria-pressed', 'false');
@@ -723,6 +833,7 @@
   }
 
   function build(pane) {
+    ui.paintedMode = ''; ui.shown = {}; ui.nowRow = null; ui.actionRow = null;
     pane.textContent = '';
     pane.classList.add('fc-pane');
     var bar = make('div', 'fc-bar');
@@ -732,7 +843,7 @@
     ui.liveBtn.title = 'Follow the conversation on air';
     ui.liveBtn.setAttribute('aria-pressed', 'true');
     ui.liveBtn.addEventListener('click', function () {
-      ui.live = true; ui.flowKey = ''; ui.liveBtn.setAttribute('aria-pressed', 'true'); tick();
+      jumpLive();
     });
     bar.appendChild(ui.liveBtn);
     ui.keyBox = make('input', 'fc-key');
@@ -770,6 +881,9 @@
     pane.appendChild(ui.status);
     ui.body = make('div', 'fc-body');
     ui.body.addEventListener('scroll', onScroll, {passive: true});
+    function handScroll() { ui.handScrollUntil = Date.now() + 1500; }
+    ['wheel', 'touchmove', 'pointerdown'].forEach(function (name) { ui.body.addEventListener(name, handScroll, {passive: true}); });
+    ui.body.addEventListener('keydown', function (e) { if (/^(ArrowUp|ArrowDown|PageUp|PageDown|Home|End)$/.test(e.key)) handScroll(); });
     wireHold(ui.body);                                                     /* [fc-inspect] */
     pane.appendChild(ui.body);
     ui.pane = pane;
@@ -779,7 +893,7 @@
     if (!ui.modeBtn) return;
     ui.modeBtn.textContent = ui.mode === 'design' ? 'Design' : 'Tech';
     ui.modeBtn.title = ui.mode === 'design'
-      ? 'Design flowchart: the chain as the NodePlan draws it - tap for the Technical flowchart (every draw)'
+      ? 'Design flowchart: every recorded roulette and the conversation chain - tap for Technical view'
       : 'Technical flowchart: every draw as it was made - tap for the Design flowchart (the NodePlan chain)';
     ui.modeBtn.setAttribute('aria-pressed', String(ui.mode === 'design'));
     if (ui.pane) ui.pane.classList.toggle('fc-design', ui.mode === 'design');
@@ -798,13 +912,14 @@
   function show(pane, on) {
     on = !!on;
     if (on && pane && ui.pane !== pane) build(pane);
-    ui.on = on;
+    ui.on = on; ui.request += 1; ui.busy = false;
+    if (ui.feedLeave) { ui.feedLeave(); ui.feedLeave = null; }
+    stopUnfold();
     if (ui.timer) { root.clearInterval(ui.timer); ui.timer = 0; }
     if (on) {
       loadRecent();
-      /* [fc-design] the moment the chart is opened: the latest conversation the
-         background kept, at once, then the live read */
-      if (ui.live && ui.bgFlow && ui.body && !ui.body.childElementCount) { ui.wantJump = true; paint(ui.bgFlow); }
+      // Subscribe only while open; the shared feed supplies the exact playback line.
+      if (root.PineStationFeed && root.PineStationFeed.subscribe) ui.feedLeave = root.PineStationFeed.subscribe(receivePlayback);
       tick();
       ui.timer = root.setInterval(tick, POLL_MS);
     }
@@ -819,8 +934,10 @@
       if (d && d.live && d.flow) { ui.bgFlow = d.flow; ui.lastLive = d.flow.key; ui.cache[d.flow.key] = d.flow; }
     }, function () { /* the next pass tries again */ });
   }
-  root.setInterval(background, BG_MS);
-  root.setTimeout(background, 1500);
+  if (!root.PINE_NATIVE_TOOLS) {
+    root.setInterval(background, BG_MS);
+    root.setTimeout(background, 1500);
+  }
 
   root.PineFlowChart = {show: show, open: openKey, isOn: function () { return ui.on; }, jumpLive: jumpLive,
     lineSource: function (fn) { ui.lineSource = typeof fn === 'function' ? fn : null; },   /* [fc-stay] the strip's line */

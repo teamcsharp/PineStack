@@ -138,6 +138,24 @@ class TerminalHost {
    * camera shutter. */
   async glassSerial() {
     const tools = this.tools();
+    /* [tablet-attach] WHY NOT, IN ADB'S OWN WORDS.
+     *
+     * "The tablet is definitely online. Check and see why the application
+     *  is unable to correspond with and connect to the tablet."
+     *
+     * Every way this could fail ended in the same empty answer, and the desk
+     * printed "no tablet is attached" for all of them: a tablet that was
+     * never chosen, one that refused the connection, one adb still listed
+     * but could no longer talk to, a missing adb. glassWhy keeps the reason
+     * for whoever shows the verdict.
+     *
+     * One of those was a trap. A network tablet whose link has died stays in
+     * adb's list as "offline", and `adb connect` answers "already connected"
+     * to it and changes nothing - so the desk could say "not attached" for
+     * as long as adb kept the dead entry. The dead entry is dropped first. */
+    this.glassWhy = '';
+    const words = (text) => String(text || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+    const failed = (error) => (error && error.killed ? 'no answer in time' : words(error && error.message) || 'no answer').slice(0, 140);
     try {
       const list = parseDevices(await runner(tools.adb, 20000)(['devices', '-l'])) || [];
       const saved = String((this.readConfig() || {}).tabletSerial || '');
@@ -147,15 +165,28 @@ class TerminalHost {
        * must not make the mirror impossible to open again. */
       if (/^[^\s:]+:\d+$/.test(saved)) {
         try {
-          await runner(tools.adb, 6000)(['connect', saved]);
+          const listed = list.find((entry) => entry.serial === saved);
+          if (listed && listed.state !== 'unauthorized') await runner(tools.adb, 6000)(['disconnect', saved]).catch(() => '');
+          const said = await runner(tools.adb, 12000)(['connect', saved]);
           const again = parseDevices(await runner(tools.adb, 6000)(['devices', '-l'])) || [];
           if (again.some((entry) => entry.authorized && entry.serial === saved)) return saved;
-        } catch (error) { /* let the caller consult the station's current address */ }
+          const now = again.find((entry) => entry.serial === saved);
+          this.glassWhy = now && now.state === 'unauthorized'
+            ? 'the tablet at ' + saved + ' has not allowed this computer yet - accept the debugging prompt on its screen'
+            : 'the tablet at ' + saved + ' did not take the connection (' + (words(said) || 'adb said nothing').slice(0, 140) + ')';
+        } catch (error) {
+          /* let the caller consult the station's current address */
+          this.glassWhy = 'adb could not reach the tablet at ' + saved + ' (' + failed(error) + ')';
+        }
         return '';
       }
       const other = list.find((entry) => entry.authorized);
+      if (!other && list.length) this.glassWhy = 'adb lists ' + list[0].serial + ' as ' + list[0].state + ', which is not ready';
       return other ? other.serial : '';
     } catch (error) {
+      this.glassWhy = tools.found === false
+        ? 'adb was not found on this computer - set the platform-tools folder'
+        : 'adb did not answer (' + failed(error) + ')';
       return '';
     }
   }

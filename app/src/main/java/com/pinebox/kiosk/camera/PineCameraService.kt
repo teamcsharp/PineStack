@@ -10,12 +10,15 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.ImageFormat
+import android.graphics.YuvImage
+import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
+import android.media.Image
 import android.net.LocalSocket
 import android.os.Build
 import android.os.Handler
@@ -23,6 +26,7 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import java.io.OutputStream
+import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 
 /**
@@ -39,9 +43,9 @@ import kotlin.concurrent.thread
  * through its camera must not take it off the air.
  *
  * SO THERE IS NO PREVIEW AND NO ACTIVITY. Camera2 will render into an
- * ImageReader instead of a Surface on screen, and an ImageReader can be
- * asked for JPEG directly - so the frames arrive already compressed, with no
- * encoder, no muxer and no colour conversion of our own. The station keeps
+ * ImageReader instead of a Surface on screen. A YUV preview avoids the slow
+ * still-photo JPEG pipeline; only the newest preview is compressed for the
+ * existing length-prefixed wire. The station keeps
  * running, the kiosk keeps drawing, and the only thing that changes is that
  * a camera is open.
  *
@@ -268,14 +272,11 @@ class PineCameraService : Service() {
             }
             val size = bestSize(manager, id)
             val take = ImageReader.newInstance(size.first, size.second,
-                ImageFormat.JPEG, 2)
+                ImageFormat.YUV_420_888, 3)
             take.setOnImageAvailableListener({ r ->
                 try {
                     val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    val buffer = image.planes[0].buffer
-                    val bytes = ByteArray(buffer.remaining())
-                    buffer.get(bytes)
-                    image.close()
+                    val bytes = try { previewJpeg(image) } finally { image.close() }
                     held = bytes
                     frames += 1
                 } catch (err: Exception) {
@@ -356,6 +357,11 @@ class PineCameraService : Service() {
                     if (slowest != null) {
                         ask.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, slowest)
                     }
+                } else {
+                    val ranges = about.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    val smooth = ranges?.filter { it.upper >= 30 }?.maxByOrNull { it.lower }
+                        ?: ranges?.maxByOrNull { it.upper }
+                    if (smooth != null) ask.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, smooth)
                 }
             } else {
                 ask.set(CaptureRequest.CONTROL_AE_MODE,
@@ -433,7 +439,7 @@ class PineCameraService : Service() {
     }
 
     /**
-     * A JPEG size near 720p.
+     * A YUV preview size near 640x480.
      *
      * Not the largest the sensor offers: this is a picture crossing adb to
      * be looked at in a window, and a 12-megapixel frame would cost the
@@ -443,8 +449,8 @@ class PineCameraService : Service() {
         return try {
             val map = manager.getCameraCharacteristics(id).get(
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val sizes = map?.getOutputSizes(ImageFormat.JPEG) ?: return 1280 to 720
-            val want = 1280 * 720
+            val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: return 640 to 480
+            val want = 640 * 480
             var best = sizes.first()
             for (size in sizes) {
                 val mine = Math.abs(size.width * size.height - want)
@@ -453,8 +459,37 @@ class PineCameraService : Service() {
             }
             best.width to best.height
         } catch (err: Exception) {
-            1280 to 720
+            640 to 480
         }
+    }
+
+    /** Preview output avoids the sensor's slow still-photo JPEG pipeline.
+     * Preserve plane strides, then encode only the newest frame for the wire. */
+    private var previewPixels = ByteArray(0)
+    private val previewOutput = ByteArrayOutputStream(80 * 1024)
+    @Synchronized private fun previewJpeg(image: Image): ByteArray {
+        val width = image.width; val height = image.height
+        val size = width * height * 3 / 2
+        if (previewPixels.size != size) previewPixels = ByteArray(size)
+        val nv21 = previewPixels
+        val y = image.planes[0]; val u = image.planes[1]; val v = image.planes[2]
+        val yb = y.buffer.duplicate(); val ub = u.buffer.duplicate(); val vb = v.buffer.duplicate()
+        var to = 0
+        for (row in 0 until height) {
+            val start = row * y.rowStride
+            if (y.pixelStride == 1) {
+                yb.position(start)
+                yb.get(nv21, to, width); to += width
+            } else for (col in 0 until width) nv21[to++] = yb.get(start + col * y.pixelStride)
+        }
+        for (row in 0 until height / 2) for (col in 0 until width / 2) {
+            nv21[to++] = vb.get(row * v.rowStride + col * v.pixelStride)
+            nv21[to++] = ub.get(row * u.rowStride + col * u.pixelStride)
+        }
+        val out = previewOutput; out.reset()
+        check(YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            .compressToJpeg(Rect(0, 0, width, height), 70, out))
+        return out.toByteArray()
     }
 
     private fun shutCamera() {

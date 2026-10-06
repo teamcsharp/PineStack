@@ -43,20 +43,21 @@ const EOI = Buffer.from([0xff, 0xd9]);
 
 const BOUNDARY = 'pineframe';
 
-/* THE THREE SIZES, as fractions of the tablet's real screen rather than as
+/* CAPTURE DETAIL, as fractions of the tablet's real screen rather than as
  * pixel counts - the tablet is asked how big it is, so these stay true if
  * the display or the GSI ever reports something different.
  *
  * A quarter is what a small window on the corner of a desk actually needs.
  * A third is the cheap read. A half is the everyday one. Full is every pixel
- * the panel has and four times the encoder work of a half, on a tablet that
- * is also running the station and the rolling recorder - so it is reached by
- * asking for it, or by zooming in far enough to need it.
+ * the panel has. Full uses native JPEG images to avoid the vendor AVC
+ * encoder's large graphics footprint while the station is running. Balanced caps the
+ * longer capture edge at 960 pixels while retaining the complete screen.
  *
  * FULL IS THE CEILING, and it is the tablet's rather than ours: asking
- * screenrecord for more than the panel has makes the TABLET upscale and send
+ * capture for more than the panel has makes the TABLET upscale and send
  * larger frames carrying no more detail. */
-const SIZES = { quarter: 1 / 4, third: 1 / 3, half: 1 / 2, full: 1 };
+const SIZES = { quarter: 1 / 4, third: 1 / 3, half: 1 / 2, balanced: 1, full: 1 };
+const BALANCED_LONG_EDGE = 960;
 
 /* The bitrate follows the pixels: the same quality per pixel at every size,
  * rather than a fixed budget that looks fine small and smears at full. */
@@ -83,7 +84,7 @@ function clampQuality(value) {
  * measure(). */
 const ASSUMED = { width: 1340, height: 800 };
 
-const DEFAULTS = { size: 'half', fps: 15, quality: 0.5 };
+const DEFAULTS = { size: 'balanced', fps: 15, quality: 0.5 };
 const FIRST_FRAME_TIMEOUT_MS = 12000;
 const STALLED_FRAME_TIMEOUT_MS = 5000;
 const WATCH_EVERY_MS = 1000;
@@ -101,11 +102,23 @@ const STILL_RECHECK_MS = 5000;
 const KNOWN_CAMERA_PORT = 8791;
 
 class Mirror {
-  constructor({ adb, serial, ffmpeg, execFile: runFile } = {}) {
+  constructor({ adb, serial, ffmpeg, execFile: runFile, spawn: spawnProcess, encoderLease, encoderOwner, jpegSourceFactory } = {}) {
     this.adb = adb || 'adb';
     this.serial = serial || '';
     this.ffmpeg = ffmpeg || 'ffmpeg';
     this.execFile = runFile || execFile;
+    this.spawn = spawnProcess || spawn;
+    this.encoderLease = encoderLease || null;
+    this.encoderOwner = encoderOwner;
+    this.jpegSource = null;
+    this.jpegSourceFactory = jpegSourceFactory || (options => new (require('./tablet-jpeg-source.cjs').TabletJpegSource)(options));
+    this.orphanChecked = false;
+    this.leaseHeld = false;
+    this.leaseRequested = false;
+    this.acquiringLease = null;
+    this.leaseTimer = null;
+    this.leaseGeneration = 0;
+    this.renewingLease = false;
     this.shape = Object.assign({}, DEFAULTS);
     /* The tablet's real screen, filled in by measure() on the first open. */
     this.real = Object.assign({}, ASSUMED);
@@ -139,6 +152,13 @@ class Mirror {
     this.still = false;
     this.stillAt = 0;
     this.probing = false;
+    this.paused = false;
+    this.closing = false;
+    this.opening = null;
+    this.pausing = null;
+    this.stopping = null;
+    this.resumeRequested = false;
+    this.rebuildGeneration = 0;
   }
 
   target(args) {
@@ -225,7 +245,11 @@ class Mirror {
    * tablet's encoder refuses an odd width and blames nothing in particular
    * when it does. */
   shapeFor(name) {
-    const part = SIZES[name] || SIZES.half;
+    // Balanced limits encoder surfaces and wireless traffic on the tablet.
+    // It never enlarges a smaller display; touch coordinates still use real.
+    const part = name === 'balanced'
+      ? Math.min(1, BALANCED_LONG_EDGE / Math.max(this.real.width, this.real.height))
+      : SIZES[name] || SIZES.half;
     const width = Math.max(2, (Math.round(this.real.width * part) >> 1) << 1);
     const height = Math.max(2, (Math.round(this.real.height * part) >> 1) << 1);
     const quality = clampQuality(this.shape.quality) || DEFAULTS.quality;
@@ -234,16 +258,31 @@ class Mirror {
   }
 
   async open(shape) {
+    if (this.closing) return { ...this.where(), ok: false, say: 'mirror is closing' };
+    if (this.pausing) await this.pausing;
+    if (this.closing) return { ...this.where(), ok: false, say: 'mirror is closing' };
     if (this.running) return this.where();
-    Object.assign(this.shape, shape || {});
-    this.shape.quality = clampQuality(this.shape.quality) || DEFAULTS.quality;
-    await this.listen();
-    this.running = true;
-    this.startedAt = Date.now();
-    this.pipe();
-    this.watchdog = setInterval(() => this.health(), WATCH_EVERY_MS);
-    if (this.watchdog.unref) this.watchdog.unref();
-    return this.where();
+    if (this.paused && this.server) {
+      this.resume();
+      return this.where();
+    }
+    if (this.opening) return this.opening;
+    const opening = (async () => {
+      Object.assign(this.shape, shape || {});
+      this.shape.quality = clampQuality(this.shape.quality) || DEFAULTS.quality;
+      await this.listen();
+      if (this.closing) return { ...this.where(), ok: false, say: 'mirror is closing' };
+      this.paused = false;
+      this.running = true;
+      this.startedAt = Date.now();
+      this.pipe();
+      this.watchdog = setInterval(() => this.health(), WATCH_EVERY_MS);
+      if (this.watchdog.unref) this.watchdog.unref();
+      return this.where();
+    })();
+    this.opening = opening;
+    try { return await opening; }
+    finally { if (this.opening === opening) this.opening = null; }
   }
 
   /**
@@ -262,7 +301,7 @@ class Mirror {
   }
 
   /* [mirror-quality] The slider. Same road as retune(): the URL stays, the
-   * tablet's encoder is rebuilt at the new bitrate. */
+   * capture is rebuilt at the new bitrate or JPEG quality. */
   requality(value) {
     const quality = clampQuality(value);
     if (quality === null || quality === this.shape.quality) return this.where();
@@ -275,7 +314,9 @@ class Mirror {
     const shape = this.shapeFor(this.shape.size);
     return {
       quality: this.shape.quality,
-      bitrate: shape.bitrate,
+      bitrate: this.shape.size === 'full' ? 0 : shape.bitrate,
+      capture: this.shape.size === 'full' ? 'jpeg' : 'h264',
+      captureFps: this.shape.size === 'full' ? 12 : this.shape.fps,
       ok: true,
       url: 'http://127.0.0.1:' + this.port + '/live.mjpg',
       stillUrl: 'http://127.0.0.1:' + this.port + '/frame.jpg',
@@ -292,12 +333,19 @@ class Mirror {
 
   listen() {
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((request, response) => this.serve(request, response));
-      this.server.on('error', reject);
-      /* Port 0: the OS picks a free one, and 127.0.0.1 so nothing off this
-       * machine can watch the tablet's screen. */
-      this.server.listen(0, '127.0.0.1', () => {
-        this.port = this.server.address().port;
+      const server = http.createServer((request, response) => this.serve(request, response));
+      this.server = server;
+      server.on('error', reject);
+      server.once('close', () => reject(new Error('mirror closed while opening')));
+      /* Keep an opening socket from outliving a window closed while listen()
+       * was pending. Each server owns its own callback. */
+      server.listen(0, '127.0.0.1', () => {
+        if (this.closing || this.server !== server) {
+          try { server.close(); } catch (error) { /* already gone */ }
+          reject(new Error('mirror closed while opening'));
+          return;
+        }
+        this.port = server.address().port;
         resolve();
       });
     });
@@ -402,16 +450,75 @@ class Mirror {
       return;
     }
     if (!this.running || epoch !== this.epoch) return;
+    try {
+      if (!this.encoderLease) {
+        const { EncoderLease } = require('./tablet-encoder-lease.cjs');
+        this.encoderLease = new EncoderLease({ adb: this.adb, serial: this.serial,
+          execFile: this.execFile, owner: this.encoderOwner });
+      }
+      this.leaseRequested = true;
+      const acquiring = (async () => {
+        let answer = await this.encoderLease.acquire();
+        if (!this.orphanChecked) {
+          // After a desktop crash, recover only this desktop's persisted owner.
+          // A different owner's recorder is never signalled.
+          if (answer && answer.ok !== true && answer.held === true
+              && answer.owner === this.encoderLease.owner) {
+            this.leaseHeld = true;
+            await this.stopRemote();
+            this.leaseHeld = false;
+            answer = await this.encoderLease.acquire();
+          }
+        }
+        if (answer && answer.ok === true) this.orphanChecked = true;
+        return answer;
+      })();
+      this.acquiringLease = acquiring;
+      try {
+        const confirmed = await acquiring;
+        if (!confirmed || confirmed.ok !== true || confirmed.held !== true
+            || confirmed.video_running !== false || confirmed.video_released !== true
+            || confirmed.owner !== this.encoderLease.owner) {
+          throw new Error(confirmed && confirmed.detail || 'the tablet did not confirm exclusive encoder ownership');
+        }
+        this.leaseHeld = true;
+      }
+      finally { if (this.acquiringLease === acquiring) this.acquiringLease = null; }
+    } catch (error) {
+      if (this.running && epoch === this.epoch) {
+        this.connecting = false;
+        this.lastError = 'tablet encoder protection: ' + error.message;
+        this.rebuild(this.lastError);
+      }
+      return;
+    }
+    if (!this.running || epoch !== this.epoch || this.closing) return;
+    this.watchEncoderLease();
     this.connecting = false;
     this.pipeAt = Date.now();
     this.lastError = '';
     const { width, height, bitrate } = this.shapeFor(this.shape.size);
     const fps = this.shape.fps;
 
+    if (this.shape.size === 'full') {
+      // Keep true panel resolution without the vendor AVC encoder's large
+      // graphics allocation. Each producer owns a fresh native stream token.
+      const source = this.jpegSourceFactory({adb: this.adb, serial: this.serial,
+        lease: this.encoderLease, runFile: this.execFile,
+        onFrame: jpeg => { if (this.running && epoch === this.epoch) this.acceptFrame(jpeg); },
+        onFailure: error => { if (this.running && epoch === this.epoch) this.rebuild('full-detail capture: ' + error.message); }});
+      this.jpegSource = source;
+      try { await source.start({width, height, quality: this.shape.quality}); }
+      catch (error) {
+        if (this.running && epoch === this.epoch) this.rebuild('full-detail capture: ' + error.message);
+      }
+      return;
+    }
+
     /* --time-limit is not passed at all: some builds cap it at 180 and
      * refuse a larger number, and the restart below covers the cap either
      * way. Asking for something a build might reject buys nothing. */
-    this.record = spawn(this.adb, this.target([
+    this.record = this.spawn(this.adb, this.target([
       'exec-out',
       'screenrecord --output-format=h264'
         + ' --size ' + width + 'x' + height
@@ -420,27 +527,20 @@ class Mirror {
         + ' -'
     ]), { windowsHide: true });
 
-    /* THESE ARGUMENTS ARE THE MEASURED ONES. DO NOT TIDY THEM.
-     *
-     * The usual live-stream incantation - `-probesize 32 -analyzeduration 0
-     * -fflags nobuffer -flags low_delay` - produces ZERO frames against raw
-     * H.264 from screenrecord, and fails silently: bytes pour in, one
-     * warning is printed, and no picture ever comes out. Each half is fatal
-     * on its own; removing only the probesize still gave nothing.
-     *
-     * Measured, nine seconds each:
-     *   plain      183 frames, first at 2.86 s
-     *   -r 30/-r15  86 frames, first at 2.40 s   <- this
-     *   "low delay"  0 frames, never
-     *   -vf fps=15 111 frames, first at 2.39 s
-     *
-     * Telling it the input rate is what fixes it: ffmpeg stops trying to
-     * estimate a rate the raw stream does not carry. Anything added here
-     * needs measuring again, because the failure is invisible. */
-    this.convert = spawn(this.ffmpeg, [
+    /* screenrecord sends changes, so a quiet screen can provide only a few
+     * H.264 pictures. Default analysis and codec frame queues wait for more
+     * input and made a healthy still screen hit the first-frame timeout.
+     * Bound input analysis bytes/time and both codec thread queues. Four static frames
+     * now produce the first JPEG within 200 ms without waiting for motion; sparse
+     * and moving fixtures preserve all 47 ordered, byte-identical pictures.
+     * Keep ordinary buffering: nobuffer/low_delay previously produced no
+     * pictures. The input rate remains explicit because raw H.264 has no
+     * usable capture clock. */
+    this.convert = this.spawn(this.ffmpeg, [
       '-hide_banner', '-loglevel', 'error',
-      '-f', 'h264', '-r', '30', '-i', 'pipe:0',
-      '-r', String(fps),
+      '-f', 'h264', '-r', '30', '-probesize', '32768',
+      '-analyzeduration', '1', '-threads', '1', '-i', 'pipe:0',
+      '-threads', '1', '-r', String(fps),
       '-q:v', '6',
       '-f', 'mjpeg', 'pipe:1'
     ], { windowsHide: true });
@@ -449,10 +549,10 @@ class Mirror {
     this.record.stdout.on('error', () => { /* the pipe closing is normal */ });
     this.convert.stdin.on('error', () => { /* likewise */ });
 
-    this.record.stderr.on('data', (bytes) => this.grumble(bytes));
-    this.convert.stderr.on('data', (bytes) => this.grumble(bytes));
+    this.record.stderr.on('data', (bytes) => { if (epoch === this.epoch) this.grumble(bytes); });
+    this.convert.stderr.on('data', (bytes) => { if (epoch === this.epoch) this.grumble(bytes); });
 
-    this.convert.stdout.on('data', (bytes) => this.chew(bytes));
+    this.convert.stdout.on('data', (bytes) => { if (epoch === this.epoch) this.chew(bytes); });
 
     /* Whichever end dies, both are replaced - a half-built pipe produces no
      * pictures and holds a process open. */
@@ -476,6 +576,51 @@ class Mirror {
       this.lastError = error.message;
       this.rebuild('desktop decoder error');
     });
+  }
+
+  watchEncoderLease() {
+    if (this.leaseTimer || !this.leaseHeld || this.closing) return;
+    this.leaseTimer = setInterval(() => this.renewEncoderLease(), 10000);
+    if (this.leaseTimer.unref) this.leaseTimer.unref();
+  }
+
+  stopLeaseWatch() {
+    this.leaseGeneration += 1;
+    clearInterval(this.leaseTimer);
+    this.leaseTimer = null;
+  }
+
+  async renewEncoderLease() {
+    if (!this.leaseHeld || this.renewingLease || !this.running || this.closing) return;
+    this.renewingLease = true;
+    const generation = this.leaseGeneration;
+    try {
+      const confirmed = await this.encoderLease.renew();
+      if (!confirmed || confirmed.ok !== true) {
+        throw new Error(confirmed && confirmed.detail || 'the tablet did not renew exclusive encoder ownership');
+      }
+    }
+    catch (error) {
+      if (generation === this.leaseGeneration && this.running && !this.closing) {
+        this.rebuild('tablet encoder protection was lost: ' + error.message);
+      }
+    } finally { this.renewingLease = false; }
+  }
+
+  async releaseEncoderLease() {
+    this.stopLeaseWatch();
+    if (this.acquiringLease) {
+      try { await this.acquiringLease; } catch (error) { /* no confirmed hold */ }
+    }
+    if (!this.encoderLease || !this.leaseRequested) return;
+    try {
+      const released = await this.encoderLease.release();
+      if (!released || released.ok !== true) {
+        throw new Error(released && released.detail || 'the tablet is still waiting for encoder shutdown');
+      }
+    }
+    catch (error) { this.lastError = 'tablet encoder release: ' + error.message; }
+    finally { this.leaseHeld = false; this.leaseRequested = false; }
   }
 
   grumble(bytes) {
@@ -506,15 +651,19 @@ class Mirror {
       }
       const jpeg = this.spare.subarray(from, to + 2);
       this.spare = this.spare.subarray(to + 2);
-      this.latest = Buffer.from(jpeg);
-      this.frames += 1;
-      this.lastFrameAt = Date.now();
-      this.failedStarts = 0;
-      this.lastError = '';
-      this.still = false;  /* [mirror-drop-moved] */
-      this.stillAt = 0;
-      for (const watcher of this.watchers) this.push(watcher, this.latest);
+      this.acceptFrame(jpeg);
     }
+  }
+
+  acceptFrame(jpeg) {
+    this.latest = Buffer.from(jpeg);
+    this.frames += 1;
+    this.lastFrameAt = Date.now();
+    this.failedStarts = 0;
+    this.lastError = '';
+    this.still = false;  /* [mirror-drop-moved] */
+    this.stillAt = 0;
+    for (const watcher of this.watchers) this.push(watcher, this.latest);
   }
 
   /** A live child process is not proof of a live picture. */
@@ -537,6 +686,7 @@ class Mirror {
     this.probing = true;
     const epoch = this.epoch;
     this.recorderAlive().then((alive) => {
+      if (epoch !== this.epoch) return;
       this.probing = false;
       /* A frame that arrived meanwhile, or a rebuild, settles it. */
       if (!this.running || epoch !== this.epoch || this.lastFrameAt > from) return;
@@ -554,6 +704,7 @@ class Mirror {
    * tablet answers, within a few seconds, that screenrecord is running. A
    * transport that cannot answer that is as good as dead. */
   recorderAlive() {
+    if (this.jpegSource) return this.jpegSource.alive().catch(() => false);
     return new Promise((resolve) => {
       if (!this.record || this.record.exitCode !== null) return resolve(false);
       try {
@@ -567,26 +718,55 @@ class Mirror {
   rebuild(why) {
     if (!this.running || this.rebuilding) return;
     this.rebuilding = true;
+    const generation = ++this.rebuildGeneration;
     this.lastRestartReason = String(why || 'stream ended');
     this.lastError = this.lastRestartReason;
     const hadFrames = this.frames > this.pipeFrames;
     this.failedStarts = hadFrames ? 0 : Math.min(4, this.failedStarts + 1);
-    this.kill();
     this.restarts += 1;
-    /* Back off only repeated starts that produced no picture. A healthy
-     * stream that merely hit Android's recording cap reconnects quickly. */
     const delay = hadFrames ? 350 : Math.min(5000, 500 * (2 ** this.failedStarts));
     clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.rebuilding = false;
-      this.spare = Buffer.alloc(0);
-      this.pipe();
-    }, delay);
+    /* Give the tablet's encoder a clean SIGINT shutdown before its replacement
+     * starts. The local server and viewers survive this producer restart. */
+    this.stopPipe().then(() => {
+      if (!this.running || this.closing || !this.rebuilding || generation !== this.rebuildGeneration) return;
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        if (!this.running || this.closing || !this.rebuilding || generation !== this.rebuildGeneration) return;
+        this.rebuilding = false;
+        this.spare = Buffer.alloc(0);
+        this.pipe();
+      }, delay);
+    });
+  }
+
+  async stopPipe() {
+    if (this.stopping) return this.stopping;
+    this.epoch += 1;
+    this.connecting = false;
+    this.pipeAt = 0;
+    const stopping = (async () => {
+      // A late native acquire must finish before cleanup releases its hold.
+      if (this.acquiringLease) {
+        try { await this.acquiringLease; } catch (error) { /* acquire failed */ }
+      }
+      try { await this.stopRemote(); }
+      catch (error) { this.lastError = 'tablet encoder stop: ' + error.message; }
+      finally {
+        await new Promise((r) => setTimeout(r, 400));
+        this.kill();
+      }
+    })();
+    this.stopping = stopping;
+    try { await stopping; }
+    finally { if (this.stopping === stopping) this.stopping = null; }
   }
 
   kill() {
     this.epoch += 1;
+    this.probing = false;
+    this.still = false;
+    this.stillAt = 0;
     this.connecting = false;
     this.pipeAt = 0;
     for (const child of [this.record, this.convert]) {
@@ -597,6 +777,8 @@ class Mirror {
     }
     this.record = null;
     this.convert = null;
+    this.jpegSource?.dispose();
+    this.jpegSource = null;
   }
 
   /* [mirror-pause] THE TABLET'S ENCODER IS NOT SPENT ON A PICTURE NOBODY SEES.
@@ -610,33 +792,70 @@ class Mirror {
    * with SIGINT - its own clean shutdown, the encoder given back rather
    * than torn down by a broken pipe - and keeps the local server, so the
    * window's <img> picks the picture up again on resume(). */
-  stopRemote() {
-    return new Promise((resolve) => {
+  async stopRemote() {
+    // Always remove this producer's forward, even after a lost lease ACK.
+    if (this.jpegSource) { await this.jpegSource.stop(); return; }
+    // An acquire that was refused must never stop another owner's recorder.
+    if (!this.encoderLease || !this.leaseHeld) return;
+    const status = await this.encoderLease.status();
+    if (!status || status.ok !== true || status.held !== true
+        || status.owner !== this.encoderLease.owner) {
+      this.lastError = 'the tablet encoder owner could not be verified before stopping';
+      return;
+    }
+    const stop = 'pkill -INT -f "screenrecord --output-format=h264"; '
+      + 'n=0; while pidof screenrecord >/dev/null; do '
+      + 'n=$((n+1)); [ "$n" -ge 40 ] && exit 1; sleep 0.1; done; exit 0';
+    await new Promise((resolve) => {
       try {
-        require('node:child_process').execFile(this.adb,
-          this.target(['shell', 'pkill -INT -f "screenrecord --output-format=h264"']),
-          { timeout: 6000, windowsHide: true }, () => resolve());
-      } catch (error) { resolve(); }
+        this.execFile(this.adb, this.target(['shell', stop]),
+          { timeout: 6000, windowsHide: true }, (error) => {
+            if (error) this.lastError = 'the tablet recorder is still stopping';
+            resolve();
+          });
+      } catch (error) { this.lastError = error.message; resolve(); }
     });
   }
 
   async pause() {
+    this.resumeRequested = false;        // the latest hide wins over a queued restore
+    this.rebuildGeneration += 1;
+    if (this.pausing) return this.pausing;
     if (!this.running) return this.how();
     this.paused = true;
-    this.running = false;                 // rebuild() stands down
+    this.running = false;
+    this.epoch += 1;                      // late connect/data/exit callbacks stand down
+    this.connecting = false;
     clearInterval(this.watchdog);
     clearTimeout(this.retryTimer);
     this.watchdog = null;
     this.retryTimer = null;
     this.rebuilding = false;
-    await this.stopRemote();
-    await new Promise((r) => setTimeout(r, 400));   // let it finish its own stop
-    this.kill();
-    return this.how();
+    this.stopLeaseWatch();
+    const pausing = (async () => {
+      try {
+        await this.stopPipe();
+        await this.releaseEncoderLease();
+      } finally {
+        this.pausing = null;
+        if (this.resumeRequested && !this.closing && this.server) {
+          this.resumeRequested = false;
+          this.resume();
+        }
+      }
+      return this.how();
+    })();
+    this.pausing = pausing;
+    return pausing;
   }
 
   resume() {
-    if (!this.paused || this.running) return this.how();
+    if (this.closing || !this.paused || this.running) return this.how();
+    if (this.pausing) {
+      this.resumeRequested = true;        // don't let an old stop kill a new encoder
+      return this.how();
+    }
+    this.resumeRequested = false;
     this.paused = false;
     this.running = true;
     this.startedAt = Date.now();
@@ -646,13 +865,21 @@ class Mirror {
     return this.how();
   }
 
-  async closeGently() {                     // [mirror-pause] the window closing
-    if (this.running) await this.pause();
+  async closeGently() {
+    this.closing = true;
+    this.resumeRequested = false;
+    if (this.pausing) await this.pausing;
+    else if (this.running) await this.pause();
     this.close();
   }
 
   close() {
+    this.closing = true;
+    this.rebuildGeneration += 1;
+    this.resumeRequested = false;
+    this.paused = false;
     this.running = false;
+    this.stopLeaseWatch();
     clearInterval(this.watchdog);
     clearTimeout(this.retryTimer);
     this.watchdog = null;
@@ -675,7 +902,11 @@ class Mirror {
   how() {
     const still = this.lastFrameAt ? Date.now() - this.lastFrameAt : 0;
     return {
+      ...this.where(),
       running: this.running,
+      paused: this.paused,
+      closing: this.closing,
+      encoderProtected: this.leaseHeld,
       frames: this.frames,
       watchers: this.watchers.size,
       restarts: this.restarts,
@@ -691,7 +922,7 @@ class Mirror {
       sinceFrameMs: still,
       size: this.shape.size,
       quality: this.shape.quality,
-      bitrate: this.shapeFor(this.shape.size).bitrate,
+      bitrate: this.shape.size === 'full' ? 0 : this.shapeFor(this.shape.size).bitrate,
       measured: this.measured,
       real: Object.assign({}, this.real),
       /* The honest reading: a stream that has not produced a frame in two
@@ -846,6 +1077,7 @@ class CameraGlass {
 
   push(response, jpeg) {
     try {
+      if (response.writableNeedDrain || response.writableLength > 128 * 1024) return;
       response.write('--' + BOUNDARY + '\r\n');
       response.write('Content-Type: image/jpeg\r\n');
       response.write('Content-Length: ' + jpeg.length + '\r\n\r\n');

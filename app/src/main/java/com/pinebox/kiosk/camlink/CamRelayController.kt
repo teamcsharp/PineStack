@@ -10,7 +10,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.URI
@@ -63,8 +62,9 @@ class CamRelayController(
     }
 
     private suspend fun turn(): Long {
+        val sent = report()
         val reply = try {
-            JSONObject(client.post(ROUTE, report().toString()))
+            JSONObject(client.post(ROUTE, sent.toString()))
         } catch (err: Exception) {
             null
         }
@@ -86,13 +86,13 @@ class CamRelayController(
             reply.optString("bssid").ifBlank { null }))
         if (link.joined) {
             if (!wasJoined) {
+                // The actual relay control channel must answer a report sent
+                // AFTER the join. A separate quick health probe can time out
+                // and change Reach even while these authenticated reports
+                // succeed, repeatedly dropping an otherwise usable side-link.
+                // If the join raced this report, wait for the next one.
+                if (sent.optJSONObject("link")?.optBoolean("joined", false) != true) return BUSY_MS
                 wasJoined = true
-                // The station must still answer with the camera joined.
-                if (!withContext(Dispatchers.IO) { client.reachable(quick = true) }) {
-                    Log.w(TAG, "the station stopped answering once the camera joined - letting it go")
-                    stopAll("the station stopped answering once the camera joined")
-                    return IDLE_MS
-                }
             }
             ensureRelay(reply)
         } else {

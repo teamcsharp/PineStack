@@ -339,7 +339,7 @@ you add runs beside that.
 | MagicDNS | `http://lilspark.tail1fec29.ts.net:8096` | same, needs the tablet to accept Tailscale DNS |
 | the public door | `http://<any of the above>:8097` | a second uvicorn in the same station process, allowlisted routes only, `Authorization` stripped, `?t=<share token>` is the only credential (§0.9.2) |
 | SSH to the box | `100.74.95.59:22` (`SSH-2.0-Tailscale`) | the DGX Terminal app. The LAN's `10.89.1.246:22` is real OpenSSH and would want a password, so it is deliberately **not** offered |
-| the Pine Cam | `192.168.1.254` (its own access point `H88_…`) | held by the DGX's spare USB radio, never by the tablet. The tablet only ever sees `/api/pinelink/frame.jpg` |
+| the Pine Cam | `192.168.1.254` (its own access point `H88_…`) | direct through the DGX's spare USB radio, or relayed through the tablet's second, local-only Wi-Fi connection (see §24). The house network remains the tablet's primary connection |
 
 The kiosk's `network_security_config.xml` permits cleartext for exactly
 `10.89.1.246`, `100.74.95.59`, `lilspark.tail1fec29.ts.net` (with
@@ -1163,7 +1163,7 @@ tablet modules, all driven from `window.pineDesktop` in the renderer:
 |---|---|---|
 | `terminal-host.cjs` / `terminal.cjs` / `terminal-net.cjs` | finds adb (`C:\_tools\platform-tools`, `C:\platform-tools`, `%LOCALAPPDATA%\Android\Sdk\platform-tools`), discovers the tablet by mDNS then a bounded private-subnet sweep, `adb tcpip`/`connect`, the provisioner (survey, snapshot, bootloader, unlock behind the string `ERASE THIS TABLET`) | — |
 | `tablet-vitals.cjs` | **one** adb shell: `dumpsys battery; current_now; /proc/loadavg; /proc/meminfo; dumpsys gfxinfo com.pinebox.kiosk`, split on `---pine---` → `{battery{percent,status,volts,tempC,chargeMah,drawMa,watts,hoursLeft}, load, memory, graphics{frames,janky,p50,p90,p95,p99,missedVsync}, rttMs}`. Polled at 4 s when present, 20 s when absent, coalesced (2.5 s hold) so the sidebar and the mirror window share one sweep | copy the shell line |
-| `tablet-mirror.cjs` `Mirror` | the screen: `screenrecord … -` piped through ffmpeg to MJPEG, sizes `quarter/third/half/full` of the measured `deviceWidth×deviceHeight`, bitrate `w×h×11` (floor 800 kbps), 15 fps, rebuilt whenever screenrecord ends. Served on **an OS-assigned loopback port**: `/live.mjpg`, `/frame.jpg` | read the port from `mirrorHow()`; or run the pipe yourself (§0.2.3) |
+| `tablet-mirror.cjs` `Mirror` | The screen: smaller details use `screenrecord` through ffmpeg; **Full** uses the bounded native JPEG capture in `tablet-jpeg-source.cjs` (two RGBA images, one latest compressed picture, at most12fps) without the vendor AVC encoder. Default **Balanced** caps the longer edge at 960 pixels; `quarter/third/half/full` remain available. Dimensions are even and never exceed the measured display. Bitrate is `width*height*11*quality` (floor 400 kbps, default quality 50%), output 15fps for H.264; Full uses JPEG quality40?85 and reports no fixed bitrate. Encoder/ADB failures rebuild the producer while preserving the loopback stream and viewers. | Read the OS-assigned port from `mirrorHow()` for `/live.mjpg` and `/frame.jpg`. |
 | `tablet-mirror.cjs` `CameraGlass` | the tablet's camera via `adb forward tcp:<9230–9629> localabstract:pine_camera`, re-served on **`127.0.0.1:8791`** as `/camera.mjpg` and `/camera.jpg` (falls back to a random port if 8791 is taken; `where().known` says which) | `http://127.0.0.1:8791/camera.jpg` while the camera window is open |
 | `tablet-input.cjs` | one held `adb shell`; `input tap/swipe/keyevent/text` lines, integers, display coordinates | copy the recipe |
 | `pinetab-route.cjs` | the six destinations (`pinetab app web box nabu off` — `both` deliberately absent); resolves the tablet in the roster by `addr` against `settings.terminals.pinetab.addr`, freshness `seen ≤ 30`; sends solo → output → settings; refuses a page that is not looking at the station. Same file ships in the APK as `pine-sampler/pinetab-route.js` | `pineDesktop.pinetabWhere()/pinetabSend(key)` |
@@ -1172,6 +1172,8 @@ tablet modules, all driven from `window.pineDesktop` in the renderer:
 | `renderer/tablet-doctor.js` | the ladder: station `look` → `sweep`/`adopt`/`wake` → `adb connect` → `look` again; "attached" is measured. Desktop-only by design | the wrench beside *The tablet* in the sidebar |
 | `android-build.cjs` | `gradle assembleDebug` + `adb install -r` from the toolchain manifest — **debug-signed, not for the kiosk** (§0.8.2) | fine for your own APK |
 | `gsi.cjs` / `firmware.cjs` | the GSI matcher (`ro.*` props vs the image's bytes) and the stock-firmware verifier; the flash plan as data with `where: bootloader|fastbootd` per step and the wipe **last and in the bootloader** (fastbootd's `-w` wiped nothing in 4 ms and said it had) | |
+
+The mirror acquires a persistent native encoder lease before either capture path. Each Full producer also has a fresh stream token, so delayed cleanup cannot stop its replacement. While screen sharing is open, replay video capture pauses to avoid simultaneous hardware encoders; audio capture and saved video history remain available. Closing or hiding the mirror stops its owned encoder or JPEG display before restoring replay video. Opening is coalesced, and late callbacks cannot stop a newer mirror. Explicit detail choices are remembered for the next opening; Auto changes do not overwrite them. The decoder uses bounded H.264 probing and one decoding thread so a quiet tablet can provide the first picture promptly.
 
 The desk also watches `/api/dj` for `kiosk_kick` (new stamp → `am
 force-stop` + `am start` on the kiosk) and `reload_at`. It, not the station,
@@ -3308,6 +3310,184 @@ not helped, the other is not a repeat.
 
 ## 24. The Pine Cam
 
+**Dual Wi-Fi update, 2026-10-02.** The Tab M9's Android 14 GSI reports
+`STA + STA Concurrency Supported: true`, but disables the local-only use case.
+`tools/pinetab-dual-wifi/install.sh` compiles a small Java helper and runs it
+through root `app_process` to register `android:PineCamDualWifi`, enabling
+`config_wifiMultiStaLocalOnlyConcurrencyEnabled`. It requires this tablet's
+existing userdebug/root setup. The system-owned fabricated overlay satisfies
+the resource's system policy. A platform-signed APK installed in `/data/app`
+produces `STATE_NO_IDMAP`; a root-created overlay under `com.android.shell`
+works until reboot, when this ROM discards it. System remounts on this GSI
+also failed to retain the added APK across boot. The final helper writes no
+system partition and uses `cmd wifi reload-resources` to refresh Wi-Fi's cache.
+Reboot after first activation to refresh existing app feature caches; the
+`android:PineCamDualWifi` overlay was verified enabled after reboot.
+
+With the feature enabled, the existing `CamLink`/`CamRelayController` joins the
+camera on a second Wi-Fi interface and binds camera sockets to that network.
+The tablet keeps TacoNet as its primary network and serves the camera to the
+Spark at `rtsp://10.89.1.154:8554/live`. The supervisor's default relay preference
+is `auto`: it prefers a joined tablet, releases the dongle, and falls back to
+the dongle if the tablet cannot hold the link. `always` keeps the dongle off;
+`never` disables the tablet relay. Carry the camera close to the tablet;
+the tablet must still reach the house Wi-Fi for the Spark to receive video.
+
+The kiosk must request the normal `CHANGE_NETWORK_STATE` permission as well
+as its Wi-Fi/settings permissions: without it, `ConnectivityManager.requestNetwork`
+fails before joining. Idle tablet reports are sent every 30 seconds with a
+30-second HTTP budget, so the supervisor accepts idle reports for 75 seconds.
+An active relay reports every five seconds and retains a 20-second freshness
+limit. Using 20 seconds for idle reports caused handoff eligibility to expire
+between ordinary polls.
+The relay starts only after the station answers an authenticated report sent
+with the camera joined. It waits one poll if the join races a report, and
+keeps the primary-network watcher and station-silence cutoff. A separate
+short health probe could reject a joined camera despite successful relay
+reports and also reset the station's selected address.
+
+After a previously joined tablet loses the side-link, auto handoff now allows
+60 seconds to rejoin. Its old 12-second grace could cancel Android's 30-second
+join request and hand the camera back to the dongle before the next joined
+report arrived, including during a kiosk update.
+
+Verification: `adb -s 10.89.1.154:5555 shell dumpsys wifi` should report
+`Local only use-case enabled: true`; `data/pinelink_relay.json` should report
+`capable`, `link.joined`, and `relay.listening` as true; and
+`data/pinelink/state.json` should show `source.use` = `tablet` with fresh frames.
+To undo the setting, use `adb root`, then
+`adb -s 10.89.1.154:5555 shell cmd overlay disable --user 0 android:PineCamDualWifi`
+and `adb -s 10.89.1.154:5555 shell cmd wifi reload-resources`.
+
+PiP now hides stale footage on a disconnect while preserving `pineCamView`.
+The next fresh live reading restores the picture and its header preference.
+The picture's bottom-right route icon shows a tablet for the PineTab relay
+or a box for the Spark's direct dongle connection. It follows the recorder's
+active source, remains visible with the header folded, and is drawn above
+the native video on Android as well as over the desktop preview.
+An explicit close cancels restoration. `node tests/test_pinecam_reconnect.cjs`
+checks those transitions; it does not disturb a live camera.
+`tests/probe_pinecam_reconnect.cjs` verifies the same behavior through the
+installed tablet WebView, briefly simulating non-live state in the view while
+the real recording continues; it restores the previous viewing preference.
+
+The camera interface also needs power saving disabled. Measured with `iw`:
+`wlan0` was awake, but `wlan1` remained in power save despite the kiosk's
+low-latency WifiLock. Android applies that lock to the primary STA. The setting
+can be reset by the framework, so `pinecam-tablet-wifi.service` runs the scoped
+`tools/pinetab-dual-wifi/keep-awake.py` helper on Spark: every second while joined it
+checks that `wlan1` is connected to this H88 SSID, then disables power save if
+needed. It leaves `wlan0` alone and reconnects/root-enables ADB after a tablet
+reboot. This requires the existing userdebug tablet and authorized station ADB.
+It waits five seconds between retries when the camera is absent. The faster
+active check limits how long framework/DHCP power-save resets can interrupt
+packet delivery before the helper disables secondary power saving again.
+`install-station-adb.sh` extracts Ubuntu's arm64 ADB packages into the station
+user's local directory, without changing the system package database; the
+helper uses its own ADB server port 5039. Stop it with
+`sudo systemctl disable --now pinecam-tablet-wifi`.
+
+The October 2 walk exposed a second, distinct ten-minute reset. Android's
+Wi-Fi dump recorded `CMD_IP_REACHABILITY_FAILURE` on `wlan1`: the camera
+gateway MAC was reported as changing from `null` to its unchanged BSSID,
+forcing IP provisioning and the relay to restart even with strong house
+Wi-Fi. The helper now maintains a permanent neighbor entry for
+`192.168.1.254` / `5c:8e:8b:dd:fa:b1`, only while the exact H88 SSID and
+BSSID are joined on `wlan1`. It removes that entry if the interface joins
+another AP. This avoids gateway relearning on this camera link; it does not
+disable reachability checks globally. To undo the pin without dropping Wi-Fi,
+stop the helper and run
+`adb -s 10.89.1.154:5555 shell ip neigh del 192.168.1.254 dev wlan1`.
+
+Walk validation on October 2: the operator reported substantially better
+range and mostly smooth PiP, with some small stutters. The first walk exposed
+the gateway relearn above; PiP returned automatically after recovery. After
+pinning the gateway, the same recorder and camera join remained up past
+14 minutes, including a second walk, with no additional player reconnects
+and roughly 0.5–0.8 s playback lag. This verifies recovery and crossing the
+previous reset boundary, not uninterrupted video beyond house Wi-Fi coverage.
+The operator still reported noticeable stutter on the second walk. Timing
+analysis found Wi-Fi bursts had been converted into presentation gaps of
+up to 0.6 s followed by frames 1 ms apart. Relay input now preserves the
+camera's RTP clock (`-fflags +genpts`) instead of overwriting it with arrival
+time; the direct dongle retains its prior recording timestamp policy. Fresh
+relay segments then showed a median 33 ms spacing, with no gaps over 150 ms
+in the sampled segments. Native playback now starts with 1 s in reserve,
+rebuffers with 1.25 s, and keeps about 1.1 s when catching up, rather than
+immediately consuming recovered bursts down to 0.6 s. Field confirmation of
+the combined timing/buffer change is separate from the reset validation.
+The final walk with APK `24434e652e3b` was confirmed by the operator as
+working. Native PiP rendered about 30 fps, with one dropped frame across
+5,645 rendered frames at the last walk sample, about 1.28 s buffered ahead,
+and no additional player reconnects during the walk. The corrected load
+control uses a 1.5 s minimum, at least the 1.25 s rebuffer reserve required
+by Media3's validation. The route badge was visually verified as a box on
+the direct Spark connection and a tablet after relay handoff; both stay
+visible over native video with the header hidden.
+
+The kiosk also handles a renderer that stays alive but stops accepting input:
+Android's unresponsive-renderer callback allows ten seconds to recover, then
+terminates the stalled renderer and uses the existing activity rebuild path.
+A responsive callback cancels recovery. `tests/probe_pinetab_renderer.cjs`
+deliberately stalls the renderer to exercise this path; an ADB tap is required
+while it runs. Camera viewing preferences survive the rebuild.
+
+The UDP-to-TCP relay also needs an explicit RTP reorder queue in FFmpeg.
+Its TCP default disables reordering, even though packets reached the tablet
+over UDP and were forwarded in arrival order. Both ordinary and cropped
+inputs now use a 64-packet queue and a 200 ms maximum delay for this hybrid
+mode; direct camera input and end-to-end TCP retain their existing defaults.
+`tests/test_tabrelay_source.py` checks both output paths and transport modes.
+For live checks, `tests/probe_pinecam_relay.py` reads the station HTTP API:
+reading JSON through the Windows SMB share can return cached state.
+
+The recorder now drains FFmpeg stderr continuously into a bounded tail.
+Previously it left the pipe unread until exit; wireless decode warnings could
+fill it and block FFmpeg while the supervisor misdiagnosed stale frames as
+camera silence. `tests/test_pinelink_stderr.py` verifies that over 2 MB of
+diagnostics cannot block frame delivery and that the final error is retained.
+Compound RTCP reports with an SDES CNAME and independent session OPTIONS
+requests are available behind `CamRelay.sessionKeepalive`, disabled by default.
+The H88 developed repeated packet pauses with that extension enabled; its
+normal path retains standard receiver reports and the station's own OPTIONS.
+For cameras that opt in, relay-owned responses are consumed locally and never
+delivered as replies to the station's requests. JVM tests cover both paths.
+
+During tablet handoff the supervisor publishes its source decision before
+radio diagnostics, and waits for the tablet without starting a dongle scan or
+join. A blocking dongle join had stopped source updates long enough for the
+tablet to cancel its own join as a station-silence recovery.
+
+**Voice and picture timing, October 2.** Both speech players preload their
+next clip into the free audio slot and reuse that source at handoff. With a
+zero-second reply gap, a queued reply follows the actual end of the previous
+words even if its old reservation is still in the future; explicit retry
+deadlines remain respected. The live reply-gap setting is zero, with random
+pauses and card holds disabled. Silence already baked into an older cached
+audio file is unaffected.
+
+Silent SFX pictures now use the matching cue's offset in the actively playing
+voice file. The desktop passes cue rows and queued identities across the
+isolated WebView preload through DOM datasets, so its separate video surface
+can follow the same audible clock as the tablet. Queued pictures warm while
+their audio is pending, start at the current audible offset, and correct drift
+above 250 ms once per second. They retain the existing station-clock fallback
+when no matching audio evidence exists.
+The initial `playing` correction runs once per clip: seeking can fire another
+`playing` event, and repeating that correction kept a slow decoder from
+settling. Corrections also wait for an outstanding seek to finish.
+The warm video slot also plays muted until its first frame is decoded, then
+pauses in place. Promotion never pauses a slot that has already gone live.
+This moves decoder startup ahead of the audible seam rather than merely
+fetching bytes ahead of it.
+
+Station relay validation after disabling the H88 extension: 660 seconds,
+294 healthy samples, one FFmpeg PID, maximum frame age 1.0 second. Native PiP
+recovered from two short buffering stalls during the broader playback run;
+this proves continuity of the camera connection, not zero playback stalls.
+The live desktop speech handoff measured 191 ms with the next audio at
+readyState 4. Older cached audio may still contain its original internal gaps.
+
 A 4K Wi-Fi body camera (`H88_…`, an access point at `192.168.1.254`). It is
 held by the **spare USB radio** on the DGX (`wlx984827b6b478`, an RTL8821AU),
 never by the station's own (`wlP9s9`, which carries `10.89.1.246` and the
@@ -3326,8 +3506,8 @@ The tablet has no glass bar to hang a camera button in, so `pine-cam.js`
 builds its own: a small pulsing **CAM** flag on the right edge, above the
 view rail, that appears only while the link is live and goes when the camera
 does. Tap it for the picture-in-picture box — draggable, remembers where you
-left it, closes itself if the link drops rather than freezing on the last
-frame. (Before #1358 the file answered `undefined` for the station's address
+left it, hides if the link drops and restores automatically when fresh video
+returns if it was open before the drop. (Before #1358 the file answered `undefined` for the station's address
 off the desktop and looked for a button that only the Electron chrome has,
 so on this tablet it did nothing at all.)
 
@@ -3691,3 +3871,37 @@ injects into the panel webview (`__pineDesktopMixer`, by what each element is
 carrying: a video, a sting, music, a voice) and into the SFX television's
 level. Inside the desktop app the panel's own copy stays at 1 so the two
 never multiply.
+
+
+### Tablet update and compact script toolbar (2026-10-02)
+
+The download icon on the tablet queues a build on the Pine Box desktop. The
+Reinitialise card shows separate build/install bars and the latest two console
+lines. A successful build stops at **Ready**: tap the download icon again or
+**Install compiled update** to install that exact signed APK. The desktop app
+must be open. Restart the station and desktop with the updated code when
+rolling out this protocol; the tablet UI is included in the next APK.
+
+Deploy supports `--prepare` (sync, build, verify assets and platform-sign without
+ADB) and `--install-only` (preflight, check signatures, release encoders and
+install the prepared APK). The desktop retains a separate APK for the request
+and checks its hash and source stamp before installation. A source change
+requires rebuilding. Existing full deploy commands remain available.
+
+The script toolbar uses two smaller icon rows in 40 pixels of height. Press
+and slide over its buttons to see an enlarged icon and label; release over the
+chosen button to select it. Release outside or cancel to dismiss. Keyboard
+activation and the pause slider keep their existing controls.
+
+The tablet download icon pulses with a mint glow, diagonal sheen and star glint
+when the desktop reports a different current source stamp, and when an update
+is compiled and waiting for installation. Version heartbeats expire after
+three minutes. The effect pauses during work and when the drawer is closed,
+and respects Android's animation setting. Version reads share the existing
+rail lifecycle and are limited to once a minute while visible.
+
+Tablet-requested preparation now copies the declared source and canonical assets
+into an isolated temporary project asynchronously, then builds there. It verifies
+the snapshot stamp before building and the workspace stamp again before offering
+or installing the result. Concurrent workspace builds cannot lock its native
+dependency checkout or replace the APK waiting for the second tap.

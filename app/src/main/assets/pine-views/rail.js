@@ -39,6 +39,7 @@
    * mount    how that view is told to start, tried in order
    * needs    scripts that must have been evaluated for it to work */
   var VIEWS = [
+    {id: 'pinelens', cls: 'pl-view', label: 'PINELENS', mount: ['PineLens']},
     {id: 'sampler', cls: 'pb-sampler', label: 'SAMPLER', external: true},
     /* PineScriptPage is the one built to the operator's numbered sketch -
      * the three buttons, the tree, the player, the live feed and the
@@ -46,6 +47,7 @@
      * the fallback so a bundle missing the new file still opens something. */
     {id: 'script', cls: 'sc-view', label: 'SCRIPT',
       mount: ['PineScriptPage', 'PineScript']},
+    {id: 'books', cls: 'bm-view', label: 'BOOKS', mount: ['PineBookView']},
     {id: 'listen', cls: 'pb-listen', label: 'LISTEN',
       mount: ['PineListenView', 'PineListen']},
     {id: 'music', cls: 'pb-music', label: 'MUSIC',
@@ -587,6 +589,15 @@
    * hosts share one document and .p3-full sits at 2147483030, above
    * them. */
   root.PineViewRail = {
+    open: function (id) {
+      var view = VIEWS.find(function (v) { return v.id === id; });
+      if (!view) return false;
+      if (root.PineLock && typeof root.PineLock.hide === 'function') root.PineLock.hide();
+      var host = hostOf(view);
+      if (host && host.classList.contains('open')) return true;
+      open(view);
+      return true;
+    },
     closeAll: closeAll,
     railEl: function () { return document.getElementById('pineViewRail'); },
     hosts: function () {

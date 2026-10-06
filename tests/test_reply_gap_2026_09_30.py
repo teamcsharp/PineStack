@@ -488,9 +488,9 @@ class Planner(unittest.TestCase):
         self.assertIn("_rg_start = reply_gap_door(clip, _rg_air, time.time() + lead)", body)
         self.assertIn("reply_gap_booked(clip,", body)
         self.assertIn("cursor = max(cursor - reply_gap_overlap(clip), start) + duration", self.text)
-        for needle in ("pineReplyGapFloor(clip)) - Date.now();", "pineReplyGapEarly(clip, player, djVoiceQueue)",
+        for needle in ("pineReplyGapDue(clip) - Date.now();", "pineReplyGapEarly(clip, player, djVoiceQueue)",
                        "pineReplyGapEarly(clip, voice, voiceQueue)", "pineReplyGapWordsEnded(clip, null, djVoiceQueue)"):
-            self.assertEqual(self.text.count(needle), 1 if "Floor" not in needle else 2, needle)
+            self.assertEqual(self.text.count(needle), 2 if "Due" in needle else 1, needle)
 
 
 

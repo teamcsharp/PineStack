@@ -41,6 +41,10 @@ import time
 
 
 import system3
+from system3_learning import SharedDialogueLearning
+import system3_handoff
+import dialogue_recovery
+import dialogue_repair
 import system3_tables                     # [s3-calls] road structures
 from system3_store import System3Store
 try:                                      # [s3-mgrtopics] the manager's topic roulette
@@ -104,6 +108,17 @@ def _s3_lines(o):
     got = o.get("lines") if isinstance(o, dict) else None
     return got if isinstance(got, (list, tuple, set)) else ()
 
+class _DialogueRecoveryRefused(ValueError):
+    """A recoverable exchange remains owed after its bounded repair pass."""
+
+    def __init__(self, reason, recovery):
+        super().__init__(reason)
+        self.recovery = copy.deepcopy(recovery)
+
+class _DialogueRecoveryDeferred(_DialogueRecoveryRefused):
+    """The writing lane declined admission before a model command was sent."""
+
+
 class Handle:
     """One road call's System 3 conversation, carried through dj_banter."""
 
@@ -118,7 +133,7 @@ class Handle:
         self.topic_new = {}
         self.plan_ms = 0.0
         self.bank = False
-        self.turns = 0            # [s3-glass] the LENGTH roll's turn count, when the round's length was a roll
+        self.turns = 0            # The complete planned running order; LENGTH keeps its original roulette count.
         self.gate = None          # [s3-turnchain] the copy gate's walk over the written round, while it runs
 
     @property
@@ -225,6 +240,7 @@ class System3Runtime:
     def __init__(self, host):
         self.host = host
         self.store = System3Store(host.data_path("system3.sqlite3"))
+        self.learning = SharedDialogueLearning(host.data_path("system3_learning.sqlite3"))
         self.settings = system3.normalise_settings({})
         self.config = system3.default_config()
         self.ready = False
@@ -268,16 +284,24 @@ class System3Runtime:
         # [link-now] a committed round's line links, known the moment it commits;
         # the store's single writer can be a minute behind the roll events
         self.pending_links = collections.OrderedDict()
+        # A final writer may await a model; only one may shape a conversation.
+        self._handoff_busy = set()
         # [s3-cast] the favourites that came up lately (they weigh a quarter at the
         # next draw) and each directive's airings; kept in data/system3_cast.json
         self.cast = {"fav_recent": [], "directive_spent": {}, "counted": []}
 
     # --- lifecycle ---------------------------------------------------------
     def load(self):
+        self.learning.start()
         self.settings = self.store.settings()
         self.config = self.store.config()
         self.add_missing_conversation_graphs()
         added = self.add_missing_default_tables()
+        import gazette_review
+        gazette_config = gazette_review.upgrade_wheels(self.config)
+        if gazette_config != self.config:
+            self.store.save_config(gazette_config, "User-requested Gazette caller and upstairs topic roulette options")
+            self.config = gazette_config
         if added:
             self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
         gained = self.add_missing_station_events()                       # [s3-live-event]
@@ -736,6 +760,21 @@ class System3Runtime:
             self.fail("manager topic", exc)
             return None
 
+    def call_source(self, unavailable=None):
+        """Approved equal source wheel; failures remain visible exclusions."""
+        if not self._dice_live():
+            return None
+        import call_diversity
+        buf = self._roll_buffer()
+        seed = str(buf["seed"]) + "|" + str(buf["stream"].next("call.source")["u"])
+        conv = system3.new_conversation({"road":"caller"}, self.config, self.settings, seed=seed)
+        selected = call_diversity.draw(conv, self.config, "CALLSOURCE", unavailable=unavailable or {})
+        ev = conv["decision_events"][-1]
+        self._record_roll({"kind":"callsource","key":"call.source","label":"Caller premise source",
+                           "u":ev["rng"]["u"],"dice":ev["rng"]["dice"],"event":ev,
+                           "picked":(selected or {}).get("id"),"seed":seed})
+        return selected or {}
+
     def _absorb_rolls(self, conv):
         """The rolls the road made before asking for this round become its first
         events (STATION): recorded with their odds and dice, not replayed."""
@@ -750,6 +789,12 @@ class System3Runtime:
             before = system3._snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
             if r.get("kind") == "mgrtopic" and system3_mgrtopics is not None:   # [s3-mgrtopics] three draws
                 system3_mgrtopics.absorb(conv, r, before, ctx0)
+                continue
+            if r.get("kind") == "callsource":
+                e = r["event"]
+                system3._event(conv, ctx0, "CALLSOURCE", e["stages"], e["selected"], before,
+                               meta=dict(e["meta"], road_roll=True, source_seed=r["seed"],
+                                         selected_premise=((conv.get("inputs") or {}).get("call") or {}).get("system3_source",{}).get("source") == (e.get("selected") or {}).get("id")), rng=e["rng"])
                 continue
             if r.get("kind") == "roll":
                 stages = [{"stage": "roll", "draw": {"u": r["u"], "dice": r["dice"]}, "selected": r["u"],
@@ -1692,6 +1737,7 @@ class System3Runtime:
             "lines_rolled": bool(ctx.get("lines_rolled")),
             "lines_min": _num(ctx.get("lines_min")), "lines_max": _num(ctx.get("lines_max")),
             "lines_base": _num(ctx.get("lines_base")),
+            "short_segment_cap": 6 if ctx.get("short_segment") and road == "banter" and not ctx.get("whole") else 0,
             # [s3-roads] the SFX Guy's dials, for his node on every host turn
             "sfxguy": {"rate": _num(dj.get("sfxguy_rate")), "warp": _num(dj.get("sfxguy_warp")),
                        "voice": bool(dj.get("drop_voice")), "every_units": _num(dj.get("sfxguy_every_units"))},
@@ -2071,9 +2117,13 @@ class System3Runtime:
                 clause = ""
         out = {"name": name, "first": name.split()[0], "other": str(dj.get("cohost_name") or ""),
                "topic": system3.whole_cut(meta.get("topic"), 400),
+               "station": str(dj.get("station_name") or "the station"),
+               "feature": str(meta.get("rewrite_feature") or ""),
                # [s3-cut] at a sentence end, never where a count fell
                "speakerbox": system3.sentence_cut(str(meta.get("speakerbox_text") or ctx.get("seed_text") or ""), 600),
                "story": bool(meta.get("story")), "scenario_clause": clause[:1500],
+               "system3_source": copy.deepcopy(meta.get("system3_source") or {}),
+               "internet_source": copy.deepcopy(meta.get("internet_source") or {}),
                "painting": self._painting_of(ctx)}                              # [s3-callend] the caller's wheel
         # [s3-callarc] the station's own business, for the detour and the result wheel
         fn = getattr(self.host, "system3_call_background", None)
@@ -2280,7 +2330,17 @@ class System3Runtime:
             return None
         try:
             turns = self.host.banter_turns(str(script or ""))
-            mapping = system3.align(conv, turns)
+            approved = (conv.get("turn_gate") or {}).get("output_turn_ids")
+            by_id = {t["turn_id"]: t for t in conv.get("turns") or []}
+            if (isinstance(approved, list) and len(approved) == len(turns)
+                    and len(set(approved)) == len(approved)
+                    and all(tid in by_id and str(by_id[tid]["speaker"]) == str(row[0])
+                            for tid, row in zip(approved, turns))):
+                # Repeated seat sequences cannot identify a surviving turn:
+                # ABAB may be turns 0,3,4,5, rather than align's 0,1,2,3.
+                mapping = {by_id[tid]["index"]: i for i, tid in enumerate(approved)}
+            else:
+                mapping = system3.align(conv, turns)  # legacy receipts
         except Exception as exc:  # noqa: BLE001
             self.fail("tint alignment", exc)
             return None
@@ -2331,6 +2391,7 @@ class System3Runtime:
             self._voice_actor_arm(ctx, inputs, road, mode)       # [voice-actor] "call in now"
             config = self.config
             started = time.perf_counter()
+            self._learning_inputs(inputs, config, mode)
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
             self._absorb_rolls(conv)                                            # [s3-dice-door]
@@ -2383,12 +2444,9 @@ class System3Runtime:
                 system3.plan_more(conv, config)
             self._voice_actor_taken(handle, inputs)             # [voice-actor] the diamond took it
             handle.plan_ms = round((time.perf_counter() - started) * 1000, 2)
-            if conv.get("length_roll"):
-                handle.turns = int(conv["length_roll"].get("turns") or 0)     # [s3-glass]
-            elif handle.active and conv.get("turns"):
-                # [s3-rounds] the sheet's row count IS the round's size: a legs road
-                # whose parity mended the count by one, a round two interjection
-                # turns were planned into - dj_banter's `lines` follows the rows
+            if handle.active and conv.get("turns"):
+                # The writer must cover every planned node, including graph
+                # interjections. The original LENGTH roulette stays in length_roll.
                 handle.turns = len(conv["turns"])
             if handle.active and conv.get("carry"):
                 with self.lock:
@@ -2508,6 +2566,7 @@ class System3Runtime:
                         inputs["names"][s] = str(n)
                         inputs["roles"][s] = {"A": "dj", "B": "cohost", "D": "third"}[s]
                 inputs["turns"] = max(4, min(12, int(ctx.get("lines") or 0) or 7))
+            self._learning_inputs(inputs, config, mode)
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
             self._absorb_rolls(conv)                                            # [s3-dice-door]
@@ -2608,6 +2667,15 @@ class System3Runtime:
                 return
             conv = handle.conv
             words = " ".join(str(text or "").split())
+            if ((conv.get("handoff") or {}).get("status") in ("ready", "disabled")
+                    and len(conv.get("turns") or []) > 1 and conv.get("actual")):
+                # The finalized exchange owns every child's full text and index.
+                # A late bind of its old whole read must not erase those words.
+                self.observe_later(handle.id, "HANDOFF", {
+                    "stage": "late-line-bind", "status": "preserved", "rng": None,
+                    "why": "the finalized exchange already binds every spoken part",
+                    "supplied_chars": len(words), "turns": len(conv["turns"])})
+                return
             if conv["turns"]:
                 # The line is the graph's initiator. Binding it to the last
                 # turn silently made a seven-turn chapter look complete while
@@ -2702,6 +2770,605 @@ class System3Runtime:
             self._flow(conv, "chapter %s%s" % (state, (": " + str(why)[:160]) if why else ""))
         except Exception as exc:  # noqa: BLE001
             self.fail("chapter state", exc)
+
+    # --- final dialogue length and conversational handoffs -----------------------
+    async def _handoff_conversation(self, handle_or_stamp):
+        if isinstance(handle_or_stamp, (Handle, LineHandle)):
+            return handle_or_stamp.conv
+        if not isinstance(handle_or_stamp, dict):
+            return None
+        cid = str(handle_or_stamp.get("conversation_id") or "")
+        if not cid:
+            return None
+        return self.recent.get(cid) or await self.read(self.store.conversation, cid)
+
+    async def _handoff_config(self, conv, handle_or_stamp):
+        """A final pass uses the revision that planned these turns."""
+        if isinstance(handle_or_stamp, Handle) and isinstance(handle_or_stamp.config, dict):
+            config = copy.deepcopy(handle_or_stamp.config)
+        else:
+            config_hash = str(conv.get("config_hash") or "")
+            config = (copy.deepcopy(self.config) if config_hash == system3.config_hash(self.config)
+                      else await self.read(self.store.config_by_hash, config_hash))
+        if not isinstance(config, dict) or system3.config_hash(config) != conv.get("config_hash"):
+            raise ValueError("the conversation's pinned config is unavailable")
+        return config
+
+    async def _handoff_committed(self, conv):
+        cid = str((conv.get("identity") or {}).get("conversation_id") or "")
+        with self.lock:
+            pending = any(row.get("conversation_id") == cid for row in self.pending_links.values())
+        if pending or conv.get("lines"):
+            return True
+        saved = await self.read(self.store.conversation, cid, False)
+        return bool(saved and saved.get("lines"))
+
+    async def handoff_candidate_status(self, stamp):
+        """Whether a saved candidate can still receive its missing final review.
+
+        A pending publication is temporary; durable ledger lines make an
+        unreviewed old candidate permanently inadmissible. Neither condition
+        grants permission to rewrite or replay that conversation identity.
+        """
+        try:
+            if not self.ready:
+                return {"ok": False, "permanent": False, "why": "System 3 has not loaded"}
+            conv = await self._handoff_conversation(stamp)
+            if not conv:
+                return {"ok": False, "permanent": True, "why": "the saved conversation no longer exists"}
+            cid = str((conv.get("identity") or {}).get("conversation_id") or "")
+            saved = await self.read(self.store.conversation, cid, False)
+            state = str(conv.get("status") or "")
+            chapter = str((conv.get("chapter_state") or {}).get("state") or "")
+            if (conv.get("lines") or (saved and saved.get("lines"))
+                    or state in ("chapter_aired", "chapter_partial") or chapter in ("aired", "partial")):
+                return {"ok": False, "permanent": True,
+                        "why": "the unreviewed candidate already has committed script-ledger lines"}
+            with self.lock:
+                pending = any(row.get("conversation_id") == cid for row in self.pending_links.values())
+            if pending or state == "chapter_airing" or chapter in ("airing", "in_flight"):
+                return {"ok": False, "permanent": False, "why": "the candidate has a current publication in flight"}
+            turns = conv.get("turns") or []
+            if turns and all(t.get("status") == "dropped" for t in turns):
+                return {"ok": False, "permanent": True,
+                        "why": "the unreviewed candidate has no remaining planned or generated turns"}
+            if ((stamp.get("revision") is not None and int(stamp["revision"]) != int(conv["identity"].get("revision") or 1))
+                    or (stamp.get("config_hash") and stamp["config_hash"] != conv.get("config_hash"))):
+                return {"ok": False, "permanent": True, "why": "the candidate no longer matches its pinned conversation"}
+            return {"ok": True, "permanent": False, "why": ""}
+        except Exception as exc:
+            return {"ok": False, "permanent": False, "why": "candidate review unavailable: %s" % type(exc).__name__}
+
+    def _handoff_receipt(self, conv, status, why):
+        receipt = {"stage": "final-dialogue", "status": status, "why": str(why),
+                   "rng": None, "at": time.time()}
+        if conv:
+            cid = str((conv.get("identity") or {}).get("conversation_id") or "")
+            if cid:
+                self.observe_later(cid, "HANDOFF", receipt)
+        return receipt
+
+    async def handoff_policy_current(self, handle_or_stamp):
+        """A prepared exchange is usable only with its recorded policy revision.
+
+        Pinned config changes require a new conversation, rather than changing
+        the meaning of an already recorded roulette draw.
+        """
+        try:
+            if not self.ready:
+                return False
+            conv = await self._handoff_conversation(handle_or_stamp)
+            if not conv or conv.get("mode") != "active":
+                return False
+            receipt = conv.get("handoff") or {}
+            config = await self._handoff_config(conv, handle_or_stamp)
+            return bool(receipt.get("status") in ("ready", "disabled")
+                        and receipt.get("policy_hash") == system3_handoff.policy_hash(config))
+        except Exception:
+            return False
+
+    async def handoff_turn_ready(self, stamp, text):
+        """Whether this exact turn, or a transport chunk of it, was finalized.
+
+        A receipt for a whole conversation cannot authorize different words on
+        one of its stamps. In particular, the old read's dropped tail never
+        matches the final turn that replaced it.
+        """
+        try:
+            if not isinstance(stamp, dict) or not stamp.get("turn_id"):
+                return False
+            words = " ".join(str(text or "").split())
+            if not words or not any(char.isalpha() for char in words):
+                return False
+            if not await self.handoff_policy_current(stamp):
+                return False
+            conv = await self._handoff_conversation(stamp)
+            if not conv:
+                return False
+            identity = conv.get("identity") or {}
+            if (stamp.get("revision") is not None
+                    and int(stamp["revision"]) != int(identity.get("revision") or 1)):
+                return False
+            if stamp.get("config_hash") and stamp["config_hash"] != conv.get("config_hash"):
+                return False
+            turn = next((turn for turn in conv.get("turns") or []
+                         if turn.get("turn_id") == str(stamp["turn_id"])), None)
+            if not turn or turn.get("status") != "generated" or turn.get("script_index") is None:
+                return False
+            recorded = (conv.get("handoff") or {}).get("output_rows") or []
+            index = int(turn.get("index", -1))
+            if not 0 <= index < len(recorded):
+                return False
+            seat, spoken = recorded[index]
+            final = " ".join(str(spoken or "").split())
+            if str(seat) != str(turn.get("speaker") or "") or final != " ".join(str(turn.get("text") or "").split()):
+                return False
+            return bool(final and words in final)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _review_recovered_rows(conv, rows):
+        """Fresh writing must pass the normal copy gate without omitting legs."""
+        turns = conv.get("turns") or []
+        if len(rows) != len(turns) or any(str(seat) != str(turn.get("speaker"))
+                                         for (seat, _), turn in zip(rows, turns)):
+            raise ValueError("recovery copy review needs every planned turn")
+        kit = system3.conv_direction_kit(conv)
+        if any(system3.direction_echo(text, kit) for _seat, text in rows):
+            raise ValueError("recovery still says a running-order direction aloud")
+        earlier = []
+        failed = set(conv.get("dialogue_recovery_failed_turn_ids") or [])
+        for index, (seat, text) in enumerate(rows):
+            caught = system3.gate_check(conv, index, text, earlier)
+            if caught:
+                raise ValueError("recovery copy gate refused: " + caught["why"])
+            turn = turns[index]
+            if ((turn["turn_id"] in failed or
+                 conv.get("dialogue_recovery_require_closing") and index == len(turns) - 1)
+                    and system3_handoff._closing(turn, turns[-1]["turn_id"])
+                    and not re.search(system3.CUES["close"], text, re.I)):
+                raise ValueError("recovery did not complete the rejected or unwritten closing")
+            earlier.append(("turn %s" % turn["turn_id"], text))
+        conv["turn_gate"] = {"at": time.time(), "written": len(rows), "kept": len(rows),
+                             "output_turn_ids": [turn["turn_id"] for turn in turns],
+                             "caught": 0, "rewritten": 0, "dropped": 0, "trimmed": 0,
+                             "visits": 0, "held": "", "turns": []}
+        conv["dialogue_recovery_gate_review"] = {
+            "at": time.time(), "turn_ids": [turn["turn_id"] for turn in turns],
+            "record": copy.deepcopy(conv["turn_gate"])}
+
+    @staticmethod
+    def _recovery_stamp(conv):
+        identity = (conv or {}).get("identity") or {}
+        return {"conversation_id": str(identity.get("conversation_id") or ""),
+                "revision": int(identity.get("revision") or 1),
+                "config_hash": str((conv or {}).get("config_hash") or ""),
+                "mode": str((conv or {}).get("mode") or "")}
+
+    def _learning_inputs(self, inputs, config, mode):
+        learner = getattr(self, "learning", None)
+        if learner is not None and mode == "active":
+            inputs["shared_learning"] = learner.snapshot(
+                system3.config_hash(config), str(inputs.get("road") or ""))
+
+    def _learning_failure(self, conv, reason, operation="initial"):
+        learner = getattr(self, "learning", None)
+        if learner is not None:
+            learner.failure(conv, dialogue_recovery.failure_feedback(reason)["category"],
+                            conv.get("dialogue_recovery_failed_turn_ids") or [], operation)
+
+    def learning_playback(self, rows, position, previous, clip):
+        """Called only inside the page's audible, progressing speech receipt."""
+        try:
+            learner = getattr(self, "learning", None)
+            if learner is not None:
+                learner.playback(rows, float(position), float(previous),
+                                 float((clip or {}).get("seconds") or 0))
+        except Exception as exc:
+            self.fail("learning playback", exc)
+
+    async def _finalize_handoff_recovery(self, base, config, source_rows, studio, writer, kind, recover=True):
+        """Retry actual rejected writing, never replay the same failed command.
+
+        Attempts work on isolated plans. Only recovery accounting survives a
+        refused pass; generated words and decisions commit with a ready exchange.
+        The scheduler later resumes the same debt after its cooldown.
+        """
+        container = {}
+        if isinstance(base.get("dialogue_recovery"), dict):
+            container["dialogue_recovery"] = copy.deepcopy(base["dialogue_recovery"])
+        state = dialogue_recovery.recovery_state(container)
+        if not state.get("active"):
+            candidate = copy.deepcopy(base)
+            try:
+                result = await system3_handoff.finalize_exchange(
+                    candidate, config, source_rows, studio, writer, kind=kind)
+                kit = system3.conv_direction_kit(candidate)
+                if any(system3.direction_echo(text, kit) for _seat, text in result.get("rows") or []):
+                    raise ValueError("the final exchange still says a running-order direction aloud")
+                return candidate, result
+            except ValueError as exc:
+                if not recover or not state.get("policy", {}).get("enabled", True):   # [s3-flow-open]
+                    raise
+                self._learning_failure(candidate, str(exc))
+                dialogue_recovery.note_failure(state, str(exc), time.time())
+
+        protected_ids = {t["turn_id"] for t in base.get("turns") or []
+                         if t.get("handoff_protected") or t.get("protected_copy")
+                         or t.get("read_exactly")}
+        original_seats = {str(t.get("speaker") or "") for t in base.get("turns") or []}
+        candidates = [dict(person, available=bool(person.get("available", True)
+                                                    and person.get("seat") in original_seats))
+                      for person in studio]
+        last_reason = str(state.get("last_reason") or "the dialogue remains unprepared")
+        # Three actual operations per pass. A denied/cooling attempt spends no
+        # model work, and existing audio remains free to run on the other lanes.
+        for _ in range(int(state.get("policy", {}).get("attempts_per_pass") or 3)):
+            learner = getattr(self, "learning", None)
+            if learner is not None and not state.get("in_flight") and (
+                    not state.get("attempt") or state["attempt"] >= state["policy"]["attempts_per_pass"]):
+                preferred = learner.preferred_operation(
+                    str((base.get("inputs") or {}).get("road") or ""),
+                    dialogue_recovery.failure_feedback(last_reason)["category"],
+                    str((base.get("identity") or {}).get("conversation_id") or ""),
+                    int(state.get("total_attempts") or 0))
+                if preferred:
+                    state["next_operation"] = dialogue_recovery.OPERATIONS.index(preferred)
+            attempt = dialogue_recovery.begin_attempt(state, time.time())
+            if not attempt.get("allow"):
+                raise _DialogueRecoveryRefused(last_reason, state)
+            attempt = dict(attempt, reason=last_reason, kind=kind,
+                           failed_turn_ids=copy.deepcopy(base.get("dialogue_recovery_failed_turn_ids") or []))
+            candidate = copy.deepcopy(base)
+            candidate.pop("handoff", None)
+            candidate["dialogue_recovery_variant"] = copy.deepcopy(attempt)
+            if attempt["operation"] == "rebuild":
+                self._learning_inputs(candidate.setdefault("inputs", {}), config, candidate.get("mode"))
+
+            async def varied_writer(request):
+                outgoing = dict(request, recovery=copy.deepcopy(attempt))
+                answer = await writer(outgoing)
+                if outgoing.get("writing_receipt") is not None:
+                    request["writing_receipt"] = copy.deepcopy(outgoing["writing_receipt"])
+                return answer
+
+            try:
+                original_turns = base.get("turns") or []
+                closing = original_turns[-1] if original_turns else {}
+                require_closing = bool(
+                    closing.get("turn_id") in set(attempt.get("failed_turn_ids") or [])
+                    and system3_handoff._closing(closing, closing.get("turn_id")))
+                repaired_rows = await dialogue_repair.prepare_recovery(
+                    candidate, config, source_rows, candidates, varied_writer, attempt,
+                    protected_ids=protected_ids,
+                    source_turn_ids=base.get("dialogue_recovery_source_turn_ids"))
+                candidate["dialogue_recovery_require_closing"] = require_closing
+                candidate["dialogue_recovery_gate_before"] = copy.deepcopy(candidate.get("turn_gate") or {})
+                self._review_recovered_rows(candidate, repaired_rows)
+                result = await system3_handoff.finalize_exchange(
+                    candidate, config, repaired_rows, candidates, varied_writer, kind=kind)
+                self._review_recovered_rows(candidate, result.get("rows") or [])
+                candidate.pop("dialogue_recovery_gate_reason", None)
+                candidate.pop("dialogue_recovery_failed_turn_ids", None)
+                candidate.pop("dialogue_recovery_source_turn_ids", None)
+                candidate.pop("dialogue_recovery_require_closing", None)
+                if result.get("status") not in ("ready", "disabled"):
+                    raise ValueError("the recovery operation did not produce a ready exchange")
+                # The station still owes source/brief review and recording.
+                # Retain the pass position so a downstream refusal resumes
+                # escalation instead of calling a prepared script a win.
+                candidate["dialogue_recovery_prepared_state"] = copy.deepcopy(state)
+                dialogue_recovery.note_success(state, time.time(), attempt["variation_id"])
+                candidate["dialogue_recovery"] = copy.deepcopy(state)
+                result["changed"] = bool(result.get("changed") or result.get("rows") != source_rows)
+                result["recovery"] = copy.deepcopy(state)
+                return candidate, result
+            except (ValueError, RuntimeError) as exc:
+                last_reason = "%s: %s" % (type(exc).__name__, str(exc)[:240])
+                self._learning_failure(candidate, last_reason, attempt["operation"])
+                dialogue_recovery.note_failure(state, last_reason, time.time(), attempt["variation_id"])
+                self.log("System 3 dialogue recovery %s held: %s" %
+                         (attempt["operation"], last_reason))
+            except BaseException as exc:
+                # Cancellation and unexpected implementation errors are not
+                # creative rejections and cannot leave a permanently busy debt.
+                dialogue_recovery.note_deferred(state, time.time(), attempt["variation_id"])
+                if type(exc).__name__ == "WritingDeferred":
+                    raise _DialogueRecoveryDeferred(str(exc), state) from exc
+                raise
+        raise _DialogueRecoveryRefused(last_reason, state)
+
+    async def recovery_reject(self, stamp, reason):
+        """Feed downstream review refusals back into the same recovery debt."""
+        conv = await self._handoff_conversation(stamp)
+        if not conv or conv.get("mode") != "active" or await self._handoff_committed(conv):
+            return None
+        current = self._recovery_stamp(conv)
+        if any(stamp.get(key) != current[key] for key in ("conversation_id", "revision", "config_hash")):
+            return None
+        with self.lock:
+            if current["conversation_id"] in self._handoff_busy:
+                return None
+        saved = conv.pop("dialogue_recovery_prepared_state", None)
+        if isinstance(saved, dict):
+            conv["dialogue_recovery"] = copy.deepcopy(saved)
+        state = dialogue_recovery.recovery_state(conv)
+        self._learning_failure(conv, str(reason), (conv.get("dialogue_recovery_variant") or {}).get("operation") or "initial")
+        dialogue_recovery.note_failure(state, str(reason), time.time())
+        if isinstance(conv.get("handoff"), dict):
+            conv["handoff"]["status"] = "refused"
+            conv["handoff"]["downstream_rejection"] = str(reason)[:300]
+        self.remember(conv)
+        self.persist(conv)
+        self.observe_later(current["conversation_id"], "HANDOFF", {
+            "stage": "recovery downstream review", "status": "refused", "why": str(reason)[:300]})
+        return copy.deepcopy(state)
+
+    async def recovery_bind_entry(self, entry, stamp):
+        """Bind a queued, successfully prepared revision without a live writer handle."""
+        conv = await self._handoff_conversation(stamp)
+        if not conv or not await self.handoff_policy_current(stamp):
+            return False
+        current = self._recovery_stamp(conv)
+        if any(stamp.get(key) != current[key] for key in ("conversation_id", "revision", "config_hash")):
+            return False
+        if await self._handoff_committed(conv):
+            return False
+        rows = self.host.banter_turns(str(entry.get("script") or ""),
+                                     str(entry.get("caller_name") or ""),
+                                     str(entry.get("caller2_name") or ""))
+        finalized = (conv.get("handoff") or {}).get("output_rows") or []
+        if [(str(seat), str(text).strip()) for seat, text in rows] != [
+                (str(seat), str(text).strip()) for seat, text in finalized]:
+            return False
+        config = await self._handoff_config(conv, stamp)
+        handle = Handle(self, conv, config, True)
+        self.bind_entry(entry, handle)
+        return bool((entry.get("system3") or {}).get("conversation_id") == current["conversation_id"])
+
+    async def flow_bind_entry(self, entry, stamp):
+        """[s3-flow-open] Bind a released draft to its saved plan, as written.
+
+        A round the final pass refused was never bound. With flow open it
+        stands as written, so it is aligned with its plan the way every round
+        was before the final pass existed: bind_entry's own alignment decides
+        which turns bind. No receipt is required; a conversation that already
+        has ledger lines is never bound again."""
+        conv = await self._handoff_conversation(stamp)
+        if not conv or conv.get("mode") != "active":
+            return False
+        if await self._handoff_committed(conv):
+            return False
+        config = await self._handoff_config(conv, stamp)
+        self.bind_entry(entry, Handle(self, conv, config, True))
+        bound = entry.get("system3") or {}
+        return bool(bound.get("conversation_id") and bound.get("turns"))
+
+    async def handoff_exchange(self, handle_or_stamp, rows, writer, dj=None, kind="", away="",
+                               protected=None, assembly_trace=None, recover=True):   # [s3-flow-open]
+        """Shape the fully assembled, uncommitted studio exchange before voices.
+
+        ``writer`` is an async callback taking one engine request dictionary.
+        ``protected`` contains original zero-based row indexes or turn IDs for
+        copies whose exact words are required. Assembly evidence is supplied by
+        the actual writer; this door does not infer an earlier model response.
+        Failure returns no playable rows and leaves the original plan intact.
+        """
+        conv, cid, acquired, before = None, "", False, None
+        active_request = (bool(handle_or_stamp.active) if isinstance(handle_or_stamp, (Handle, LineHandle))
+                          else isinstance(handle_or_stamp, dict) and handle_or_stamp.get("mode") == "active")
+        source_rows = []
+        try:
+            source_rows = [(str(seat), str(text or "").strip()) for seat, text in rows]
+            if not self.ready:
+                why = "System 3 has not loaded"
+            else:
+                conv = await self._handoff_conversation(handle_or_stamp)
+                why = "no active conversation" if not conv or conv.get("mode") != "active" else ""
+                if isinstance(handle_or_stamp, (Handle, LineHandle)) and not handle_or_stamp.active:
+                    why = "the writer's handle is not active"
+            if why:
+                if active_request:
+                    raise ValueError(why)
+                receipt = self._handoff_receipt(conv, "skipped", why)
+                return {"rows": source_rows, "changed": False, "traces": [receipt],
+                        "status": "skipped", "eligible": False, "why": why}
+            cid = str(conv["identity"]["conversation_id"])
+            stamp = handle_or_stamp if isinstance(handle_or_stamp, dict) else {}
+            if (stamp.get("revision") is not None
+                    and int(stamp["revision"]) != int(conv["identity"].get("revision") or 1)):
+                raise ValueError("the conversation stamp is from a different revision")
+            if stamp.get("config_hash") and stamp["config_hash"] != conv.get("config_hash"):
+                raise ValueError("the conversation stamp is from a different config")
+            studio = self._studio(dj, away)
+            candidate_exclusions = []
+            for person in studio:
+                if person["seat"] not in ("A", "B", "D"):
+                    person["available"] = False
+                    person["unavailable_reason"] = "the dialogue parser does not support this studio seat"
+                    candidate_exclusions.append({"seat": person["seat"], "who": person["who"],
+                                                 "why": person["unavailable_reason"]})
+            live_seats = {p["seat"] for p in studio if p.get("available") is not False}
+            seats = {seat for seat, _text in source_rows}
+            if not source_rows or not seats.intersection(live_seats):
+                why = "this exchange has no dialogue between available studio voices"
+                receipt = self._handoff_receipt(conv, "skipped", why)
+                return {"rows": source_rows, "changed": False, "traces": [receipt],
+                        "status": "skipped", "eligible": False, "why": why}
+            with self.lock:
+                if cid in self._handoff_busy:
+                    raise ValueError("another final handoff pass is in progress")
+                self._handoff_busy.add(cid)
+                acquired = True
+            state = str(conv.get("status") or "")
+            chapter_state = str((conv.get("chapter_state") or {}).get("state") or "")
+            if (state in ("chapter_airing", "chapter_aired", "chapter_partial")
+                    or chapter_state in ("airing", "in_flight", "aired", "partial")
+                    or await self._handoff_committed(conv)):
+                raise ValueError("the exchange is already in flight or committed to the script ledger")
+            config = await self._handoff_config(conv, handle_or_stamp)
+            before = json.dumps(conv, sort_keys=True, ensure_ascii=False, default=str)
+            cloned = copy.deepcopy(conv)
+            original_turns = list(cloned.get("turns") or [])
+            tint_cuts = (assembly_trace or {}).get("tint_cuts") if isinstance(assembly_trace, dict) else None
+            original_source_rows = list(source_rows)
+            protected = set(protected or ())
+            source_ids = list((cloned.get("turn_gate") or {}).get("output_turn_ids") or [])
+            if source_ids and tint_cuts:
+                source_ids = [tid for i, tid in enumerate(source_ids) if i not in set(tint_cuts.get("cut_indexes") or [])]
+            if not source_ids and len(original_turns) == len(source_rows):
+                source_ids = [t["turn_id"] for t in original_turns]
+            protected_ids = {str(value) for value in protected if not isinstance(value, int)}
+            protected_ids.update(source_ids[index] for index in protected
+                                 if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(source_ids))
+            if len(original_turns) == 1 and not cloned.get("graph_structure"):
+                # plan_line's sole legacy leg is labelled close because it was
+                # once the complete source. It is an opener for this exchange;
+                # explicit graph endings and protected copy remain mandatory.
+                original_turns[0]["handoff_opening"] = True
+            for index, turn in enumerate(cloned.get("turns") or []):
+                if str(turn.get("speaker") or "") not in live_seats:
+                    turn["handoff_protected"] = True
+                    turn["handoff_protection_reason"] = "this original voice is outside the available dialogue handoff pool"
+                elif turn.get("turn_id") in protected_ids or (not source_ids and index in protected):
+                    turn["handoff_protected"] = True
+            # Existing omission receipts remain authoritative until new words
+            # pass a fresh copy gate. A refusal may trigger writing recovery,
+            # but cannot approve or commit the old rejected wording.
+            recovery_base = copy.deepcopy(cloned)
+            debt = dialogue_recovery.recovery_state(cloned)
+            recovering = bool(debt.get("active"))
+            if recovering and not recover:
+                # [s3-flow-open] no recovery debt is paid while flow is open: the
+                # caller is told at once and the round stands as written
+                raise ValueError(str(debt.get("last_reason") or "the final pass refused this exchange earlier"))
+            if recovering:
+                now = time.time()
+                leased = (debt.get("in_flight") and debt.get("started_at") is not None
+                          and now - float(debt["started_at"]) < debt["policy"]["max_attempt_seconds"])
+                if (not debt["policy"].get("enabled") or leased
+                        or now < float(debt.get("cooldown_until") or 0)):
+                    raise _DialogueRecoveryRefused(
+                        str(debt.get("last_reason") or "dialogue recovery is waiting"), debt)
+            try:
+                if not recovering:
+                    source_rows, tint_cuts = await system3_handoff.complete_unwritten_legs(
+                        cloned, config, source_rows, writer, tint_cuts)
+                system3_handoff.reconcile_copy_gate(cloned, source_rows, tint_cuts)
+            except ValueError as exc:
+                if not recover:
+                    raise                       # [s3-flow-open] no rewrite passes: the caller decides
+                cloned = recovery_base
+                cloned["dialogue_recovery_gate_reason"] = str(exc)
+                gate = cloned.get("turn_gate") or {}
+                failed = {row.get("turn_id") for row in gate.get("turns") or []
+                          if row.get("state") == "dropped"}
+                failed.update(gate.get("unwritten_turn_ids") or [])
+                approved = list(gate.get("output_turn_ids") or [])
+                failed.update(approved[i] for i in (tint_cuts or {}).get("cut_indexes") or []
+                              if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(approved))
+                cloned["dialogue_recovery_failed_turn_ids"] = sorted(str(tid) for tid in failed if tid)
+                if source_ids:
+                    cloned["dialogue_recovery_source_turn_ids"] = list(source_ids)
+                self._learning_failure(cloned, str(exc))
+                state = dialogue_recovery.recovery_state(cloned)
+                if not state.get("active"):
+                    dialogue_recovery.note_failure(state, str(exc), time.time())
+                source_rows = original_source_rows
+            cloned, result = await self._finalize_handoff_recovery(
+                cloned, config, source_rows, studio, writer, kind, recover=recover)
+            if not isinstance(result, dict) or result.get("status") not in ("ready", "disabled"):
+                raise ValueError("the final handoff pass did not produce a ready exchange")
+            final_rows = [(str(seat), str(text or "").strip()) for seat, text in result.get("rows") or []]
+            final_turns = cloned.get("turns") or []
+            if (not final_rows or len(final_rows) != len(final_turns)
+                    or any(not text or seat != str(turn.get("speaker") or "")
+                           for (seat, text), turn in zip(final_rows, final_turns))):
+                raise ValueError("the final exchange leaves a planned turn unresolved")
+            kit = system3.conv_direction_kit(cloned)
+            if any(system3.direction_echo(text, kit) for _seat, text in final_rows):
+                raise ValueError("the final exchange still says a running-order direction aloud")
+            for index, (turn, (_seat, text)) in enumerate(zip(final_turns, final_rows)):
+                turn.update(index=index, text=text, script_index=index, status="generated")
+                if turn.get("handoff_protection_reason"):
+                    turn.setdefault("length_trace", {})["exemption_reason"] = turn["handoff_protection_reason"]
+            cloned.setdefault("handoff", {})["candidate_exclusions"] = candidate_exclusions
+            if assembly_trace is not None:
+                evidence = json.loads(json.dumps(assembly_trace, default=str))
+                cloned.setdefault("handoff", {})["assembly"] = evidence
+                original_ids = {turn["turn_id"]: index for index, turn in enumerate(original_turns)}
+                for turn in final_turns:
+                    index = original_ids.get(turn["turn_id"])
+                    if index is not None:
+                        supplied = (evidence[index] if isinstance(evidence, list) and index < len(evidence)
+                                    else evidence.get(str(index), evidence.get(turn["turn_id"], evidence))
+                                    if isinstance(evidence, dict) else evidence)
+                        trace = turn.setdefault("length_trace", {})
+                        trace["assembly"] = copy.deepcopy(supplied)
+                        if isinstance(supplied, dict):
+                            for key in ("draft_chars", "source_changes"):
+                                if key in supplied:
+                                    trace[key] = copy.deepcopy(supplied[key])
+            cloned["actual"] = [{"speaker": seat, "text": text} for seat, text in final_rows]
+            cloned["identity"]["script_digest"] = hashlib.sha256(
+                "\n".join("%s: %s" % row for row in final_rows).encode("utf-8")).hexdigest()[:16]
+            if (json.dumps(conv, sort_keys=True, ensure_ascii=False, default=str) != before
+                    or await self._handoff_committed(conv)):
+                raise ValueError("the conversation changed while the final handoff writer was running")
+            # Keep the stable object held by the station's writer and director.
+            conv.clear()
+            conv.update(cloned)
+            if isinstance(handle_or_stamp, Handle):
+                old_ids = {index: turn["turn_id"] for index, turn in enumerate(original_turns)}
+                new_indexes = {turn["turn_id"]: turn["index"] for turn in final_turns}
+                rolls = []
+                for row in handle_or_stamp.rolls:
+                    index = new_indexes.get(old_ids.get(int(row.get("turn") or 0) - 1))
+                    if index is not None:
+                        rolls.append(dict(row, turn=index + 1))
+                handle_or_stamp.rolls = sorted(rolls, key=lambda row: row["turn"])
+                handle_or_stamp.turns = len(final_turns)
+            self.remember(conv)
+            self.persist(conv)
+            learner = getattr(self, "learning", None)
+            if learner is not None:
+                learner.prepared(conv)
+            with self.lock:
+                self.metrics["handoff_rounds"] = self.metrics.get("handoff_rounds", 0) + 1
+                self.metrics["handoff_changed"] = self.metrics.get("handoff_changed", 0) + int(bool(result.get("changed")))
+            if result.get("recovery") is not None:
+                result["original_turn_ids"] = [turn["turn_id"] for turn in original_turns]
+                result["turn_ids"] = [turn["turn_id"] for turn in final_turns]
+            return dict(result, rows=final_rows, eligible=True,
+                        changed=bool(result.get("changed") or final_rows != original_source_rows),
+                        conversation_stamp=self._recovery_stamp(conv),
+                        recovery_variant=copy.deepcopy(conv.get("dialogue_recovery_variant") or {}),
+                        recovery_preparation=copy.deepcopy(conv.get("dialogue_recovery_preparation") or {}))
+        except Exception as exc:  # No long fallback is returned from an eligible final pass.
+            why = "%s: %s" % (type(exc).__name__, str(exc)[:240])
+            recovery = None
+            if (isinstance(exc, _DialogueRecoveryRefused) and conv is not None
+                    and before == json.dumps(conv, sort_keys=True, ensure_ascii=False, default=str)):
+                recovery = copy.deepcopy(exc.recovery)
+                conv["dialogue_recovery"] = recovery
+                self.remember(conv)
+                self.persist(conv)
+            receipt = self._handoff_receipt(conv, "refused", why)
+            with self.lock:
+                self.metrics["handoff_held"] = self.metrics.get("handoff_held", 0) + 1
+                self.metrics["last_failure"] = "handoff held: " + why
+            self.log(("System 3 held the final exchange: " if recover else
+                      "[s3-flow-open] the final pass did not shape the exchange; it stands as written: ") + why)
+            return {"rows": [], "changed": False, "traces": [receipt],
+                    "status": "refused", "eligible": bool(active_request or conv and conv.get("mode") == "active"),
+                    "why": why, "recovery": recovery,
+                    "deferred": isinstance(exc, _DialogueRecoveryDeferred) or type(exc).__name__ == "WritingDeferred",
+                    "conversation_stamp": self._recovery_stamp(conv)}
+        finally:
+            if acquired:
+                with self.lock:
+                    self._handoff_busy.discard(cid)
 
     # --- [s3-split] THE SPLIT NODE AT THE STATION'S DOORS ---------------------------
     @staticmethod
@@ -2909,9 +3576,8 @@ class System3Runtime:
                     self.metrics["splits"] = self.metrics.get("splits", 0) + 1
                     self.metrics["split_parts"] = self.metrics.get("split_parts", 0) + len(parts)
             if added:
-                conv["timing"]["turn_budget"] = int(conv["timing"].get("turn_budget") or 0) + added
-                if handle.turns:
-                    handle.turns = int(handle.turns) + added
+                conv["timing"]["turn_budget"] = len(conv["turns"])
+                handle.turns = len(conv["turns"])
                 self._flow(conv, "shared a speaker-box monologue out over %d more turn(s)" % added)
         except Exception as exc:  # noqa: BLE001
             self.fail("split passages", exc)
@@ -3237,10 +3903,70 @@ class System3Runtime:
             self.fail("echo cut", exc)
         return cut
 
+    def rewrite_material(self, handle):
+        """Snapshot the same grounded application-feature catalog H3 uses."""
+        if not handle or not handle.active:
+            return
+        inputs=handle.conv["inputs"]
+        if "rewrite_features" in inputs:
+            return
+        inputs["rewrite_features"]=[]
+        pool=getattr(self.host,"h3_feature_pool",None)
+        if callable(pool):
+            try:
+                import h3_slots, h3_overview
+                feats=pool() or {}
+                inputs["rewrite_features"]=[{"id":str(tag),"label":h3_overview.feature_label(feat),
+                        "text":h3_slots.feature(feat)+". "+h3_slots.releaselog(feat),
+                        "source":"H3 tagged release-log catalog"} for tag,feat in feats.items()]
+            except Exception as exc:
+                self.log("RW1 feature catalog unavailable",extra=str(exc)[:200])
+
+    async def diversity_retry(self, handle, ctx, report):
+        """One pre-recording alternate plan, retaining caller/source/continuity."""
+        if not handle or not handle.active or handle.conv.get("diversity_retry"):
+            return False
+        novelty = (report or {}).get("novelty") or {}
+        if novelty.get("ok", True) or not novelty.get("fingerprint"):
+            return False
+        old = handle.conv
+        if not old.get("call_structure"):
+            return False
+        if old.get("bindings"):
+            return False  # Existing takes must retain their recorded plan.
+        conv = system3.new_conversation(copy.deepcopy(old["inputs"]), handle.config,
+                                        old["settings"], seed=str(old["seed"])+"|diversity-retry:1",
+                                        conversation_id=old["identity"]["conversation_id"])
+        conv["identity"]["trace_id"] = old["identity"]["trace_id"]
+        conv["identity"]["revision"] = int(old["identity"].get("revision") or 1)+1
+        conv["inputs"]["diversity_exclude"] = {f:[v["key"]] for f,v in
+                    ((old.get("call_diversity") or {}).get("selections") or {}).items() if v}
+        conv["diversity_retry"] = {"node":"call_diversity_repair","premise_preserved":True,
+                                   "prior_seed":old["seed"],"reason":"stored call similarity",
+                                   "prior_revision":old["identity"].get("revision"),
+                                   "matched":novelty.get("matched"),"similarity":novelty.get("similarity")}
+        conv["decision_events"] = copy.deepcopy(old["decision_events"])
+        for event in conv["decision_events"]:
+            event.setdefault("meta", {}).update(road_roll=True, prior_revision=True)
+        system3.plan_call(conv, handle.config)
+        handle.conv = conv
+        handle.sheet = system3.render_call_sheet(conv)
+        handle.turns = len(conv["turns"])
+        await self._callend_after_plan(handle, ctx)
+        import call_diversity
+        self.rewrite_material(handle)
+        call_diversity.rewrite_request(conv, handle.config, "stored call similarity")
+        self.remember(conv)
+        return True
+
     def repair_clause(self, handle):
         if not handle or not handle.active or not handle.sheet:
             return ""
-        return ("\n\nFOLLOW THIS RUNNING ORDER - the draft skipped it:" + handle.sheet)
+        import call_diversity
+        self.rewrite_material(handle)
+        call_diversity.rewrite_request(handle.conv, handle.config, "previous rejection")
+        return ("\n\nFOLLOW THIS RUNNING ORDER - the draft skipped it:" + handle.sheet +
+                (handle.conv.get("rewrite_request") or {}).get("prompt", ""))
 
     # --- Mode B ------------------------------------------------------------------
     def director(self, handle):
@@ -3250,10 +3976,16 @@ class System3Runtime:
         observed (validated against their intent, the state moved by what
         was actually said), the rest of the plan is decided again from
         there, and the beat writer is handed the new rows."""
-        if (not handle or not handle.active or self.settings.get("generation_mode") != "turn"
-                or handle.conv["identity"]["road_kind"] != "banter"):
+        if not handle or not handle.active:
             return None
         conv = handle.conv
+        graph_road = str((conv.get("graph_structure") or {}).get("road") or "")
+        graph = ((handle.config.get("structure") or {}).get("graph") if graph_road == "banter"
+                 else (system3.road_structure(handle.config, graph_road) or {}).get("graph")) or {}
+        reactive = bool(graph_road and graph.get("reply_roulette", {}).get("enabled", True))
+        if not reactive and (self.settings.get("generation_mode") != "turn"
+                             or conv["identity"]["road_kind"] != "banter"):
+            return None
         seen = {"n": 0}
 
         async def step(made, cursor, rows):
@@ -3270,11 +4002,31 @@ class System3Runtime:
                 self.persist(conv)
                 out = [{"turn": t["index"] + 1, "seat": t["speaker"], "work": system3._row_work(t, conv)}
                        for t in conv["turns"][cursor:]]
+                for row, turn in zip(out, conv["turns"][cursor:]):
+                    if turn.get("reply_to"):
+                        row["reply_target"] = turn["reply_to"]["index"] + 1
+                    row["work"] = re.sub(r"\s*\[reply-target=\d+\]", "", row["work"])
+                handle.sheet = system3.render_sheet(conv)
+                handle.turns = len(conv["turns"])
+                conv["plan"]["sheet"] = handle.sheet
                 return out or rows
             except Exception as exc:  # noqa: BLE001
                 self.fail("turn-by-turn", exc)
                 return rows
+        step.reactive = reactive
         return step
+
+    def chapter_director(self, stamp):
+        """Line chapters use the same observed-word reaction path as banter."""
+        conv = self.recent.get(str((stamp or {}).get("conversation_id") or ""))
+        if not conv or conv.get("mode") != "active" or not conv.get("graph_structure"):
+            return None
+        config = self.config
+        if system3.config_hash(config) != conv.get("config_hash"):
+            config = self.store.config_by_hash(conv.get("config_hash"))
+        if not config:
+            return None
+        return self.director(Handle(self, conv, config, True))
 
     # --- [s3-turnchain] the copy gate, where the written lines are bound -------------
     def turn_gate(self, handle, turns, spoken=None, prepared=False):
@@ -3311,6 +4063,40 @@ class System3Runtime:
         if not run:
             return None
         try:
+            run["rewrite_prepare"] = lambda: self.rewrite_material(handle)
+            run["diversity_config"] = handle.config
+            check = getattr(self.host, "norepeat_text_used", None)
+            if callable(check):
+                cid = handle.conv["identity"]["conversation_id"]
+                def reserved_repeat(text):
+                    import air_norepeat
+                    # Book Time deliberately revisits its exact source across
+                    # separate part CIDs. Only its validated source/protocol
+                    # spans are removed; the remaining discussion still owns
+                    # the original ledger and five-minute reservation checks.
+                    book_material = getattr(self.host, "book_repeat_material", None)
+                    if callable(book_material):
+                        text = book_material(text)
+                    if not str(text or "").strip():
+                        return False
+                    if check(text):
+                        return True
+                    keys = air_norepeat.sentence_keys(text)
+                    full = air_norepeat.line_key(text)
+                    if full:
+                        keys.append(full)
+                    now = time.time()
+                    with self.lock:
+                        reservations = getattr(self, "_caller_line_reservations", {})
+                        reservations = {k:v for k,v in reservations.items() if v[1] > now}
+                        if any(k in reservations and reservations[k][0] != cid for k in keys):
+                            self._caller_line_reservations = reservations
+                            return True
+                        for key in keys:
+                            reservations[key] = (cid, now + 300)
+                        self._caller_line_reservations = reservations
+                    return False
+                run["repeat_check"] = reserved_repeat
             ask = system3.gate_next(handle.conv, run)
             self._gate_flush(handle)
             return dict(ask) if ask else None
@@ -3352,6 +4138,9 @@ class System3Runtime:
                     (", %d written past the end" % c["trimmed"]) if c.get("trimmed") else "",
                     (" - held: " + out["held"][:100]) if out.get("held") else ""))
             self.remember(handle.conv)
+            suggest = getattr(self.host, "orch_s3_caller_diversity_failure", None)
+            if out.get("held") and callable(suggest) and handle.conv.get("call_diversity"):
+                asyncio.get_running_loop().create_task(suggest(copy.deepcopy(handle.conv)))
             return out
         except Exception as exc:  # noqa: BLE001
             self.fail("copy gate", exc)
@@ -3462,7 +4251,12 @@ class System3Runtime:
             return
         conv = handle.conv
         try:
-            self.echo_cut(entry, handle)                                   # [s3-echo] the last gate
+            import handoff_preparation as hp
+            # The final pass now repairs/rejects direction echoes before
+            # recording and certifies these exact words. A later cut would
+            # invalidate the receipt and detach audio from its turn IDs.
+            if not hp.receipt_matches_script(entry):
+                self.echo_cut(entry, handle)                               # legacy unreviewed rows
             turns = self.host.banter_turns(str(entry.get("script") or ""),
                                            str(entry.get("caller_name") or ""),
                                            str(entry.get("caller2_name") or ""))
@@ -3942,6 +4736,9 @@ class System3Runtime:
                     if isinstance(row, dict) and len(str(row.get("text") or "")) > 30:
                         self.recent_air.append(" ".join(str(row["text"]).split())[:600])
             self._paces_from(rows)                                             # [s3-split] each voice's pace
+            learner = getattr(self, "learning", None)
+            if learner is not None:
+                learner.committed(rows)
             links = {}
             for ord_, row in enumerate(rows or []):
                 s3 = row.get("system3") if isinstance(row.get("system3"), dict) else {}
@@ -4661,6 +5458,7 @@ class System3Runtime:
                 "roads": self.roads(),                                           # [s3-roads]
                 "events": self.events_view(),                                    # [s3-live-event]
                 "metrics": m,
+                "shared_learning": self.learning.status() if getattr(self, "learning", None) else None,
                 "capabilities": {
                     "performance": "ES maps to the station's six emotion dimensions, and an ES row's `voice` "
                                    "(tempo, pitch, range, energy, pause, temp) is the station's "
@@ -4709,6 +5507,7 @@ class System3Runtime:
         view["structures"] = structures
         view.setdefault("sfxguy", copy.deepcopy(system3.DEFAULT_SFXGUY))
         view["split"] = system3.split_config(self.config)                        # [s3-split] the section in force
+        view["handoff"] = system3_handoff.config_of(self.config)
         view["blocks"] = system3.block_rules(self.config)                  # [s3-blocks] every rule, defaults included
         return view
 
@@ -4782,8 +5581,11 @@ def install(app, namespace):
     namespace["system3_tint_turns_entry"] = rt.tint_turns_entry
     namespace["system3_repair_roll"] = rt.repair_roll
     namespace["system3_room_allowed"] = rt.room_allowed
+    namespace["system3_diversity_retry"] = rt.diversity_retry
+    namespace["system3_call_source"] = rt.call_source
     namespace["system3_repair_clause"] = rt.repair_clause
     namespace["system3_director"] = rt.director
+    namespace["system3_chapter_director"] = rt.chapter_director
     namespace["system3_bind_entry"] = rt.bind_entry
     namespace["system3_perf_state"] = rt.perf_state
     namespace["system3_perf_voice"] = rt.perf_voice                  # [s3-es-voice]
@@ -4806,6 +5608,7 @@ def install(app, namespace):
     namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_line_chapter"] = rt.line_chapter
     namespace["system3_line_chapter_state"] = rt.line_chapter_state      # [s3-chain]
+    namespace["system3_learning_playback"] = rt.learning_playback
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_segment_block"] = rt.segment_block              # [s3-segment]
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
@@ -4833,6 +5636,13 @@ def install(app, namespace):
     namespace["system3_manager_topic"] = rt.manager_topic              # [s3-mgrtopics]
     namespace["system3_writing_for"] = _S3_WRITE
     namespace["system3_split_line"] = rt.split_line                    # [s3-split]
+    namespace["system3_handoff_exchange"] = rt.handoff_exchange
+    namespace["system3_recovery_bind_entry"] = rt.recovery_bind_entry
+    namespace["system3_flow_bind_entry"] = rt.flow_bind_entry          # [s3-flow-open]
+    namespace["system3_recovery_reject"] = rt.recovery_reject
+    namespace["system3_handoff_candidate_status"] = rt.handoff_candidate_status
+    namespace["system3_handoff_policy_current"] = rt.handoff_policy_current
+    namespace["system3_handoff_turn_ready"] = rt.handoff_turn_ready
     namespace["system3_note_pace"] = rt.note_pace
     namespace["system3_injected_node"] = rt.injected_node          # [s3-inject] the honest forced card
     namespace["_system3"] = lambda: rt
@@ -4895,6 +5705,11 @@ def install(app, namespace):
         out = rt.status()
         out["store"] = await rt.read(rt.store.counts)
         return out
+
+    @app.get("/api/system3/learning")
+    async def learning_status(authorization: str | None = Header(default=None)):
+        host.require_read_auth(authorization)
+        return rt.learning.status()
 
     # [roll-override] the marquee's dice, the roulette popup and the entry screen
     def _entry_find(table_id, item_id, category_id=""):
@@ -5277,6 +6092,14 @@ def install(app, namespace):
             config = copy.deepcopy(rt.config)
             config["split"] = split
             return {"hash": await save_config(config, "split section"), "split": split}
+        if name == "handoff":
+            try:
+                handoff = system3_handoff.validate_config(body_json(await request.body()))
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(400, str(exc)) from exc
+            config = copy.deepcopy(rt.config)
+            config["handoff"] = handoff
+            return {"hash": await save_config(config, "handoff section"), "handoff": handoff}
         if name not in ("speakerbox", "sfx", "personalities", "sfxguy", "blocks"):   # [s3-blocks]
             raise HTTPException(404, "no section %s" % name)
         raw = body_json(await request.body())
@@ -5649,7 +6472,7 @@ def install(app, namespace):
 
     @app.get("/system3/{name}")
     async def asset(name: str):
-        if name not in ("system3.js", "system3.css"):
+        if name not in ("system3.js", "system3.css", "system3-message-tile.js", "system3-message-tile.css"):
             raise HTTPException(404, "Unknown asset")
         # Revalidated on every load (the ETag makes that a 304): the Script
         # tab imports these under a fixed ?v= that lives in the APK, so a

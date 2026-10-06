@@ -38,6 +38,7 @@ class CamRelayTest {
         val rtpOut = DatagramSocket(0, lo).also { closers.add(it) }
         val seen = CopyOnWriteArrayList<String>()
         val transports = CopyOnWriteArrayList<String>()
+        val keepaliveSessions = CopyOnWriteArrayList<String>()
         val rrs = AtomicInteger(0)
         @Volatile var clientPort = 0
         val base get() = "rtsp://127.0.0.1:${server.localPort}/live/"
@@ -75,6 +76,9 @@ class CamRelayTest {
                 val m = u.m
                 seen.add(m.start)
                 val cseq = m.header("CSeq") ?: "0"
+                if (m.method == "OPTIONS" && cseq.toInt() >= 1_000_000_000) {
+                    keepaliveSessions.add(m.header("Session") ?: "")
+                }
                 when (m.method) {
                     "DESCRIBE" -> {
                         val sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=control:${base}track1\r\n"
@@ -111,10 +115,11 @@ class CamRelayTest {
         }
     }
 
-    private fun relayFor(cam: Camera, udp: Boolean = true): CamRelay =
+    private fun relayFor(cam: Camera, udp: Boolean = true, sessionKeepalive: Boolean = false): CamRelay =
         CamRelay(CamRelay.Plain, lo, rtspPort = 0.freePort(), httpPort = 0.freePort(),
             cameraHost = "127.0.0.1", cameraRtspPort = cam.server.localPort,
-            cameraHttpPort = cam.http.localPort, udpUpstream = udp).also { it.start(); closers.add(it) }
+            cameraHttpPort = cam.http.localPort, udpUpstream = udp,
+            sessionKeepalive = sessionKeepalive).also { it.start(); closers.add(it) }
 
     private fun Int.freePort(): Int = ServerSocket(0, 1, lo).use { it.localPort }
 
@@ -134,7 +139,7 @@ class CamRelayTest {
 
     @Test fun interleavedStationUdpCameraAndEveryAddressReAimed() {
         val cam = Camera()
-        val relay = relayFor(cam)
+        val relay = relayFor(cam, sessionKeepalive = true)
         val st = Station(relay.rtspPort)
         val url = "rtsp://127.0.0.1:${relay.rtspPort}/live"
         val d = st.ask("DESCRIBE", url)
@@ -159,8 +164,27 @@ class CamRelayTest {
         assertEquals("udp-upstream", relay.lastMode)
         // and the relay reports to the camera as its UDP client would
         val deadline = System.currentTimeMillis() + CamRelay.RR_EVERY_MS + 3000
-        while (cam.rrs.get() == 0 && System.currentTimeMillis() < deadline) Thread.sleep(100)
+        while ((cam.rrs.get() == 0 || !cam.keepaliveSessions.contains("42")) &&
+            System.currentTimeMillis() < deadline) Thread.sleep(100)
         assertTrue("an RTCP RR reached the camera", cam.rrs.get() > 0)
+        assertTrue("relay maintains the camera's session independently", cam.keepaliveSessions.contains("42"))
+        val next = st.ask("OPTIONS", url, "Session: 42\r\n")
+        assertEquals(st.cseq.toString(), next.header("CSeq"))
+    }
+
+    @Test fun defaultH88SessionDoesNotInjectExtensionKeepalives() {
+        val cam = Camera()
+        val relay = relayFor(cam)
+        val st = Station(relay.rtspPort)
+        closers.add(st.s)
+        val url = "rtsp://127.0.0.1:${relay.rtspPort}/live"
+        st.ask("SETUP", "$url/track1", "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+        st.ask("PLAY", url, "Session: 42\r\n")
+        Thread.sleep(11_000)
+        assertTrue("standard receiver reports remain active", cam.rrs.get() > 0)
+        assertTrue("H88 must not receive unsolicited extension OPTIONS", cam.keepaliveSessions.isEmpty())
+        val reply = st.ask("OPTIONS", url, "Session: 42\r\n")
+        assertEquals(st.cseq.toString(), reply.header("CSeq"))
     }
 
     @Test fun aCameraThatRefusesUdpIsAskedAgainAsTheStationAsked() {

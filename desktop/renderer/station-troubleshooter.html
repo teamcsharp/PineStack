@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; object-src 'none'">
+<title>Pine station troubleshooting</title><link rel="stylesheet" href="station-troubleshooter.css"></head>
+<body><header><h1>Troubleshoot station</h1><p>Check the station or repair the part that needs help. This window stays above your other apps.</p></header>
+<nav aria-label="Troubleshooting actions">
+<button data-action="playback">Resolve playback + restore DJs</button>
+<button data-action="check">Check everything</button><button data-action="all">Check and repair everything</button>
+<button data-action="audio">Restore DJ audio</button><button data-action="broadcast">Repair broadcast delivery</button>
+<button data-action="camera">Reconnect Pine Cam + PiP</button><button data-action="tablet">Reconnect Pine Tab + display</button>
+<button data-action="reload">Reload app display</button><button data-action="show">Show Pine window</button>
+</nav><p class="help">Repairs run step by step and report what changed. Camera and tablet checks include steps you can take if a device needs power or Wi-Fi.</p>
+<p id="status" role="status">Ready to check the station</p><main id="results" aria-label="Troubleshooting results"></main>
+<script src="station-troubleshooter.js"></script></body></html>

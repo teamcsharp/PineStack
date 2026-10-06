@@ -1,0 +1,756 @@
+{
+  "origin": {
+    "nodes": [
+      {
+        "node": "conversation",
+        "label": "System 3 conversation",
+        "conversation_id": "621661915dd64452",
+        "turn_id": "621661915dd64452:t00",
+        "mode": "active",
+        "decisions": [
+          "621661915dd64452:0069",
+          "621661915dd64452:0070",
+          "621661915dd64452:0071",
+          "621661915dd64452:0072",
+          "621661915dd64452:0073",
+          "621661915dd64452:0074",
+          "621661915dd64452:0076"
+        ],
+        "turn_key": "621661915dd64452|621661915dd64452:t00"
+      }
+    ]
+  },
+  "conversation": {
+    "turns": [
+      {
+        "turn_id": "621661915dd64452:t00",
+        "index": 0
+      },
+      {
+        "turn_id": "621661915dd64452:t01",
+        "index": 1
+      },
+      {
+        "turn_id": "621661915dd64452:t02",
+        "index": 2
+      },
+      {
+        "turn_id": "621661915dd64452:t03",
+        "index": 3
+      },
+      {
+        "turn_id": "621661915dd64452:t04",
+        "index": 4
+      },
+      {
+        "turn_id": "621661915dd64452:t05",
+        "index": 5
+      },
+      {
+        "turn_id": "621661915dd64452:t06",
+        "index": 6
+      },
+      {
+        "turn_id": "621661915dd64452:t07",
+        "index": 7
+      },
+      {
+        "turn_id": "621661915dd64452:t08",
+        "index": 8
+      },
+      {
+        "turn_id": "621661915dd64452:t09",
+        "index": 9
+      },
+      {
+        "turn_id": "621661915dd64452:t10",
+        "index": 10
+      },
+      {
+        "turn_id": "621661915dd64452:t11",
+        "index": 11
+      },
+      {
+        "turn_id": "621661915dd64452:t12",
+        "index": 12
+      },
+      {
+        "turn_id": "621661915dd64452:t13",
+        "index": 13
+      },
+      {
+        "turn_id": "621661915dd64452:t14",
+        "index": 14
+      },
+      {
+        "turn_id": "621661915dd64452:t15",
+        "index": 15
+      },
+      {
+        "turn_id": "621661915dd64452:t16",
+        "index": 16
+      },
+      {
+        "turn_id": "621661915dd64452:t17",
+        "index": 17
+      },
+      {
+        "turn_id": "621661915dd64452:t18",
+        "index": 18
+      },
+      {
+        "turn_id": "621661915dd64452:t19",
+        "index": 19
+      },
+      {
+        "turn_id": "621661915dd64452:t20",
+        "index": 20
+      },
+      {
+        "turn_id": "621661915dd64452:t21",
+        "index": 21
+      },
+      {
+        "turn_id": "621661915dd64452:t22",
+        "index": 22
+      },
+      {
+        "turn_id": "621661915dd64452:t23",
+        "index": 23
+      },
+      {
+        "turn_id": "621661915dd64452:t24",
+        "index": 24
+      },
+      {
+        "turn_id": "621661915dd64452:t25",
+        "index": 25
+      }
+    ],
+    "decision_events": [
+      {
+        "schema": "system3.decision-event/1",
+        "event_id": "621661915dd64452:0000",
+        "seq": 0,
+        "conversation_id": "621661915dd64452",
+        "trace_id": "s3-621661915dd64452",
+        "turn_id": "",
+        "turn_index": -1,
+        "at": 1791018508.644797,
+        "family": "STATION",
+        "stages": [
+          {
+            "stage": "item",
+            "draw": {
+              "u": 0.689493,
+              "dice": 69
+            },
+            "selected": "Yeah. We didn't did twenty twenty five years of just getting taken care of or or a little older and that's what ends up happening.",
+            "selected_index": 1,
+            "of": 3,
+            "candidates": [
+              {
+                "id": "0",
+                "label": "Yeah. We didn't did twenty twenty five years of just getting taken care of or or",
+                "base": 1,
+                "weight": 1,
+                "p": 0.3333,
+                "why": []
+              },
+              {
+                "id": "1",
+                "label": "So i was gonna ask you about her her black people food stamps, but you kind of y",
+                "base": 1,
+                "weight": 1,
+                "p": 0.3333,
+                "why": []
+              },
+              {
+                "id": "2",
+                "label": "Food stamp hurts us. Food stamp hurts us.",
+                "base": 1,
+                "weight": 1,
+                "p": 0.3333,
+                "why": []
+              }
+            ]
+          }
+        ],
+        "rng": {
+          "u": 0.689493,
+          "dice": 69,
+          "label": "speakbox.swath_line"
+        },
+        "selected": {
+          "id": "1",
+          "label": "which line the swath rolls on to (the next is likeliest): Yeah. We didn't did twenty twenty five years of just getting taken care of or or a little older and that's what ends up happening.",
+          "key": "speakbox.swath_line",
+          "index": 1,
+          "of": 3
+        },
+        "state_before": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "state_after": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "links": {
+          "prompt_id": "",
+          "script_id": "",
+          "render_id": "",
+          "delivery_id": ""
+        },
+        "meta": {
+          "key": "speakbox.swath_line",
+          "road_roll": true,
+          "why": "the station road rolled this before the round was planned; its odds and options are on the desk (STATION1 / POOLS1)"
+        },
+        "config_hash": "8b16ed1583b8a1f8",
+        "engine": "system3-engine/6",
+        "cursor": 7727369
+      },
+      {
+        "schema": "system3.decision-event/1",
+        "event_id": "621661915dd64452:0001",
+        "seq": 1,
+        "conversation_id": "621661915dd64452",
+        "trace_id": "s3-621661915dd64452",
+        "turn_id": "",
+        "turn_index": -1,
+        "at": 1791018508.6448154,
+        "family": "STATION",
+        "stages": [
+          {
+            "stage": "item",
+            "draw": {
+              "u": 0.45254,
+              "dice": 46
+            },
+            "selected": "mawt.md",
+            "selected_index": 191,
+            "of": 421,
+            "candidates": [
+              {
+                "id": "0",
+                "label": "tv9.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "1",
+                "label": "clb2.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "2",
+                "label": "tv11.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "3",
+                "label": "gc5.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "4",
+                "label": "tlr.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "5",
+                "label": "2d1.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "6",
+                "label": "css3.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "7",
+                "label": "rl8.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "8",
+                "label": "koh5.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "9",
+                "label": "tv3.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "10",
+                "label": "mgs2.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "11",
+                "label": "comp3 (2).md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              }
+            ]
+          }
+        ],
+        "rng": {
+          "u": 0.45254,
+          "dice": 46,
+          "label": "speakbox.doc"
+        },
+        "selected": {
+          "id": "191",
+          "label": "which document the swath comes from (weighted, past the rotation): mawt.md",
+          "key": "speakbox.doc",
+          "index": 191,
+          "of": 421
+        },
+        "state_before": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "state_after": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "links": {
+          "prompt_id": "",
+          "script_id": "",
+          "render_id": "",
+          "delivery_id": ""
+        },
+        "meta": {
+          "key": "speakbox.doc",
+          "road_roll": true,
+          "why": "the station road rolled this before the round was planned; its odds and options are on the desk (STATION1 / POOLS1)"
+        },
+        "config_hash": "8b16ed1583b8a1f8",
+        "engine": "system3-engine/6",
+        "cursor": 7727370
+      },
+      {
+        "schema": "system3.decision-event/1",
+        "event_id": "621661915dd64452:0002",
+        "seq": 2,
+        "conversation_id": "621661915dd64452",
+        "trace_id": "s3-621661915dd64452",
+        "turn_id": "",
+        "turn_index": -1,
+        "at": 1791018508.6448236,
+        "family": "STATION",
+        "stages": [
+          {
+            "stage": "dice",
+            "draw": {
+              "u": 0.954311,
+              "dice": 96
+            },
+            "threshold": 0.2885,
+            "rule": "a hit when the die lands under 29% (follows the desk dial box depth (#895))",
+            "selected": "MISS"
+          }
+        ],
+        "rng": {
+          "u": 0.954311,
+          "dice": 96,
+          "label": "speakbox.archive_dive"
+        },
+        "selected": {
+          "id": "MISS",
+          "label": "the swath dives into the archive: an old document leads (#478): no",
+          "key": "speakbox.archive_dive"
+        },
+        "state_before": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "state_after": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "links": {
+          "prompt_id": "",
+          "script_id": "",
+          "render_id": "",
+          "delivery_id": ""
+        },
+        "meta": {
+          "key": "speakbox.archive_dive",
+          "road_roll": true,
+          "why": "the station road rolled this before the round was planned; its odds and options are on the desk (STATION1 / POOLS1)"
+        },
+        "config_hash": "8b16ed1583b8a1f8",
+        "engine": "system3-engine/6",
+        "cursor": 7727371
+      },
+      {
+        "schema": "system3.decision-event/1",
+        "event_id": "621661915dd64452:0003",
+        "seq": 3,
+        "conversation_id": "621661915dd64452",
+        "trace_id": "s3-621661915dd64452",
+        "turn_id": "",
+        "turn_index": -1,
+        "at": 1791018508.6448293,
+        "family": "STATION",
+        "stages": [
+          {
+            "stage": "dice",
+            "draw": {
+              "u": 0.377079,
+              "dice": 38
+            },
+            "threshold": 0.32,
+            "rule": "a hit when the die lands under 32% (the desk's odds (STATION1))",
+            "selected": "MISS"
+          }
+        ],
+        "rng": {
+          "u": 0.377079,
+          "dice": 38,
+          "label": "speakbox.newest_dive"
+        },
+        "selected": {
+          "id": "MISS",
+          "label": "a newly added document leads (#547): no",
+          "key": "speakbox.newest_dive"
+        },
+        "state_before": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "state_after": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "links": {
+          "prompt_id": "",
+          "script_id": "",
+          "render_id": "",
+          "delivery_id": ""
+        },
+        "meta": {
+          "key": "speakbox.newest_dive",
+          "road_roll": true,
+          "why": "the station road rolled this before the round was planned; its odds and options are on the desk (STATION1 / POOLS1)"
+        },
+        "config_hash": "8b16ed1583b8a1f8",
+        "engine": "system3-engine/6",
+        "cursor": 7727372
+      },
+      {
+        "schema": "system3.decision-event/1",
+        "event_id": "621661915dd64452:0004",
+        "seq": 4,
+        "conversation_id": "621661915dd64452",
+        "trace_id": "s3-621661915dd64452",
+        "turn_id": "",
+        "turn_index": -1,
+        "at": 1791018508.6448433,
+        "family": "STATION",
+        "stages": [
+          {
+            "stage": "item",
+            "draw": {
+              "u": 0.893794,
+              "dice": 90
+            },
+            "selected": "/app/data/speakbox/tr3.md",
+            "selected_index": 380,
+            "of": 425,
+            "candidates": [
+              {
+                "id": "0",
+                "label": "/app/data/speakbox/11d.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "1",
+                "label": "/app/data/speakbox/12doc.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "2",
+                "label": "/app/data/speakbox/2.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "3",
+                "label": "/app/data/speakbox/206a.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "4",
+                "label": "/app/data/speakbox/211a.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "5",
+                "label": "/app/data/speakbox/256.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "6",
+                "label": "/app/data/speakbox/2d.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "7",
+                "label": "/app/data/speakbox/2d1.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "8",
+                "label": "/app/data/speakbox/304.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "9",
+                "label": "/app/data/speakbox/322a.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "10",
+                "label": "/app/data/speakbox/42a.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              },
+              {
+                "id": "11",
+                "label": "/app/data/speakbox/43d.md",
+                "base": 1,
+                "weight": 1,
+                "p": 0.0024,
+                "why": []
+              }
+            ]
+          }
+        ],
+        "rng": {
+          "u": 0.893794,
+          "dice": 90,
+          "label": "speakbox.next_docs"
+        },
+        "selected": {
+          "id": "380",
+          "label": "the documents tried next if the drawn one is used up: /app/data/speakbox/tr3.md",
+          "key": "speakbox.next_docs",
+          "index": 380,
+          "of": 425
+        },
+        "state_before": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "state_after": {
+          "tension": 0.35,
+          "agreement": 0.5,
+          "energy": 0.5,
+          "novelty": 0.5,
+          "repetition_risk": 0,
+          "closure_pressure": 0,
+          "topic_exhaustion": 0,
+          "phase": "OPEN",
+          "initiator": "A",
+          "unresolved": 0,
+          "speaker": "A",
+          "speaker_emotion": "level",
+          "speaker_intensity": 0,
+          "speaker_position": 0
+        },
+        "links": {
+          "prompt_id": "",
+          "script_id": "",
+          "render_id": "",
+          "delivery_id": ""
+        },
+        "meta": {
+          "key": "speakbox.next_docs",
+          "road_roll": true,
+          "why": "the station road rolled this before the round was planned; its odds and options are on the desk (STATION1 / POOLS1)"
+        },
+        "config_hash": "8b16ed1583b8a1f8",
+        "engine": "system3-engine/6",
+        "cursor": 7727373
+      }
+    ]
+  }
+}

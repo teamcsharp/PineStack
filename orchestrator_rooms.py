@@ -593,7 +593,22 @@ def _pantry(app: Any, now: float, flow: list[dict[str, Any]],
         who = str(row.get("who") or row.get("kind") or "").strip()
         if who:
             by_who[who] = by_who.get(who, 0) + 1
-    out["stuck"] = len(rows)
+    out["cached"] = len(rows)
+    out["stuck"] = None
+    out["holding_door"] = "cached audio is inventory; a lifecycle item is work"
+    lifecycle = _get(app, "_PANTRY_LIFECYCLE")
+    if lifecycle is not None:
+        census = lifecycle.snapshot()
+        states = census.get("states") or {}
+        out["stuck"] = int(states.get("blocked") or 0)
+        out["lifecycle_states"] = states
+        out["lifecycle_policy"] = census.get("policy")
+        out["lifecycle_counts"] = census.get("counts")
+        oldest = float(census.get("oldest_blocked_seconds") or 0)
+        out["why"] = census.get("say", "")
+    else:
+        oldest = 0
+        out["ledger_why"] = "Lifecycle work is unmeasured; cached clips are not a stuck-work count."
     out["in"] = fresh
     if journal:
         out["out"] = _flow_in_window(flow, "publish", now)

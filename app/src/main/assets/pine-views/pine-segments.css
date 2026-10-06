@@ -256,3 +256,17 @@ textarea.pseg-topic-in { resize: vertical; min-height: 44px; }
   background: #12202e; color: #dbe6f0; cursor: pointer; }
 .pseg-topic-save { border-color: #8cd4c0; color: #8cd4c0; }
 .pseg-topic-save:disabled { opacity: .5; }
+
+/* Dynamic content templates share the segment desk on desktop and tablet. */
+.pseg-dynamic-controls, .pseg-dynamic-bar { display:flex; flex-wrap:wrap; gap:6px; }
+.pseg-field-label { display:block; color:#91a8b8; font-size:11px; margin:8px 0; }
+.pseg-field-label .pseg-field, .pseg-field-label .pseg-text { display:block; margin-top:4px; }
+.pseg-field { box-sizing:border-box; max-width:100%; min-width:0; width:100%; padding:7px 8px; border:1px solid #294250; border-radius:5px; background:#0a1219; color:#dbe6f0; font:11px/1.4 system-ui; }
+.pseg-dynamic-controls .pseg-field { flex:1 1 150px; width:auto; }
+.pseg-check { display:flex; align-items:center; gap:7px; }
+.pseg-dynamic-preview { margin-top:10px; max-width:100%; }
+.pseg-preview-text { white-space:pre-wrap; overflow-wrap:anywhere; font:11px/1.5 ui-monospace,monospace; color:#c4d4df; max-height:360px; overflow:auto; background:#091117; padding:9px; border-radius:5px; }
+.pseg-cuts { padding-left:22px; font:11px/1.5 system-ui; color:#c4d4df; max-height:300px; overflow:auto; overflow-wrap:anywhere; }
+.pseg-source-details { font-size:11px; color:#91a8b8; }
+.pseg-dynamic-preview audio { width:100%; margin-top:8px; }
+.pseg-schedule-dynamic { padding:8px 0 12px; }

@@ -62,7 +62,7 @@ class PineStreamPush(
         private const val FAIL_LIMIT = 5
     }
 
-    @Volatile private var fps = 2
+    @Volatile private var fps = 30
     @Volatile private var width = 640
     @Volatile private var quality = 60
     @Volatile private var veiled = false
@@ -89,7 +89,7 @@ class PineStreamPush(
     @Synchronized
     fun run(opts: JSONObject?) {
         if (opts != null) {
-            fps = opts.optInt("fps", fps).coerceIn(1, 5)
+            fps = opts.optInt("fps", fps).coerceIn(1, 60)
             width = opts.optInt("width", width).coerceIn(320, 960)
             quality = opts.optInt("quality", quality).coerceIn(30, 90)
             veiled = opts.optBoolean("private", false)
@@ -160,11 +160,11 @@ class PineStreamPush(
                 }
                 if (body.isNotEmpty()) sent += 1
                 /* the station is the master of the rate too */
-                fps = answer.optInt("fps", fps).coerceIn(1, 5)
+                fps = answer.optInt("fps", fps).coerceIn(1, 60)
                 width = answer.optInt("width", width).coerceIn(320, 960)
                 quality = answer.optInt("quality", quality).coerceIn(30, 90)
                 val every = 1000L / fps
-                delay((every - (SystemClock.elapsedRealtime() - t0)).coerceAtLeast(50L))
+                delay((every - (SystemClock.elapsedRealtime() - t0)).coerceAtLeast(1L))
             }
         } catch (err: CancellationException) {
             reason = if (reason == "running") "stopped" else reason
@@ -220,7 +220,7 @@ class PineStreamPush(
         val image = try { r.acquireLatestImage() } catch (err: Exception) { null } ?: return
         try {
             val now = SystemClock.elapsedRealtime()
-            if (now - lastShotAt < 1000L / fps - 40L) return
+            if (now - lastShotAt < 1000L / fps) return
             lastShotAt = now
             val plane = image.planes[0]
             val pixelStride = plane.pixelStride

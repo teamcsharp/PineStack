@@ -83,6 +83,7 @@ RRF_K = 60.0               # reciprocal-rank fusion constant
 WORD_DOCS = 12             # documents the lexical half will open
 
 SHARD_CACHE = 150          # documents whose chunk text is held in memory
+MATRIX_CACHE = 64          # one mapped file descriptor per cached document
 
 _LOCK = RLock()
 _INDEX: dict[str, Any] | None = None
@@ -91,7 +92,9 @@ _INDEX: dict[str, Any] | None = None
 # a shelf of three hundred transcripts it would grow without a bound. This box
 # has been taken down by memory pressure before (#1156), so it is capped.
 _SHARDS: "OrderedDict[str, Any]" = OrderedDict()   # slug -> (stamp, rows)
-_MATS: dict[str, Any] = {}            # slug -> (stamp, mmap matrix)
+# Matrix mappings also own file descriptors. Bound cache ownership separately
+# from the text LRU; callers keep any borrowed mapping alive after eviction.
+_MATS: "OrderedDict[str, Any]" = OrderedDict()  # slug -> ((path, stamp), matrix)
 _DF_CACHE: dict[str, Any] = {}        # derived, keyed by which docs are ready
 _VOCAB_CACHE: dict[str, Any] = {}
 _WORK: dict[str, Any] = {             # what the console tails
@@ -322,26 +325,55 @@ def shard_forget(slug: str) -> None:
 
 
 def shard_matrix(slug: str) -> Any:
-    """Just the vectors, memory-mapped. Costs almost nothing to open, which
-    is the point: ranking touches EVERY document on the shelf, so it must not
-    also parse every document's text to do it."""
+    """Borrow one document's mapped matrix from a bounded descriptor cache.
+
+    Eviction drops only cache ownership. Closing mat._mmap explicitly
+    would invalidate a concurrent caller or NumPy view that still uses it.
+    """
     npy, _jsl = shard_paths(slug)
     try:
-        stamp = npy.stat().st_mtime_ns
+        stamp = (str(npy.absolute()), npy.stat().st_mtime_ns)
     except OSError:
         return None
     with _LOCK:
         held = _MATS.get(slug)
         if held and held[0] == stamp:
+            _MATS.move_to_end(slug)
             return held[1]
+        initial_held = held
     try:
         mat = _numpy().load(npy, mmap_mode="r")
     except (OSError, ValueError):
         return None
+    # Keep filesystem I/O outside the shared library lock.
+    try:
+        current_stamp = npy.stat().st_mtime_ns
+    except OSError:
+        current_stamp = None
     with _LOCK:
+        # Two searches can miss together. Reuse the first published matrix
+        # rather than retaining a second mapping for the same file/version.
+        held = _MATS.get(slug)
+        if held and held[0] == stamp:
+            _MATS.move_to_end(slug)
+            return held[1]
+        # A newer/different entry can arrive after the outside-lock stat.
+        # Keep its ownership instead of overwriting it with this snapshot.
+        if held is not initial_held:
+            return mat
+        # A replaced shard or changed data directory must not publish an old
+        # in-flight load as the current cache entry. Its caller may still use
+        # that snapshot safely, without giving the cache ownership of it.
+        current_npy, _current_jsl = shard_paths(slug)
+        if str(current_npy.absolute()) != stamp[0]:
+            return mat
+        if current_stamp != stamp[1]:
+            return mat
         _MATS[slug] = (stamp, mat)
+        _MATS.move_to_end(slug)
+        while len(_MATS) > MATRIX_CACHE:
+            _MATS.popitem(last=False)
     return mat
-
 
 def shard_rows(slug: str) -> list[dict[str, Any]] | None:
     """The chunk text beside those vectors. Parsed only for a document that
@@ -554,7 +586,8 @@ def scan(folders: Iterable[str | Path]) -> dict[str, dict[str, Any]]:
     for folder in folders:
         if not str(folder or "").strip():
             continue
-        for path in extract.scan_folder(folder):
+        book_shelf = str(folder).rstrip("/\\").replace("\\", "/").split("/")[-1].casefold() in {"epub", "pdf"}
+        for path in extract.scan_folder(folder, depth=12 if book_shelf else 1, cap=100000 if book_shelf else 4000):
             try:
                 st = path.stat()
             except OSError:
@@ -603,7 +636,16 @@ def _fresh(row: dict[str, Any], seen: dict[str, Any]) -> bool:
 
 def plan(folders: Iterable[str | Path]) -> dict[str, Any]:
     """Reconcile the shelf with the index: what to read, what to forget."""
+    folders = list(folders)
     seen = scan(folders)
+    configured = {str(folder) for folder in folders}
+    available = set()
+    for folder in folders:
+        try:
+            next(Path(folder).iterdir(), None)
+            available.add(str(folder))
+        except OSError:
+            pass
     with _LOCK:
         held = index()["docs"]
         by_path = {r.get("path"): (slug, r) for slug, r in held.items()}
@@ -627,8 +669,43 @@ def plan(folders: Iterable[str | Path]) -> dict[str, Any]:
                             "state": "queued", "note": ""})
                 todo.append(slug)
         gone = [slug for slug, row in held.items()
-                if row.get("path") not in seen]
+                if row.get("path") not in seen
+                and (row.get("folder") not in configured or row.get("folder") in available)]
     return {"todo": todo, "gone": gone, "seen": len(seen)}
+
+
+
+def discover(folders: Iterable[str | Path]) -> dict[str, Any]:
+    """Queue new or changed files without interrupting an active extraction.
+
+    This is separate from ingestion: a multi-hour embedding pass must not
+    prevent discovery, and an unavailable share is never evidence of deletion.
+    """
+    seen = scan(folders)
+    queued = []
+    with _LOCK:
+        held = index()["docs"]
+        by_path = {r.get("path"): r for r in held.values()}
+        for path, stat in seen.items():
+            row = by_path.get(path)
+            if row is None:
+                slug = slug_for(path)
+                row = {"slug": slug, "path": path, "name": stat["name"],
+                       "folder": stat["folder"], "title": extract.nice_title(path),
+                       "kind": extract.doc_kind(path), "state": "queued",
+                       "size": stat["size"], "mtime": stat["mtime"],
+                       "pages": 0, "chunks": 0, "chars": 0, "at": 0.0,
+                       "note": "", "sha": ""}
+                held[slug] = row
+                queued.append(slug)
+            elif row.get("state") not in ("reading", "embedding") and (
+                    int(row.get("size") or -1) != stat["size"]
+                    or int(row.get("mtime") or -1) != stat["mtime"]):
+                row.update(size=stat["size"], mtime=stat["mtime"], state="queued", note="")
+                queued.append(row["slug"])
+    if queued:
+        _write_index()
+    return {"queued": queued, "seen": len(seen), "at": time.time()}
 
 
 def forget(slug: str) -> None:
@@ -778,17 +855,26 @@ async def ingest_pass(folders: Iterable[str | Path],
                       "done": 0, "total": 0})
     _BURST = bool(burst)
     try:
-        for slug in todo_plan["todo"]:
+        pending = list(todo_plan["todo"])
+        visited = set(pending)
+        while pending:
+            slug = pending.pop(0)
             if over:
                 row = doc_row(slug)
                 if row is not None:
-                    row.update({"state": "skipped",
-                                "note": "the shelf is full "
+                    row.update({"state": "queued",
+                                "note": "waiting for vector shelf capacity "
                                         f"({chunk_total()} chunks)"})
-                continue
+                break
             await ingest_one(slug)
             read += 1
             over = chunk_total() > VEC_MAX
+            # Discovery may add files while this pass is embedding a large book.
+            with _LOCK:
+                arrivals = [key for key, row in index()["docs"].items()
+                            if row.get("state") == "queued" and key not in visited]
+            pending.extend(arrivals)
+            visited.update(arrivals)
     finally:
         _BURST = False
         with _LOCK:
@@ -961,7 +1047,7 @@ def _word_rows(query: str, want: int,
 
 
 async def search(query: str, k: int = 6, per_doc: int = 2,
-                 gate: bool = True) -> list[dict[str, Any]]:
+                 gate: bool = True, scope_slugs: set[str] | None = None) -> list[dict[str, Any]]:
     """The k passages most likely to answer `query`, best first.
 
     Hybrid on purpose. The vectors find the passage that MEANS the right
@@ -986,7 +1072,8 @@ async def search(query: str, k: int = 6, per_doc: int = 2,
         return []
 
     ready = [slug for slug, row in index().get("docs", {}).items()
-             if row.get("state") == "ready" and row.get("chunks")]
+             if row.get("state") == "ready" and row.get("chunks")
+             and (scope_slugs is None or slug in scope_slugs)]
     named = named_document(query)
     opening = {slug for slug in ready if is_reference(slug) or slug == named}
     rest = {slug for slug in ready if slug not in opening}

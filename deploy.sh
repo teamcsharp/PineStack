@@ -43,8 +43,8 @@ DEV=${PINE_TAB:-10.89.1.154:5555}
 PKG=com.pinebox.kiosk
 MODE=${1:-}
 case "$MODE" in
-  ''|--no-build|--build-only) ;;
-  *) echo "usage: $0 [--no-build|--build-only]" >&2; exit 2 ;;
+  ''|--no-build|--build-only|--prepare|--install-only) ;;
+  *) echo "usage: $0 [--no-build|--build-only|--prepare|--install-only]" >&2; exit 2 ;;
 esac
 
 # JAVA. apksigner is a java program and Git Bash inherits no JAVA_HOME here,
@@ -64,7 +64,7 @@ ANDROID_SDK_ROOT=$SDK
 export ANDROID_HOME ANDROID_SDK_ROOT
 
 DEBUG="$HERE/app/build/outputs/apk/debug/app-debug.apk"
-SIGNED="$HERE/app/build/outputs/apk/debug/app-platform.apk"
+SIGNED=${PINE_PREPARED_APK:-$HERE/app/build/outputs/apk/debug/app-platform.apk}
 # The platform key is never in the checkout on the share: keys/ is gitignored and the
 # repo is public. It lives on the build PC, so look there when the checkout has none
 # (PINE_PLATFORM_KEYS overrides both). The desk's tablet button runs this script from
@@ -83,6 +83,7 @@ if [ "$MODE" != "--build-only" ]; then
   [ -f "$KEY" ] || { echo "no platform key at $KEY - the jack cannot work without it"; exit 1; }
 fi
 
+if [ "$MODE" != "--install-only" ]; then
 # The renderer is the official copy of every shared tablet view. The APK
 # carries the video controller twice because the panel and sampler are
 # separate injected pages; silently building any stale view recreates bugs
@@ -223,6 +224,19 @@ rm -f "$SIGNED"
 "$TOOLS/zipalign.exe" -p -f 4 "$DEBUG" "$SIGNED"
 "$TOOLS/apksigner.bat" sign --key "$KEY" --cert "$CERT" \
   --v1-signing-enabled true --v2-signing-enabled true "$SIGNED"
+
+# Preparation finishes with a verified, signed APK; the second tap installs it.
+if [ "$MODE" = "--prepare" ]; then
+  say "verifying prepared APK signature"
+  GOT=$("$TOOLS/apksigner.bat" verify --print-certs "$SIGNED" | sed -n 's/.*SHA-256 digest: *//p' | head -1)
+  [ "$GOT" = c8a2e9bccf597c2fb6dc66bee293fc13f2fc47ec77bc6b2b0d52c11f51192ab8 ] || {
+    echo "REFUSING: prepared APK is not platform-signed."; exit 1;
+  }
+  say "ready to install; the tablet app has not been changed"
+  exit 0
+fi
+fi # build / sign; install-only uses the exact prepared APK
+[ -f "$SIGNED" ] || { echo "REFUSING: prepared APK is missing."; exit 1; }
 
 say "kiosk deployment preflight"
 ADB="$ADB" AAPT="$TOOLS/aapt.exe" ANDROID_SDK="$SDK" PINE_TAB="$DEV" \

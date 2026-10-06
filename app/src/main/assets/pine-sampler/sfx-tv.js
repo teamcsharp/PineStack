@@ -2782,6 +2782,9 @@
        them, which is why the strip cannot end up with a hole in it. */
     remember(playing);
     playing = clip;                                        /* #1306b */
+    if (clip.silent_picture && nativeCueCapable && !endlessOn && !clip.__webFallback) {
+      nativeCuePlay(clip); return;
+    }
     var tries = Number(clip.__tries) || 0;                 /* #1311d */
     var ready = warmTake(clip);                            /* #1411 */
     /* [#1212] the seam promotes the warm tube in place; everything else
@@ -3100,6 +3103,18 @@
     };
     screen.addEventListener('loadedmetadata', joinNow);
     if (screen.readyState >= 1) joinNow();
+    var firstSoundSync = false;
+    screen.addEventListener('playing', function () {
+      // Seeking fires playing again. Rejoining every time restarts the
+      // decoder before a slower tablet can settle into normal playback.
+      if (firstSoundSync || !clip.silent_picture || done || video !== screen) return;
+      firstSoundSync = true;
+      var into = airInto(clip);
+      if (into > 0 && Math.abs(Number(screen.currentTime) - into) > 0.08
+          && (!isFinite(screen.duration) || into < screen.duration - JOIN_TAIL)) {
+        try { screen.currentTime = into; } catch (err) { /* next tick retries */ }
+      }
+    });
     /* AND IT IS HELD THERE. This WebView suspends its JS timers when the
      * screen sleeps and the decode stalls with them; it comes back where
      * it left off, with no way to notice it is now behind. The check that
@@ -3109,14 +3124,14 @@
      * out. */
     var fixedAt = 0;
     screen.addEventListener('timeupdate', function () {
-      if (done || video !== screen) return;
+      if (done || video !== screen || screen.seeking) return;
       if (isFinite(from) && from > 0) return;
       var into = airInto(clip);
       if (into <= 0) return;
       var off = Number(screen.currentTime) - into;
       var span = Number(screen.duration);
-      if (!worthSeeking(off, span, SLIP_MAX)) return;          /* #1421 */
-      if (now() - fixedAt < SLIP_REST) return;
+      if (clip.silent_picture ? Math.abs(off) <= 0.25 : !worthSeeking(off, span, SLIP_MAX)) return;
+      if (now() - fixedAt < (clip.silent_picture ? 1000 : SLIP_REST)) return;
       if (isFinite(span) && span > 0 && into > span - JOIN_TAIL) return;
       fixedAt = now();
       try { screen.currentTime = into; } catch (err) { /* it plays on */ }
@@ -3198,6 +3213,12 @@
        sound's moment, not before it */
     var startNow = function () {
       if (done || video !== screen) return;
+      var sound = soundClock(clip);
+      var lead = sound ? sound.at - now() : 0;
+      if (sound && (sound.pending || lead > 25)) {
+        setTimeout(startNow, sound.pending ? 100 : lead);
+        return;
+      }
       var started = screen.play();
       if (started && started.catch) {
         started.catch(function () {
@@ -5414,7 +5435,41 @@
      before its moment and playback is held to clip.at - and airInto() is
      left to take up whatever is still out. */
   var AVSYNC_PREROLL_MS = 1100;   /* the tablet's measured start-up, with margin */
+  // A silent picture belongs to an audible cue, not its old reservation.
+  // Read the tablet's audio element or the desktop's existing playhead bridge.
+  function soundClock(clip) {
+    if (!clip || !clip.silent_picture || !clip.line) return null;
+    var clock = null, pending = [];
+    try {
+      var all = document.querySelectorAll('audio');
+      for (var i = 0; i < all.length; i += 1) {
+        var a = all[i], held = a && a.pineDeliveryClip;
+        if (!held || a.paused || a.ended) continue;
+        clock = {t: Number(a.currentTime) || 0, rows: (held.stream || {}).rows || []};
+        break;
+      }
+      if (typeof djVoiceQueue !== 'undefined') pending = djVoiceQueue;
+      if (!clock && root.pinePlayhead) clock = root.pinePlayhead();
+      if (clock && clock.pending) pending = clock.pending;
+    } catch (err) { /* absent audio evidence keeps the station clock */ }
+    var rows = clock && clock.rows || [];
+    for (var r = 0; r < rows.length; r += 1) {
+      if (String(rows[r].id) !== String(clip.line)) continue;
+      var elapsed = now() - Number(clock.at || now());
+      var t = Number(clock.t) + (clock.at ? Math.max(0, elapsed) / 1000 : 0);
+      return {at: now() + (Number(rows[r].from || 0) - t) * 1000, pending: false};
+    }
+    for (var p = 0; p < pending.length; p += 1) {
+      var future = pending[p].rows || (pending[p].stream || {}).rows || [];
+      if (future.some(function (row) { return String(row.id) === String(clip.line); })) {
+        return {at: now() + AVSYNC_PREROLL_MS, pending: true};
+      }
+    }
+    return null;
+  }
   function avsyncAt(clip) {
+    var sound = soundClock(clip);
+    if (sound) return sound.at;
     var at = Number(clip && clip.at);
     return clip && clip.silent_picture && !clip.endless && isFinite(at) && at > 0 ? at : 0;
   }
@@ -5613,6 +5668,13 @@
 
   function warmElement(head) {
     if (!mounted || !head || !head.url) return;
+    if (head.silent_picture && nativeCueCapable && !endlessOn) {
+      if (nativeCueWarm !== head) {
+        nativeCueWarm = head;
+        api().videoWall('cue-warm', {id: clipId(head), url: head.url, seconds: head.seconds})['catch'](function () {});
+      }
+      return;
+    }
     if (warm && warm.clip === head) return;
     warmDrop();
     var el;
@@ -5634,6 +5696,14 @@
     } catch (err) { return; }
     warm = {clip: head, el: el};
     warmPark(el);                                          /* [#1212] */
+    // preload fetches bytes but leaves decoder startup on the audible seam.
+    // Decode one muted frame in its final slot, then hold it for promotion.
+    var primed = el.play();
+    if (primed && primed.then) {
+      primed.then(function () {
+        if (warm && warm.el === el) el.pause();
+      })['catch'](function () { /* preload remains the fallback */ });
+    }
   }
 
   function warmUp() {
@@ -5694,7 +5764,8 @@
     /* [vidmiss] and a silent picture: its sound is in the round, so the
        picture belongs where the sound is, not at its own first frame. */
     if (!clip || !(clip.endless || clip.silent_picture)) return 0;
-    var at = Number(clip.at);
+    var sound = soundClock(clip);
+    var at = sound ? sound.at : Number(clip.at);
     if (!isFinite(at) || at <= 0) return 0;
     var into = (now() - at) / 1000;
     return (isFinite(into) && into > 0) ? into : 0;
@@ -5718,7 +5789,9 @@
    * a clip the desk was in the middle of. */
   function missed(clip) {
     if (!clip) return false;
-    var late = (now() - Number(clip.at || now())) / 1000;
+    var sound = soundClock(clip);
+    if (sound && sound.pending) return false;
+    var late = (now() - (sound ? sound.at : Number(clip.at || now()))) / 1000;
     /* [vidmiss] a SILENT picture is the picture of a board clip whose
        sound is welded into the round and already sounding - it is not
        punctuation that can be too late, it is late only once that
@@ -5726,7 +5799,7 @@
     if (!clip.endless && !clip.silent_picture) return late > LATE;
     var slot = Number(clip.seconds);
     if (!isFinite(slot) || slot <= 0) slot = LATE;
-    if (!clip.endless) return late >= slot - SILENT_TAIL;   /* [vidmiss] */
+    if (!clip.endless) return late >= slot - Math.min(SILENT_TAIL, slot / 4);   /* [vidmiss] */
     return late >= slot;
   }
 
@@ -5758,9 +5831,18 @@
     }
     if (!clip) return;
     warmSync(clip);                                        /* #1411 */
-    var wait = Number(clip.at || 0) - now();
-    if (avsyncAt(clip)) wait -= AVSYNC_PREROLL_MS;         /* [av-sync] built before its sound */
-    if (wait > 250) {
+    var sound = soundClock(clip);
+    if (sound && sound.pending) {
+      queue.unshift(clip);
+      warmUp();
+      if (hold) clearTimeout(hold);
+      hold = setTimeout(function () { hold = null; next(); }, 100);
+      return;
+    }
+    var wait = (sound ? sound.at : Number(clip.at || 0)) - now();
+    var nativePicture = nativeCueCapable && clip.silent_picture && !endlessOn;
+    if (avsyncAt(clip) && !nativePicture) wait -= AVSYNC_PREROLL_MS;         /* [av-sync] built before its sound */
+    if (wait > (nativePicture ? 25 : 250)) {
       /* Early is not late: the station stamps an air moment a lead ahead
        * of delivery, and a picture that jumps the gun lands over the line
        * it was meant to punctuate. */
@@ -5931,6 +6013,54 @@
    * a picture that disappears on the first tablet that has not updated. */
   var wallWant = null;               /* what we last asked for; null = never */
   var wallHas = false;               /* what the wall says it is doing */
+  var nativeCueCapable = false, nativeCueWarm = null, nativeCueActive = null;
+  var nativeCuePosition = 0;
+
+  function nativeCuePlay(clip) {
+    teardownNow(); showing = true; playing = clip;
+    nativeCueActive = clip; nativeCuePosition = 0;
+    wallHas = true; wallWant = false;
+    ringRemember([clip]); warmDrop();
+    var bridge = api(), sound = soundClock(clip);
+    var at = sound ? sound.at : Number(clip.at || now());
+    var args = nativeWallRect() || {};
+    args.id = clipId(clip); args.url = clip.url; args.seconds = clip.seconds; args.at = Math.round(at);
+    var started = now(), first = false;
+    function finish(stop) {
+      if (nativeCueActive !== clip) return;
+      nativeCueActive = null; nativeCueWarm = null; wallHas = false; showing = false; curtain = null;
+      if (stop) bridge.videoWall('off', {vcr: false})['catch'](function () {});
+      floorRelease('tube'); playing = null; next();
+    }
+    curtain = function () { finish(true); };
+    function fallback() {
+      if (nativeCueActive !== clip) return;
+      nativeCueActive = null; wallHas = false; showing = true; curtain = null;
+      bridge.videoWall('off', {vcr: false})['catch'](function () {});
+      clip.__webFallback = true; play(clip);
+    }
+    function follow() {
+      if (nativeCueActive !== clip) return;
+      bridge.videoWall('state').then(function (got) {
+        if (nativeCueActive !== clip) return;
+        var st = wallState(got);
+        if (!st) { fallback(); return; }
+        nativeCuePosition = Math.max(0, Number(st.position_ms) || 0) / 1000;
+        if (root.PineSfxSeen) { try { root.PineSfxSeen.wall(st, clip); } catch (e) {} }
+        if (st.first_frame_id === args.id && st.first_frame_at >= started) first = true;
+        if (st.playing === args.id && st.shown_since >= started && st.frames_rendered > 0) first = true;
+        if (!st.on && !st.cue_pending) {
+          if (!first && now() < at + Number(clip.seconds) * 1000) fallback();
+          else finish(false);
+          return;
+        }
+        if (now() > at + Number(clip.seconds || 15) * 1000 + 5000) { finish(true); return; }
+        setTimeout(follow, 200);
+      })['catch'](fallback);
+    }
+    bridge.videoWall('cue', args).then(follow, fallback);
+    warmUp();
+  }
 
   function wallState(got) {
     if (!got) return null;
@@ -6015,6 +6145,9 @@
   var UI_AREA_MIN = 20000;          /* a panel, not a button */
 
   function uiOverPicture() {
+    // Lens owns the display and pointer input while controlling a computer.
+    var lens = document.getElementById('pinelens');
+    if (lens && lens.classList && lens.classList.contains('open')) return true;
     var box;
     try { box = readBox(); } catch (err) { return false; }
     if (!box || !(box.width > 0) || !(box.height > 0)) return false;
@@ -6347,10 +6480,12 @@
     var bridge = api();
     if (!bridge || typeof bridge.videoWall !== 'function') return false;
     want = !!want;
+    if (nativeCueActive && !want) return wallHas;
     if (wallWant === want) return wallHas;
     wallWant = want;
     bridge.videoWall(want ? 'on' : 'off', nativeWallRect()).then(function (got) {
       var state = wallState(got);
+      nativeCueCapable = !!(state && state.cue_capable);
       wallHas = !!(state && state.on);
       if (wallHas) wallTakesOver();
     })['catch'](function () {
@@ -7136,7 +7271,7 @@
     __pineSfxTvDocument: document,
     /* 2026-09-14: for the LISTEN view's backdrop - is the set on, and
        hide the floating set while the view shows the clip as wallpaper. */
-    timeline: function () { return tlRead(); },   /* [#1219] */
+    timeline: function () { return nativeCueActive ? {on: true, at: nativeCuePosition, total: Number(nativeCueActive.seconds) || 0} : tlRead(); },   /* [#1219] */
     endless: function () { return !!endlessOn; },
     nativeWallActive: function () { return !!wallHas; },
     repairEndless: repairEndless,

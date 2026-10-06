@@ -89,6 +89,11 @@ object ViewAssets {
         "script-stage.js",        // the 3D presentation of it
         "script.js",              // the Script view
         "script-diagnostics.js", // evidence captured by the Script report button
+        "book-mode.js",
+        "system3-message-tile.js", // shared Digital roulette and message tile
+        "pine-pip-tablet.js",      // authenticated kiosk bridge for the shared PiP renderer
+        "pine-pip.js",             // the same configured PiP widgets and message tile as desktop
+        "gazette-view.js",        // issue reader before Script mounts its toolbar
         "script-page.js",         // the Script view built to the sketch
         "listen.js",
         "music.js",
@@ -129,7 +134,9 @@ object ViewAssets {
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
         "line-repeat.js",         // why a line came round again (after line-deep, as on the desk)
+        "supercut-review.js",
         "ad-viewer.js",           // Pine Box Gallery carousel and signed playback
+        "generated-media.js",
         "prompt-history.js",      // prompt records and fullscreen controls
         "line-actions.js",        // hold a line: pad, keep, or examine
         "msg-id.js",              // [msgid] the message code chip, copy, find by code
@@ -144,6 +151,7 @@ object ViewAssets {
         // it is watching whatever else fails to start.
         "deaf-watch.js",
         "rail.js",                // it looks for the globals above
+        "pinelens.js",
         // THE HOT CORNERS, after everything they reach for: line-deep.js
         // (the inspector), talk-dot.js and the report pad (the shot),
         // sfx-tv.js (the last clip) and rail.js (the drawer they mirror).
@@ -156,12 +164,18 @@ object ViewAssets {
 
     /** Concatenated into one <style>; each keys off its own class prefix. */
     private val STYLES = listOf(
+        "pinelens.css",
         "view-chrome.css",
         "changelog.css",          // the Git task history panel
         "boot-splash.css",        // the startup assembly
         "console-trace.css",      // the trace popup and the strip's menu
         "script.css",
+        "book-mode.css",
+        "system3-message-tile.css", // exact shared roulette listing styles
+        "pine-pip.css",            // shared desktop PiP widget styling
+        "pine-pip-tablet.css",     // tablet viewport rules for that shared renderer
         "script-page.css",        // the Script view laid out to the sketch
+        "gazette-view.css",        // the Gazette in that same right pane
         "listen-music.css",
         "presentation.css",
         "lock.css",               // the locked screen
@@ -170,6 +184,8 @@ object ViewAssets {
         "msg-id.css",             // [msgid] the code chip and its toast
         "line-repeat.css",        // the repeat sheet; its own <link> needs a script URL the bundle has not got
         "prompt-history.css",     // prompt history and fullscreen top bar
+        "generated-media.css",
+        "supercut-review.css",
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag

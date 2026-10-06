@@ -112,6 +112,10 @@ def digest(value):
 OVERRUN_UNBOUNDED = 3600.0
 
 
+class System2Unavailable(RuntimeError):
+    """The original planner store could not open; other station services stay up."""
+
+
 class System2Runtime:
     RECAP_LEAD_FLOOR_SECONDS = 420.0
     RECAP_LEAD_MAX_SECONDS = 900.0
@@ -167,6 +171,7 @@ class System2Runtime:
         self._last_refresh = 0.0
         self._errors = []
         self._work = {}
+        self._conversation_last_priority = False
         self._works = {}
         self._dispatched = {}
         self._record_slots = set()
@@ -374,7 +379,7 @@ class System2Runtime:
                       "tint_report", "desk", "swaths", "prep_news_stories", "prep_gallery", "caller_name",
                       "system2_trace_id", "system2_trace_ids", "system2_job", "system2_slot", "tint_retry_budget",
                       "system2_guest", "system2_source_evidence", "system2_authoring_budget",
-                      "system2_topic_review", "topic_contract", "topic_id", "topic_shape",
+                      "system2_topic_review", "gazette_review", "gazette_topic", "topic_contract", "topic_id", "topic_shape",
                       "topic", "premise", "angle") if k in entry}),
                   "why": reason, "created_at": float(entry.get("at") or row.get("at") or 0)}
         if entry.get("system2_slot") and (kind == "recap" or self.binding_live(entry["system2_slot"])):
@@ -495,7 +500,7 @@ class System2Runtime:
                         "preferred_candidate_id": str(choice.get("candidate") or ""),
                         **({"required_news_url": str(news_choice.get("url") or "")}
                            if road == "news" else {})})
-            if road == "recap":
+            if road == "recap" or kind == "gazette_review":
                 out[-1]["require_slot_binding"] = True
             if road == "news" and hasattr(h, "news_story_choice"):
                 out[-1]["require_slot_binding"] = True
@@ -524,9 +529,11 @@ class System2Runtime:
 
     @staticmethod
     def recap_matches(slot, candidate, entry=None):
-        if slot.get("kind") != "recap":
+        if slot.get("kind") != "recap" and slot.get("slot_kind") != "gazette_review":
             return True
         source = candidate.get("source") or {}
+        if slot.get("slot_kind") == "gazette_review" and not source.get("gazette_review"):
+            return False
         sid = slot.get("id")
         return (candidate.get("slot_id") == sid
                 and isinstance(source, dict) and source.get("system2_slot") == sid
@@ -1179,6 +1186,41 @@ class System2Runtime:
         temp.write_text(json.dumps(work, ensure_ascii=False, indent=2, default=str) + "\n", "utf-8")
         temp.replace(path)
 
+    async def _claim_preparation(self, kinds, lookahead):
+        """Restore conversation stock on its own road, without starving others.
+
+        Ads and unrelated recordings cannot satisfy the conversation floor.
+        An existing sitting keeps its lease; only the next claim is changed.
+        Alternate reserve claims with the normal deadline planner while the
+        reserve is empty, so source-bound roads still receive production.
+        """
+        ready = sum(1 for row in self._candidates
+                    if row.get("kind") == "banter" and row.get("ready")
+                    and row.get("eligible") and float(row.get("seconds") or 0) > 0)
+        floor = max(1, min(4, int(self.config.get("conversation_reserve_floor") or 2)))
+        prefer = ("banter" in kinds and not self.host.radio_paused()
+                  and ready < floor and not self._conversation_last_priority)
+        if prefer:
+            job = await asyncio.to_thread(
+                self.store.claim_job, "system2-preparer", kinds=["banter"],
+                lease_seconds=900, lookahead_seconds=lookahead)
+            if job:
+                self._conversation_last_priority = True
+                job["conversation_reserve_priority"] = True
+                return job
+        job = await asyncio.to_thread(
+            self.store.claim_job, "system2-preparer", kinds=kinds,
+            lease_seconds=900, lookahead_seconds=lookahead)
+        if not job and not self.host.radio_paused() and self.config["horizon_hours"] > 1:
+            job = await asyncio.to_thread(
+                self.store.claim_job, "system2-preparer",
+                kinds=[k for k in ("ad", "gallery") if k in kinds],
+                lease_seconds=900,
+                lookahead_seconds=int(self.config["horizon_hours"]) * 3600)
+        if job:
+            self._conversation_last_priority = False
+        return job
+
     async def prepare(self):
         """One bounded producer finishes useful work before commissioning more.
 
@@ -1211,22 +1253,15 @@ class System2Runtime:
             lookahead = 3600
             if h.radio_paused():
                 lookahead = int(self.config["horizon_hours"]) * 3600
-            job = await asyncio.to_thread(                         # #1224
-                self.store.claim_job, "system2-preparer", kinds=kinds,
-                lease_seconds=900, lookahead_seconds=lookahead)
-            if not job and not h.radio_paused() and self.config["horizon_hours"] > 1:
-                job = await asyncio.to_thread(
-                    self.store.claim_job, "system2-preparer",
-                    kinds=[k for k in ("ad", "gallery") if k in kinds],
-                    lease_seconds=900,
-                    lookahead_seconds=int(self.config["horizon_hours"]) * 3600)
+            job = await self._claim_preparation(kinds, lookahead)
             if not job:
                 return
             kind = job["kind"]
             work = {"trace_id": uuid.uuid4().hex, "job_id": job["id"], "slot_id": job["slot_id"],
                     "kind": kind, "started": time.time(), "state": "preparing", "calls": [],
                     "template": copy.deepcopy(job["template"]),
-                    "generation_turns": int(self.config["generation_turns"])}
+                    "generation_turns": int(self.config["generation_turns"]),
+                    "conversation_reserve_priority": bool(job.get("conversation_reserve_priority"))}
             self._work = work
             self._works[work["trace_id"]] = work
             token = WORK.set(work)
@@ -1571,12 +1606,15 @@ class System2Runtime:
         except (ValueError, TypeError, AttributeError):
             return None
 
-    async def dispatch(self):
+    async def dispatch(self, *, only_slot_id=None):
         if not self.enabled or not self.host._RADIO.get("on") or self.host.radio_paused() or self._dispatch_lock.locked():
             return False
         h = self.host
         async with self._dispatch_lock:
             await self.refresh()
+            if only_slot_id is not None and (not self.enabled
+                    or not h._RADIO.get('on') or h.radio_paused()):
+                return False
             now = time.time()
             event_slots = [slot for hour in self._event_plans for slot in hour["slots"]
                            if slot["start"] <= now < slot["deadline"] and slot["allocations"]]
@@ -1584,6 +1622,10 @@ class System2Runtime:
             if not slots:
                 return False
             slot = slots[0]
+            if only_slot_id is not None and (slot.get('id') != only_slot_id
+                    or slot.get('dynamic_kind') not in {'book_time', 'sfx_supercut'}
+                    or not slot.get('enabled', True)):
+                return False
             track_position = None
             if slot["kind"] == "track_talk":
                 track_position = self._track_position()
@@ -1847,7 +1889,10 @@ class System2Runtime:
                         failed = True
                         timed_out = True
                         return False
-                    said = await delivery
+                    # A published clip retains its completion/ACK owner when
+                    # a dispatch clock shuts down. Unhanded work still uses
+                    # the explicit cancellation/release cleanup below.
+                    said = await asyncio.shield(delivery) if handed and only_slot_id is not None else await delivery
                     failed = not bool(said)
                     return bool(said)
                 finally:
@@ -2023,47 +2068,84 @@ def install(app, namespace):
     holder = {}
 
     def runtime():
-        if "runtime" not in holder:
-            holder["runtime"] = System2Runtime(host)
-        return holder["runtime"]
-
-    namespace["_system2"] = runtime
-
-    @app.on_event("startup")
-    async def start_system2():
-        # #1074: whatever the last run was preparing when it stopped is this
-        # run's to finish, not a 30-minute hole in the plan.
+        if "runtime" in holder:
+            return holder["runtime"]
+        now = time.monotonic()
+        failure = holder.get("unavailable") or {}
+        if now < float(failure.get("retry_at") or 0):
+            raise System2Unavailable(str(failure.get("message") or "System2 is unavailable"))
         try:
-            lost = runtime().store.reclaim_jobs("system2-preparer")
+            created = System2Runtime(host)
+        except Exception as exc:
+            message = type(exc).__name__ + ": " + str(exc)[:500]
+            holder["unavailable"] = {"message": message, "retry_at": now + 30.0}
+            raise System2Unavailable(message) from exc
+        holder["runtime"] = created
+        holder.pop("unavailable", None)
+        return created
+
+    def report_error(stage, exc):
+        # Reporting a failed constructor must never try the constructor again.
+        current = holder.get("runtime")
+        if current is not None:
+            try:
+                current.error(stage, exc)
+                return
+            except Exception:
+                pass
+        message = str(exc)[:500]
+        now = time.monotonic()
+        previous = holder.get("unavailable_log") or {}
+        if previous.get("message") == message and now - float(previous.get("at") or 0) < 30.0:
+            return
+        holder["unavailable_log"] = {"message": message, "at": now}
+        try:
+            host.pipeline_log("system2", stage + ": " + message + "; station remains running; retrying")
+        except Exception:
+            pass
+
+    def ready_runtime():
+        current = runtime()
+        if holder.get("reclaimed"):
+            return current
+        # Retry interrupted startup only after the original database recovers.
+        # A malformed abandoned job or logging failure cannot hold every worker.
+        try:
+            lost = current.store.reclaim_jobs("system2-preparer")
             if lost:
                 host.pipeline_log("system2", "(#1074) %d preparation job(s) the last run left working are pending again: %s"
                                   % (len(lost), ", ".join(lost)[:400]))
         except Exception as exc:
-            runtime().error("startup", exc)
-        # 2026-09-10: and the RESERVATIONS the last run left on air. One of
-        # those, stuck in 'playing' under a dead lease, forbids its hour
-        # from ever being planned again - thirteen had accumulated over two
-        # days and the hour on air had one, so plan_hour raised on every
-        # refresh and the whole running order read "unplanned" while the
-        # shelf held hundreds of finished rounds.
+            report_error("startup jobs", exc)
         try:
-            freed = runtime().store.reclaim_reservations("system2-air")
+            freed = current.store.reclaim_reservations("system2-air")
             if freed:
                 host.pipeline_log("system2", "%d reservation(s) the last run left playing under a dead lease "
                                   "were released - their hours can be planned again: %s"
                                   % (len(freed), ", ".join(freed)[:400]))
         except Exception as exc:
-            runtime().error("startup", exc)
+            report_error("startup reservations", exc)
+        holder["reclaimed"] = True
+        return current
+
+    namespace["_system2"] = runtime
+
+    @app.on_event("startup")
+    async def start_system2():
+        try:
+            ready_runtime()
+        except Exception as exc:
+            report_error("startup", exc)
 
         async def plan_loop():
             await asyncio.sleep(8)
             while True:
                 try:
-                    await runtime().refresh()
+                    await ready_runtime().refresh()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    runtime().error("planning", exc)
+                    report_error("planning", exc)
                 await asyncio.sleep(15)
 
         async def prepare_loop():
@@ -2073,27 +2155,27 @@ def install(app, namespace):
                 try:
                     # #1084: one sitting per free lane, each its own task;
                     # a sitting's own exception is recorded by the task.
-                    task = runtime().prepare_spawn()
+                    task = ready_runtime().prepare_spawn()
                     if task is not None:
                         sittings.add(task)
                         task.add_done_callback(sittings.discard)
                         task.add_done_callback(lambda t: (
-                            runtime().error("worker", t.exception())
+                            report_error("worker", t.exception())
                             if not t.cancelled() and t.exception() else None))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    runtime().error("worker", exc)
+                    report_error("worker", exc)
                 await asyncio.sleep(3)
 
         async def event_loop():
             while True:
                 try:
-                    await runtime().events_tick()
+                    await ready_runtime().events_tick()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    runtime().error("events", exc)
+                    report_error("events", exc)
                 await asyncio.sleep(1)
 
         async def retention_loop():
@@ -2102,12 +2184,12 @@ def install(app, namespace):
             await asyncio.sleep(90)
             while True:
                 try:
-                    await asyncio.to_thread(runtime().run_retention)
+                    await asyncio.to_thread(ready_runtime().run_retention)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    runtime().error("retention", exc)
-                await asyncio.sleep(runtime().RETENTION_INTERVAL_SECONDS)
+                    report_error("retention", exc)
+                await asyncio.sleep(System2Runtime.RETENTION_INTERVAL_SECONDS if holder.get("runtime") else 30)
 
         holder["tasks"] = [
             asyncio.create_task(plan_loop(), name="system2:plan"),
@@ -2125,11 +2207,19 @@ def install(app, namespace):
     @app.get("/api/system2/status")
     async def status(authorization: str | None = Header(default=None)):
         host.require_read_auth(authorization)
-        await runtime().refresh(want_status=False)
+        try:
+            current = runtime()
+        except System2Unavailable as exc:
+            retry = max(0.0, float((holder.get("unavailable") or {}).get("retry_at") or 0) - time.monotonic())
+            body = json.dumps({"available": False, "error": "System2 database unavailable",
+                               "detail": str(exc), "retry_in_seconds": round(retry, 1),
+                               "data_preserved": True})
+            return Response(content=body, status_code=503, media_type="application/json")
+        await current.refresh(want_status=False)
         # #1070: a megabyte of nested plans is serialised in one C call in a
         # worker thread rather than walked field by field on the event loop,
         # straight from the live plans (no copy first).
-        body = await asyncio.to_thread(lambda: json.dumps(runtime().status(copy_plans=False), default=str))
+        body = await asyncio.to_thread(lambda: json.dumps(current.status(copy_plans=False), default=str))
         return Response(content=body, media_type="application/json")
 
     @app.post("/api/system2/settings")

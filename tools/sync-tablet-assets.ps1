@@ -12,8 +12,10 @@ if (-not (Test-Path -LiteralPath $views) -or -not (Test-Path -LiteralPath $sampl
     throw 'Tablet asset directories are missing.'
 }
 
+& (Join-Path $PSScriptRoot 'sync-system3-tile.ps1') -ProjectRoot (Join-Path $PSScriptRoot '..') -RendererRoot $renderer
+
 $copied = 0
-foreach ($name in @('line-repeat.js', 'line-repeat.css', 'ad-viewer.js', 'prompt-history.js', 'prompt-history.css')) {
+foreach ($name in @('line-repeat.js', 'line-repeat.css', 'ad-viewer.js', 'prompt-history.js', 'prompt-history.css', 'system3-message-tile.js', 'system3-message-tile.css')) {
     Copy-Item -LiteralPath (Join-Path $renderer $name) -Destination (Join-Path $views $name)
 }
 Get-ChildItem -LiteralPath $views -File | ForEach-Object {

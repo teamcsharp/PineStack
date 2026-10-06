@@ -32,6 +32,7 @@ ROLE_ALIASES = {
 # performer sessions already used by the recording room.
 REQUIRED_ROLES = {
     "banter": ("dj", "cohost"),
+    "book_time": ("dj", "cohost"),
     "caller": ("dj", "cohost", "caller"),
     "banter_caller": ("dj", "cohost", "caller"),
     "gallery": ("dj", "cohost"),
@@ -46,11 +47,12 @@ REQUIRED_ROLES = {
 }
 
 DIALOGUE_ROADS = frozenset({"banter", "caller", "banter_caller", "gallery",
-                            "manager", "upstairs", "guest"})
+                            "manager", "upstairs", "guest", "book_time"})
 
 # Track talk carries a record between two authored links. A record itself is
 # scheduled material but does not require generated dialogue.
-SPEECH_SHARE = {"record": 0.0, "music": 0.0, "track_talk": 0.0}
+SPEECH_SHARE = {"record": 0.0, "music": 0.0, "track_talk": 0.0,
+                "sfx_supercut": 0.0}
 
 CONTRACT_SCHEMA = 1
 WORDS_PER_MINUTE = 170.0
@@ -107,7 +109,7 @@ def build_segment_contract(slot: Mapping[str, Any], *, target_seconds: Any = Non
     required_roles = list(REQUIRED_ROLES.get(road, ()))
     if road == "track_talk" and target > 0:
         min_turns, min_events = 2, 2
-    elif road in ("record", "music") or target <= 0:
+    elif road in ("record", "music", "sfx_supercut") or target <= 0:
         min_turns, min_events = 0, 0
     elif road in DIALOGUE_ROADS:
         min_turns = max(len(required_roles), int(math.ceil(
@@ -133,7 +135,10 @@ def build_segment_contract(slot: Mapping[str, Any], *, target_seconds: Any = Non
         "minimum_speech_seconds": round(speech_floor, 3),
         "required_roles": required_roles,
         "required_role_groups": [["dj", "cohost"]] if road == "track_talk" else [],
-        "required_bookends": ["intro", "outro"] if road == "track_talk" else [],
+        "required_bookends": ["intro", "outro"]
+                             if road in ("track_talk", "book_time") or kind == "book_time" else [],
+        "required_source_structure": ["opening", "sell", "closing", "station_identity_verified"]
+                                     if road == "sfx_supercut" else [],
         "minimum_turns": min_turns,
         "minimum_events": min_events,
         "word_target": words,
@@ -225,6 +230,26 @@ def evaluate_segment_contract(contract: Mapping[str, Any],
                         if not bookends.get(side, {}).get("written")]
     missing_recorded_bookends = [side for side in required_bookends
                                  if not bookends.get(side, {}).get("recorded")]
+    required_source_structure = list(contract.get("required_source_structure") or ())
+    source_complete = not required_source_structure
+    source_structure = {key: False for key in required_source_structure}
+    for row in rows + inserted:
+        plan = row.get("source_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        structure = plan.get("structure")
+        if not isinstance(structure, Mapping):
+            continue
+        # One complete, source-only audio body must supply the whole spot.
+        # Joining assertions from unrelated partial plans is not a proof.
+        complete = bool(plan.get("complete") and plan.get("source_only")
+                        and plan.get("clips") and all(structure.get(key)
+                            for key in required_source_structure))
+        if complete:
+            source_complete = True
+            source_structure = {key: True for key in required_source_structure}
+            break
+    missing_source_structure = [key for key, present in source_structure.items() if not present]
     duration_short = max(0.0, minimum - supplied)
     speech_target = max(0.0, _number(contract.get("speech_seconds"), target))
     speech_floor = max(0.0, _number(contract.get("minimum_speech_seconds"), speech_target))
@@ -242,7 +267,8 @@ def evaluate_segment_contract(contract: Mapping[str, Any],
                            min(missing_turns, 3) * ROLE_TURN_SECONDS,
                            missing_events * EVENT_BEAT_SECONDS,
                            len(missing_bookends) * ROLE_TURN_SECONDS,
-                           len(missing_recorded_bookends) * ROLE_TURN_SECONDS)
+                           len(missing_recorded_bookends) * ROLE_TURN_SECONDS,
+                           len(missing_source_structure) * EVENT_BEAT_SECONDS)
     short = max(duration_short, structural_short, script_short, recording_short)
     return {
         "target_seconds": round(target, 3),
@@ -266,9 +292,12 @@ def evaluate_segment_contract(contract: Mapping[str, Any],
         "missing_events": missing_events,
         "missing_bookends": missing_bookends,
         "missing_recorded_bookends": missing_recorded_bookends,
+        "source_plan_complete": source_complete,
+        "missing_source_structure": missing_source_structure,
         "ready": bool(short <= 1.0 and not missing_roles
                       and missing_turns == 0 and missing_events == 0
-                      and not missing_bookends and not missing_recorded_bookends),
+                      and not missing_bookends and not missing_recorded_bookends
+                      and source_complete),
         "basis": "measured playable seconds plus acknowledged insertions",
     }
 
@@ -279,7 +308,7 @@ def preparation_tasks(contract: Mapping[str, Any], coverage: Mapping[str, Any]
     target = max(0.0, _number(contract.get("target_seconds")))
     speech_target = max(0.0, _number(contract.get("speech_seconds"), target))
     speech_floor = max(0.0, _number(contract.get("minimum_speech_seconds"), speech_target))
-    speech_optional = str(contract.get("road") or "") in ("record", "music")
+    speech_optional = str(contract.get("road") or "") in ("record", "music", "sfx_supercut")
     scripted = max(0.0, _number(coverage.get("scripted_seconds")))
     recorded = max(0.0, _number(coverage.get("recorded_seconds")))
     script_floor = max(0.0, speech_floor - (
@@ -319,6 +348,45 @@ def preparation_tasks(contract: Mapping[str, Any], coverage: Mapping[str, Any]
         "prepare_by_in_seconds": round(_number(
             contract.get("prepare_by_in_seconds")), 3),
     } for room, ready, want in tasks]
+
+
+def book_title_said(title: Any, words: str) -> bool:
+    """[book-title] Was this book named, the way a person names a book?
+
+    The library's titles are catalogue strings - 'Main Title - Subtitle --
+    Authors -- 1954'. A host says the main title. `words` is speech already
+    put through _normal and single-spaced. The whole title always counts; so
+    does its leading title, when that is long enough to mean one book."""
+    whole = " ".join(_normal(title).split())
+    if not whole:
+        return True
+    if whole in words:
+        return True
+    lead = re.split(r"\s+--\s+|\s+-\s+|:\s+|;\s+|\s+[(\[]", str(title or "").strip(), maxsplit=1)[0]
+    lead = " ".join(_normal(lead).split()).strip(" .,;:-")
+    if len(lead.split()) < 2 and len(lead) < 6:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(lead) + r"(?!\w)", words) is not None
+
+
+def book_time_bookends(text: Any, *, title: str = "", station: str = ""
+                      ) -> dict[str, dict[str, Any]]:
+    """Recognize the segment's actual welcome and send-off in authored speech.
+
+    Recording evidence is supplied separately by the recording-room caller.
+    An assigned opening/closing phase alone never proves those words exist.
+    """
+    words = " ".join(_normal(text).split())
+    title_ok = not title or book_title_said(title, words)      # [book-title]
+    station_ok = not station or _normal(station).strip() in words
+    intro = bool(title_ok and station_ok and re.search(
+        r"\bwelcome\b.{0,80}\bbook time\b", words))
+    outro = bool(station_ok and re.search(
+        r"(?:\b(?:thank|thanks|thank you)\b.{0,100}\bbook time\b|"
+        r"\b(?:that ends|that wraps|that's|that is|end of)\b.{0,70}\bbook time\b)", words)
+        and re.search(r"\b(?:back to|return to|hand back|back with|back on|next record|"
+                      r"next song|the music|the show)\b", words))
+    return {"intro": {"written": intro}, "outro": {"written": outro}}
 
 
 def ad_sale_evidence(script: str, product: str = '') -> dict:

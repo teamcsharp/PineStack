@@ -342,7 +342,17 @@ class ManifestStore:
                          replacement: Mapping) -> dict:
         existing = self.load_script(revision) if kind == "script" \
             else self.load(kind, revision, identifier)
-        pins = self.pins()
+        # [pins-lazy] check_overwrite reads the pins in ONE case only: a
+        # different record already stands at this id, under a kind that can be
+        # pinned. Every other write - a new master, an identical rewrite, a
+        # session, an admission - never looks at them, and pins() opens every
+        # admission, assembly and cut of every revision (71,146 files on
+        # 2026-10-05), under the interpreter lock, once per stored take.
+        if (existing is None or not sm._PIN_BUCKET.get(str(kind), "")
+                or sm._stable(existing) == sm._stable(replacement)):
+            pins = {}
+        else:
+            pins = self.pins()
         if kind == "script":
             pins = {"revisions": pins.get("revisions") or {}}
             return sm.check_overwrite("script", revision, existing, replacement, pins)

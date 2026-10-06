@@ -190,7 +190,7 @@
 
   function runIn(frame, source) {
     var going;
-    try { going = frame.executeJavaScript(source); }
+    try { going = frame.executeJavaScript(source, true); }
     catch (err) { return Promise.resolve(null); }
     if (!going || typeof going.then !== 'function') return Promise.resolve(going || null);
     return going.then(function (v) { return v; }, function () { return null; });
@@ -223,7 +223,7 @@
     try { out.shellAudible = window.__pineDesktopAudible; } catch (e4) { /* fine */ }
     try { out.listener = String(sessionStorage.pbfmListener || ''); } catch (e5) { /* locked */ }
     try {
-      var c = window.pineAudioCtx;
+      var c = window.pineAudioCtx || window.__pineAudioCtx;
       if (c) {
         out.ctx = {state: String(c.state), time: Number(c.currentTime),
                    sink: (typeof c.sinkId === 'string' ? c.sinkId : null)};
@@ -252,7 +252,7 @@
   function panelReviveFn() {
     var did = [];
     try {
-      var c = window.pineAudioCtx;
+      var c = window.pineAudioCtx || window.__pineAudioCtx;
       if (c && String(c.state) !== 'running') {
         did.push('the panel audio graph was ' + c.state
                  + ' - every clip it plays was going nowhere; asked it to resume');
@@ -284,7 +284,7 @@
   function panelSinkFn() {
     var did = [];
     try {
-      var c = window.pineAudioCtx;
+      var c = window.pineAudioCtx || window.__pineAudioCtx;
       if (c && typeof c.setSinkId === 'function'
           && typeof c.sinkId === 'string' && c.sinkId) {
         did.push('the panel audio graph was pinned to output "' + c.sinkId
@@ -1308,6 +1308,12 @@
                verdict: null, proof: null, tone: null};
     var i = 0;
     var only = opts.only || null;     /* for the harness: run these keys */
+    function report() {
+      paint(ctx);
+      if (typeof opts.onProgress === 'function') {
+        try { opts.onProgress({ lines: ctx.lines, verdict: ctx.verdict, done: ctx.done }); } catch (_) { /* a report cannot interrupt recovery */ }
+      }
+    }
 
     var step = function () {
       if (i >= RUNGS.length) return finish(ctx, opts);
@@ -1316,7 +1322,7 @@
       if (only && only.indexOf(rung.key) < 0) return step();
       var line = blank(rung);
       ctx.lines.push(line);
-      paint(ctx);
+      report();
       var going;
       try { going = Promise.resolve(rung.run(ctx, line)); }
       catch (err) { going = Promise.reject(err); }
@@ -1326,13 +1332,13 @@
         line.found = got.found || [];
         line.cannot = got.cannot || '';
         line.state = got.changed ? 'changed' : 'looked';
-        paint(ctx);
+        report();
         if (!got.changed && !got.prove) return step();
         return proveSound(opts.gap).then(function (proof) {
           ctx.proof = proof;
           line.proof = proof.why;
           line.state = proof.sound ? 'proved' : line.state;
-          paint(ctx);
+          report();
           if (!proof.sound) return step();
           ctx.stoppedAt = rung.key;
           return finish(ctx, opts);
@@ -1340,7 +1346,7 @@
       }, function (err) {
         line.state = 'failed';
         line.cannot = 'this rung threw: ' + String((err && err.message) || err);
-        paint(ctx);
+        report();
         return step();
       });
     };

@@ -323,6 +323,8 @@
   }
 
   function loadAlbum(box, seed) {
+    var player = box.querySelector('.pa-player');
+    if (player.hidden) { player.hidden = false; box.querySelector('.pa-visual').hidden = false; box.querySelector('.pa-countdown').hidden = false; box.querySelector('.pa-votes').hidden = false; startVisual(box, player); }
     var note = box.querySelector('.pa-top-note');
     say(note, 'Reading the album from the station...');
     var path = '/api/music/album?track_id=' + encodeURIComponent(seed.id || '')
@@ -496,7 +498,7 @@
 
   function open(track) {
     var seed = track || {};
-    if (!seed.id && !seed.album) return null;
+    var browsing = !seed.id && !seed.album;
     close();
     active = seed;
     back = make('div', 'pa-back');
@@ -525,11 +527,11 @@
     head.setAttribute('data-pine-drag-handle', '');
     var art = make('img', 'pa-art');
     art.alt = '';
-    if (seed.art) art.src = media(seed.art);
+    if (seed.art) art.src = media(seed.art); else art.hidden = true;
     var names = make('div', 'pa-names');
-    names.appendChild(make('b', 'pa-title', String(seed.album || 'Album')));
-    names.appendChild(make('i', 'pa-artist', String(seed.artist || 'Unknown artist')));
-    names.appendChild(make('strong', 'pa-track-name', String(seed.title || 'Unknown track')));
+    names.appendChild(make('b', 'pa-title', String(seed.album || (browsing ? 'Album library' : 'Album'))));
+    names.appendChild(make('i', 'pa-artist', String(seed.artist || (browsing ? 'Search the station music library' : 'Unknown artist'))));
+    names.appendChild(make('strong', 'pa-track-name', String(seed.title || (browsing ? 'Choose an artist, album, or song above.' : 'Unknown track'))));
     names.appendChild(make('small', 'pa-album-detail', seed.seconds ? clock(seed.seconds) : ''));
     head.appendChild(art); head.appendChild(names);
     var countdown = make('div', 'pa-countdown');
@@ -566,8 +568,10 @@
         function (words, bad) { say(box.querySelector('.pa-top-note'), words, bad); });
     }
     wireSearch(box);
-    startVisual(box, player);
-    loadAlbum(box, seed);
+    if (browsing) {
+      player.hidden = visual.hidden = countdown.hidden = votes.hidden = true;
+      say(box.querySelector('.pa-top-note'), 'Nothing is playing. Search above to open an album from the station library.');
+    } else { startVisual(box, player); loadAlbum(box, seed); }
     return box;
   }
 

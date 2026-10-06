@@ -14,6 +14,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.widget.SwitchCompat
 import androidx.drawerlayout.widget.DrawerLayout
+import com.pinebox.kiosk.BuildConfig
 import com.pinebox.kiosk.R
 import com.pinebox.kiosk.config.ConfigStore
 import com.pinebox.kiosk.config.HotCorners
@@ -103,6 +104,18 @@ class RailController(
     private val fixNote: TextView = rail.findViewById(R.id.fixNote)
     /* [tablet-update-ask] the download icon: ask the desk for the newest app */
     private val fixUpdate: View = rail.findViewById(R.id.fixUpdate)
+    private val updateStatus: View = rail.findViewById(R.id.updateStatus)
+    private val updateCaption: TextView = rail.findViewById(R.id.updateCaption)
+    private val updateConsole: TextView = rail.findViewById(R.id.updateConsole)
+    private val updateConsoleLast: TextView = rail.findViewById(R.id.updateConsoleLast)
+    private val updateBuildProgress: android.widget.ProgressBar = rail.findViewById(R.id.updateBuildProgress)
+    private val updateInstallProgress: android.widget.ProgressBar = rail.findViewById(R.id.updateInstallProgress)
+    private val updateInstall: Button = rail.findViewById(R.id.updateInstall)
+    private val updateSheen = UpdateSheenDrawable()
+    private var updateRequired = false
+    private var updateVersionReadAt = 0L
+    private var updateReadyAt = 0.0
+    private var updateRequesting = false
     private var updateWatch: kotlinx.coroutines.Job? = null
     private var fixRunning = false
     /* [smart-reinit] the question after every cure */
@@ -328,7 +341,19 @@ class RailController(
         }
 
         fixGo.setOnClickListener { reinitialise() }
+        rail.findViewById<View>(R.id.railPineLens).setOnClickListener {
+            drawer.closeDrawer(rail)
+            runScript("(function(){if(!window.PineViewRail||!PineViewRail.open)return 'absent';PineViewRail.open('pinelens');return 'ok';})()") { result ->
+                if (!result.contains("ok")) {
+                    noteError("Pine Lens is unavailable in this page. Open the panel or update PineTab.")
+                }
+            }
+        }
         fixUpdate.setOnClickListener { askDeskUpdate() }
+        fixUpdate.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) { paintUpdateSheen() }
+            override fun onViewDetachedFromWindow(view: View) { updateSheen.stop() }
+        })
         updateResume()
         for ((answer, chip) in fixAnswers) chip.setOnClickListener { doctorAnswer(answer) }
         fixAskClose.setOnClickListener { doctorAnswer("stopped") }
@@ -381,6 +406,8 @@ class RailController(
         drawer.addDrawerListener(object : DrawerLayout.SimpleDrawerListener() {
             override fun onDrawerOpened(drawerView: View) {
                 if (dirty) paint()
+                updateResume()
+                paintUpdateSheen()
                 /* The page can change the corners too (hotCornersSet), and
                  * HotCorners.live already holds the result; the rows only
                  * need to catch up when they come into view. */
@@ -400,6 +427,8 @@ class RailController(
              * drawer would be spending the very battery it reports on. */
             override fun onDrawerClosed(drawerView: View) {
                 stopPower()
+                updateSheen.stop()
+                fixUpdate.foreground = null
             }
         })
     }
@@ -407,6 +436,8 @@ class RailController(
     /** Called from the activity's feed collector, already off the tick. */
     fun render(next: RailState) {
         state = next
+        if (next.connected && drawer.isDrawerOpen(rail) && updateWatch?.isActive != true &&
+            android.os.SystemClock.uptimeMillis() - updateVersionReadAt > 60000L) updateResume()
         /* ONCE, when the station first answers: put the air where the table
          * says it belongs, without waiting for anyone to open the drawer.
          * The tablet is meant to be switched on and be the room - "whenever
@@ -1018,11 +1049,33 @@ class RailController(
      * Not a standing poller (see the class comment): it reads every UPDATE_POLL_MS
      * only while an update is in flight, and stops when it is done or gone. */
     private fun askDeskUpdate() {
+        if (updateRequesting) return
+        if (updateReadyAt > 0.0) {
+            val askAt = updateReadyAt
+            updateRequesting = true
+            updateInstall.isEnabled = false
+            scope.launch {
+                try {
+                    val body = JSONObject().put("state", "install-requested").put("ask_at", askAt)
+                        .put("line", "install requested by the tablet")
+                    val v = JSONObject(client.post(UPDATE_ROUTE, body.toString()))
+                    paintUpdate(v)
+                    watchUpdate(askAt)
+                } catch (err: Exception) {
+                    updateCaption.text = "could not request install: " + (err.message ?: "connection failed")
+                } finally {
+                    updateRequesting = false
+                    updateInstall.isEnabled = true
+                }
+            }
+            return
+        }
         if (updateWatch?.isActive == true) {
             fixNote.text = "an update is already under way - its progress shows here"
             return
         }
         fixNote.text = "asking the desk to build the newest PineTab app…"
+        updateRequesting = true
         scope.launch {
             try {
                 val v = JSONObject(client.post(UPDATE_ROUTE, JSONObject().put("by", "the PineTab").toString()))
@@ -1031,14 +1084,18 @@ class RailController(
             } catch (err: Exception) {
                 Log.w(TAG, "update ask failed", err)
                 fixNote.text = "could not ask the desk: " + (err.message ?: err.javaClass.simpleName)
+            } finally {
+                updateRequesting = false
             }
         }
     }
 
     private fun updateResume() {
+        updateVersionReadAt = android.os.SystemClock.uptimeMillis()
         scope.launch {
             try {
                 val v = JSONObject(client.get(UPDATE_ROUTE))
+                paintUpdateAvailable(v)
                 val st = v.optString("state")
                 val age = v.optDouble("now", 0.0) - v.optDouble("at", 0.0)
                 if (v.optBoolean("open", false)) {
@@ -1073,19 +1130,75 @@ class RailController(
                     last = said
                 }
                 val st = v.optString("state")
-                if (st == "done" || st == "failed") return@launch
+                if (st == "done" || st == "failed" || !v.optBoolean("open", false)) return@launch
             }
         }
     }
 
+    private fun paintUpdateSheen() {
+        val show = updateRequired && drawer.isDrawerOpen(rail)
+        fixUpdate.foreground = if (show) updateSheen else null
+        if (show) updateSheen.start() else updateSheen.stop()
+    }
+
+    private fun paintUpdateAvailable(v: JSONObject) {
+        val wanted = v.optString("wanted")
+        val fresh = v.optDouble("now") - v.optDouble("wanted_at") in 0.0..180.0
+        val installed = BuildConfig.VERSION_NAME.substringAfter('+', "")
+        val st = v.optString("state")
+        val busy = st in listOf("asked", "taken", "running", "install-requested", "installing") && v.optBoolean("open")
+        updateRequired = !busy && ((fresh && wanted.length == 12 && wanted != installed) || (st == "ready" && v.optBoolean("open")))
+        fixUpdate.contentDescription = when {
+            st == "ready" && v.optBoolean("open") -> "Update ready - tap to install compiled update"
+            updateRequired -> "Update available - tap to build the latest PineTab app"
+            else -> "Build latest PineTab update"
+        }
+        paintUpdateSheen()
+    }
+
+    private fun paintUpdate(v: JSONObject) {
+        paintUpdateAvailable(v)
+        val st = v.optString("state")
+        val ready = st == "ready"
+        val installing = st == "install-requested" || st == "installing"
+        val finished = st == "done"
+        updateStatus.visibility = View.VISIBLE
+        updateReadyAt = if (ready) v.optDouble("ask_at", 0.0) else 0.0
+        updateInstall.visibility = if (ready) View.VISIBLE else View.GONE
+        updateInstall.setOnClickListener { askDeskUpdate() }
+        updateCaption.text = when (st) {
+            "asked" -> "Build: queued / Install: waiting"
+            "ready" -> "Build: complete / Tap again to install"
+            "install-requested", "installing" -> "Build: complete / Install: working"
+            "done" -> "Build: complete / Install: complete"
+            "failed" -> "Update failed - tap to retry"
+            else -> "Build: working / Install: waiting"
+        }
+        updateBuildProgress.isIndeterminate = st == "asked" || st == "taken" || st == "running"
+        updateBuildProgress.progress = if (ready || installing || finished) 100 else 0
+        updateInstallProgress.isIndeterminate = installing
+        updateInstallProgress.progress = if (finished) 100 else 0
+        val lines = v.optJSONArray("lines")
+        val consoleLines = if (lines != null && lines.length() > 0) {
+            (maxOf(0, lines.length() - 2) until lines.length()).map {
+                lines.optJSONObject(it)?.optString("line") ?: ""
+            }
+        } else listOf(v.optString("line"))
+        updateConsole.text = consoleLines.firstOrNull() ?: ""
+        updateConsoleLast.text = if (consoleLines.size > 1) consoleLines.last() else ""
+    }
+
     private fun updateLine(v: JSONObject, waitedMs: Long): String {
+        paintUpdate(v)
         val st = v.optString("state")
         if (st == "asked" && waitedMs > UPDATE_UNTAKEN_MS) {
             return "the desk has not taken it yet - is the Pine Box app open on the computer?"
         }
         val head = when (st) {
             "asked" -> "asked the desk"
-            "taken", "running" -> "the desk is updating this tablet"
+            "taken", "running" -> "the desk is building the update"
+            "ready" -> "compiled - tap the update button again to install"
+            "install-requested", "installing" -> "installing the compiled update"
             "done" -> "updated"
             "failed" -> "the update did not finish"
             else -> st

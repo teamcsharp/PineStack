@@ -1,0 +1,548 @@
+/* THE CAUSE GRAPH [#1386] [#1387] - the drawing on the left, the record on
+   the right, and a divider between them the operator owns.
+
+   [#1387] THE LOOK. "a streamlined, teenage engineering inspired technical
+   look showing the paths and datastreams in a concise and understandable
+   way." So: near-black sheet, one hot accent (#ff5f1f) and nothing else
+   competing for it, greyscale everywhere between, hairline rules instead
+   of boxes-inside-boxes, mono for every key and number, and type that is
+   uppercase and tiny where it is a LABEL and plain where it is CONTENT.
+   No gradients, no glows, no rounded pills. An instrument, not a poster.
+
+   [#1387] THE RAIL IS A TABLE AND IT IS NOT SQUEEZED. "make sure that the
+   sidebar has elements formatted properly in a way where the elements are
+   not compressed and there's ample room and they're able to fit properly
+   in nice and adequate tables." Every row is a grid with named columns
+   that line up down the whole list, rows have real height, values wrap
+   instead of being clipped, and the divider DRAGS - so when a document
+   path or a system prompt needs half the glass, it can have half the
+   glass. */
+
+:root {
+  --wc-back: #0e0e0d;
+  --wc-sheet: #121211;
+  --wc-panel: #161614;
+  --wc-line: #2a2926;
+  --wc-line2: #34332f;
+  --wc-text: #ece8e0;
+  --wc-dim: #8a857c;
+  --wc-faint: #57534c;
+  --wc-hot: #ff5f1f;
+  --wc-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.wc-dialog {
+  position: fixed;
+  inset: 4vh 3vw;
+  z-index: 2147483040;
+  display: flex;
+  flex-direction: column;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  border-radius: 3px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .7);
+  color: var(--wc-text);
+  font: 13px/1.5 ui-sans-serif, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------- the bar */
+.wc-bar {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--wc-line);
+  align-items: center;
+  background: var(--wc-sheet);
+  flex: 0 0 auto;
+}
+.wc-field {
+  flex: 1;
+  min-width: 0;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-text);
+  padding: 7px 10px;
+  font: 12px/1.4 var(--wc-mono);
+}
+.wc-field:focus { outline: none; border-color: var(--wc-hot); }
+.wc-go, .wc-shut, .wc-lay {
+  background: var(--wc-panel);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-dim);
+  padding: 7px 12px;
+  font: 10px/1 var(--wc-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.wc-go:hover, .wc-shut:hover, .wc-lay:hover {
+  background: #1e1d1a; color: var(--wc-text); border-color: #45443e;
+}
+.wc-lay { text-transform: lowercase; letter-spacing: 0; padding: 7px 8px; }
+
+/* ----------------------------------------------------------- the split */
+.wc-split { flex: 1; display: flex; min-height: 0; }
+.wc-stage {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  background: var(--wc-back);
+  touch-action: none;           /* pinch and pan are ours, not the page's */
+}
+.wc-canvas { display: block; width: 100%; height: 100%; }
+
+/* The divider. 7px of grab and 1px of rule, because a 1px target on glass
+   cannot be hit and a 7px rule looks like a wall. */
+.wc-grip {
+  flex: 0 0 7px;
+  cursor: col-resize;
+  background: var(--wc-back);
+  border-left: 1px solid var(--wc-line);
+  position: relative;
+  touch-action: none;
+}
+.wc-grip::after {
+  content: '';
+  position: absolute;
+  left: 2px; top: 50%;
+  width: 3px; height: 34px;
+  margin-top: -17px;
+  border-left: 1px solid var(--wc-line2);
+  border-right: 1px solid var(--wc-line2);
+}
+.wc-grip:hover { border-left-color: var(--wc-hot); }
+
+/* No canvas: the rail is the whole feature and says so. */
+.wc-flat { padding: 20px; color: var(--wc-dim); max-width: 440px; }
+
+/* ------------------------------------------------------------ the rail */
+.wc-rail {
+  flex: 0 0 410px;
+  min-width: 260px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 0 20px;
+  background: var(--wc-sheet);
+  scrollbar-width: thin;
+  scrollbar-color: #34332f var(--wc-sheet);
+}
+.wc-rail::-webkit-scrollbar { width: 9px; }
+.wc-rail::-webkit-scrollbar-thumb { background: #34332f; }
+.wc-rail::-webkit-scrollbar-track { background: var(--wc-sheet); }
+
+.wc-say {
+  padding: 12px 14px 10px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--wc-text);
+  border-bottom: 1px solid var(--wc-line);
+}
+.wc-muted {
+  color: var(--wc-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+  padding: 2px 0;
+}
+.wc-verdict {
+  margin: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--wc-line);
+  border-left: 3px solid var(--wc-hot);
+  background: #1a1210;
+  font-size: 12px;
+  line-height: 1.55;
+}
+/* An honest gap is not an error and must not look like one; it is the
+   station saying what it does not record. */
+.wc-gap {
+  margin: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--wc-line);
+  border-left: 3px solid var(--wc-faint);
+  background: #131311;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--wc-dim);
+}
+.wc-gap b { color: var(--wc-text); font-weight: 600; }
+
+/* A section heading: the smallest type in the file, and the only
+   letter-spaced type in the file. */
+.wc-head {
+  margin: 0;
+  padding: 16px 14px 7px;
+  font: 9.5px/1 var(--wc-mono);
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--wc-faint);
+  border-bottom: 1px solid var(--wc-line);
+  background: var(--wc-back);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+/* ------------------------------------------------------- the node table
+   Columns that line up all the way down: the number the box carries, the
+   kind, the thing itself, how many airings. A GRID and not a flex row, so
+   a long document name in row 9 cannot shove the counts in rows 1 to 8
+   out of alignment. */
+.wc-list { display: flex; flex-direction: column; }
+.wc-row {
+  display: grid;
+  grid-template-columns: 30px 92px minmax(0, 1fr) auto 26px;
+  gap: 10px;
+  align-items: start;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--wc-line);
+  cursor: pointer;
+  min-height: 20px;
+}
+.wc-row:hover { background: #1a1a17; }
+.wc-num {
+  font: 10px/1.5 var(--wc-mono);
+  font-style: normal;
+  text-align: right;
+  opacity: .85;
+}
+.wc-kind {
+  font: 9.5px/1.6 var(--wc-mono);
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--wc-faint);
+  overflow-wrap: anywhere;
+}
+/* The content column. It WRAPS - up to three lines - because a clipped
+   document name is a name you have to open a panel to read. */
+.wc-label {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--wc-text);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.wc-n {
+  font: 10px/1.6 var(--wc-mono);
+  color: var(--wc-dim);
+  white-space: nowrap;
+}
+.wc-more {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--wc-faint);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 4px;
+  border-radius: 2px;
+}
+.wc-more:hover { color: var(--wc-text); border-color: var(--wc-line2); }
+
+/* ---------------------------------------------------- the opened record
+   A two-column definition table. The key column is fixed so every key in
+   every opened row lines up with every other, and the value column wraps
+   as far as it needs to - nothing here is ever cut off. */
+.wc-deep {
+  padding: 4px 14px 12px 44px;
+  border-bottom: 1px solid var(--wc-line);
+  background: var(--wc-back);
+}
+.wc-deep-row {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 6px 0;
+  border-bottom: 1px solid #1d1c1a;
+  font-size: 11.5px;
+}
+.wc-deep-row:last-child { border-bottom: 0; }
+.wc-deep-row .wc-kind { line-height: 1.5; }
+.wc-deep-row .wc-label {
+  -webkit-line-clamp: unset;
+  display: block;
+  overflow: visible;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--wc-text);
+  user-select: text;
+}
+.wc-deep .wc-head {
+  position: static;
+  padding: 14px 0 6px;
+  background: none;
+  border-bottom: 1px solid var(--wc-line);
+}
+
+/* ------------------------------------------------------------ the card */
+.wc-card {
+  margin: 0;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--wc-line);
+  border-left: 3px solid var(--wc-hot);
+  background: var(--wc-panel);
+}
+.wc-card > b {
+  display: block;
+  font-size: 13px;
+  line-height: 1.45;
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+.wc-snip {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line);
+  font: 11.5px/1.6 var(--wc-mono);
+  color: #c6c1b8;
+  max-height: 180px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* --------------------------------------------------------- the actions */
+.wc-act {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.wc-slide { flex: 1; min-width: 120px; accent-color: var(--wc-hot); }
+.wc-btn {
+  background: var(--wc-panel);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-text);
+  padding: 6px 11px;
+  font: 10px/1.2 var(--wc-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.wc-btn:hover { background: #24231f; border-color: #4a4942; }
+.wc-btn.wc-small { padding: 4px 8px; font-size: 9.5px; }
+/* The irreversible ones are the only amber in the file after the accent. */
+.wc-btn.wc-warn { border-color: #7a3a17; color: #ffb07a; }
+.wc-btn.wc-warn:hover { background: #2a1a10; }
+.wc-box {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 8px;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-text);
+  padding: 9px 10px;
+  font: 11.5px/1.6 var(--wc-mono);
+  resize: vertical;
+}
+.wc-box:focus { outline: none; border-color: var(--wc-hot); }
+
+/* ------------------------------------------------------------ embedded */
+/* In the feed pane: no float, no shadow, no inset - the pane owns the
+   frame and the heading above it owns the toggle. */
+.wc-dialog.wc-embed {
+  position: static;
+  inset: auto;
+  z-index: auto;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.wc-dialog.wc-embed .wc-rail { flex: 0 0 360px; }
+
+/* The tablet is 1340 wide. The rail still gets real room here, because a
+   260px rail was the compression complained about - it is the DRAWING
+   that gives way on a narrow pane, and the stack layout exists for
+   exactly that. */
+@media (max-width: 1250px) {
+  .wc-dialog { inset: 2vh 2vw; }
+  .wc-rail, .wc-dialog.wc-embed .wc-rail { flex: 0 0 340px; }
+}
+@media (max-width: 900px) {
+  .wc-rail, .wc-dialog.wc-embed .wc-rail { flex: 0 0 300px; }
+  .wc-row { grid-template-columns: 26px 76px minmax(0, 1fr) auto 24px; gap: 8px; }
+  .wc-deep-row { grid-template-columns: 116px minmax(0, 1fr); }
+  .wc-deep { padding-left: 24px; }
+}
+
+
+/* ------------------------------------------------ [#1387] THE FILTER STRIP
+   "offer filter options for narrowing down the amount of items being shown
+   and of what type." One row of chips, each carrying the kind's own colour
+   key and its count, so the strip doubles as the legend for the stripes in
+   the drawing. A chip that is OFF is not removed - it stays, dimmed and
+   struck, because a filter you cannot see is a filter you forget is on. */
+.wc-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--wc-line);
+  background: var(--wc-back);
+  flex: 0 0 auto;
+}
+.wc-strip-head {
+  font: 9.5px/1 var(--wc-mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--wc-faint);
+  margin-right: 4px;
+}
+.wc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--wc-panel);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-text);
+  padding: 4px 7px;
+  font: 9.5px/1.2 var(--wc-mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.wc-chip:hover { border-color: #4a4942; }
+.wc-chip b { color: var(--wc-dim); font-weight: 400; }
+.wc-chip-dot { width: 7px; height: 7px; border-radius: 1px; flex: 0 0 7px; }
+.wc-chip-off { opacity: .42; text-decoration: line-through; }
+.wc-chip-off .wc-chip-dot { background: #3a3934 !important; }
+.wc-chip-all { border-color: #7a3a17; color: #ffb07a; }
+.wc-narrow {
+  flex: 1;
+  min-width: 110px;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  color: var(--wc-text);
+  padding: 4px 8px;
+  font: 10px/1.4 var(--wc-mono);
+}
+.wc-narrow:focus { outline: none; border-color: var(--wc-hot); }
+
+/* ---------------------------------------------------- [#1387] THE PLAYER
+   Real HTML over the canvas. It sits bottom-left, clear of the key strip's
+   corner, and it is deliberately small: it is a check that this is the
+   right clip, not a viewing room. translateZ(0) because on the tablet a
+   promoted video layer that is NOT explicitly composited has gone behind
+   web content before - the same fault, and the same cure, as the SFX TV. */
+.wc-player {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  width: 300px;
+  max-width: calc(100% - 24px);
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  border-left: 3px solid var(--wc-hot);
+  z-index: 6;
+  transform: translateZ(0);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .66);
+}
+.wc-player-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--wc-line);
+}
+.wc-player-head b {
+  flex: 1;
+  min-width: 0;
+  font: 10.5px/1.4 var(--wc-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wc-player-media {
+  display: block;
+  width: 100%;
+  max-height: 210px;
+  background: #000;
+}
+audio.wc-player-media { max-height: 40px; }
+.wc-player-bad { padding: 8px 9px; font-size: 11px; color: #ffb07a; }
+
+/* ------------------------------------------------ [#1387] THE HOLD SHEET
+   What to do with a clip, asked where the finger is. The destructive one
+   is the only amber, and it asks twice by changing its own words rather
+   than stacking a second dialog on top. */
+.wc-sheet {
+  position: absolute;
+  width: 208px;
+  z-index: 7;
+  background: var(--wc-back);
+  border: 1px solid var(--wc-line2);
+  box-shadow: 0 12px 38px rgba(0, 0, 0, .7);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.wc-sheet-head {
+  font: 9.5px/1.4 var(--wc-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--wc-faint);
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--wc-line);
+  overflow-wrap: anywhere;
+}
+.wc-sheet .wc-btn { text-align: left; }
+.wc-sheet-said {
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--wc-dim);
+  padding: 2px;
+}
+.wc-sheet-said:empty { display: none; }
+
+
+/* ---------------------------------------------- [#1387] THE EXCERPT BLOCK
+   Prose, not a table cell. Full width, wrapped, selectable, and carrying
+   the grade of the claim above it - because "this is the passage the round
+   was handed" and "this is a passage from that document around then" are
+   different statements and must not look the same. */
+.wc-exhow {
+  padding: 7px 0 0;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--wc-dim);
+}
+.wc-grade {
+  display: inline-block;
+  font: 9px/1.4 var(--wc-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  margin-right: 6px;
+  border: 1px solid var(--wc-line2);
+  border-radius: 2px;
+  font-weight: 400;
+}
+.wc-grade-measured { color: #d6d1c7; border-color: #55534c; }
+.wc-grade-written { color: #8a857c; }
+.wc-grade-absent { color: #57534c; border-style: dashed; }
+.wc-excerpt {
+  max-height: 260px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #ded9d0;
+  border-left: 2px solid var(--wc-line2);
+}
+.wc-card .wc-excerpt { margin-top: 6px; }

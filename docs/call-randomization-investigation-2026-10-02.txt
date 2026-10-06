@@ -1,0 +1,70 @@
+Caller spontaneity investigation ? October 2, 2026
+
+Outcome
+The strongest current evidence points to repeated literal prompt wording, copied source/previous turns, writer overproduction, and writer admission pressure. Additional equally weighted intent roulettes can help, but they need to affect protocol openings and local repairs as well as subject matter. They must be System Three decisions with full Rolodex receipts.
+
+Operator preferences
+- Outcomes should generally retain equal weights. Increase the variety and number of independent decisions rather than favoring a few outcomes.
+- A similarity retry keeps the premise and varies angle, stakes, reactions, and ending first.
+- New wheels and nodes require approval. Generated options stay proposed until operator approval. Fictional caller details and complications are allowed, preserving source quotes, real station facts and story continuity.
+
+Live evidence
+A reusable read-only audit queried the station container using a transaction for each database. Complete measurements and retained sample ids are in call-randomization-investigation-2026-10-02.json.
+- 737 retained rejection events, covering roughly 36 hours. Older unique reports remain in line_reviews even when event retention is shorter.
+- Last 24 hours: 103 repetition events across station roads. 30 cite the exact opening ?The request line is ringing, you're live, go ahead.? Two more cite the ?you are live? variant. This is 32 of 103 station-wide line repetition refusals; it is not 32 whole rejected calls.
+- Of 82 generated caller conversations in the last 24 hours, the canonical opening appears on 36 answer turns; its variant appears on 3. Changing only the topic cannot remove this fixed phrase.
+- 27 caller conversations are withheld: 17 writer-admission deferrals and 10 copy-gate holds. Busy writer capacity is not an RNG failure.
+- Generated call gate totals: 433 catches, 258 rewritten turns, 254 drops and 493 turns trimmed past the planned ending, using 266 repair visits. A catch, a dropped turn and a withheld call are different units and must not be added into a single rejection percentage.
+- Generated verdicts: 47 compliant, 33 partial, 2 non_compliant. The lexical verdict can still mark a call compliant after only some requested actions were met. It is not proof of a listener hearing a complete call.
+- 60 distinct caller conversations created in the last 24 hours have script-block receipts. The audit has not proved that every receipt was actually broadcast or heard.
+- Four call arcs are already in active use: resolution 25, escalation 25, confrontation 17 and argument 15. More emotion or arc variety alone will not fix fixed openings.
+- No recent event in the retained window has gate call_contract. The 72-hour unique report window has one ?broken opening? report. This does not prove that whole-call collisions are gone: current turn gates and status ledgers carry other kinds of failure.
+
+Historical similarity evidence
+- 6675 unique call-contract reports have 10980 lifetime occurrences. Faults overlap; a report can contain several faults.
+- 580 unique reports include a similarity fault, with 2548 lifetime occurrences.
+- Classified by stored evidence: 547 structural-similarity reports / 1,311 occurrences; 32 exact-duplicate reports / 166 occurrences; one empty-script report / 1,071 occurrences.
+- That empty script has similarity 0.0, no matched call and an empty fingerprint. call_novelty currently returns not-ok for an empty fingerprint; call_flow_report labels every not-ok novelty result ?the premise or dialogue is too similar to a stored call?. This inflates the apparent historical collision count and should become an empty/invalid-draft reason.
+- Latest retained genuine similarity samples date to September 24. Examples are fallback scripts about the same topic, with different caller names, places and props, scoring 0.493?0.525 against a 0.48 threshold. Their repeated sentence skeleton remains plainly visible. These are historical evidence, not today's rejection rate.
+
+Code findings
+1. system3_tables.py:1688 and the live caller structure tell the answer node to say a literal stock line. It only draws ES at this node; emotion does not necessarily change the words. Introductions likewise offer two quotable formulas.
+2. caller_topic.py:506 builds a fixed fallback script with hashed place/incident/object/landing substitutions. The legacy fallback in app.py:104448 is similar. Extra props do not create a different conversational action.
+3. app.py:105074 call_novelty compares caller-text trigrams, plus exact full-script fingerprints. That is distinct from the 24-hour exact-line guard at app.py:112611.
+4. The 24-hour guard can drop a required opening immediately before speech. System3Runtime.near_repeats uses a recent-air ring and a different 8-word/85%-similar test; System Three's local gate handles copied source passages and prior turns. These checks do not currently provide one shared pre-recording diversity verdict and recovery receipt.
+5. system3.py:7039 gate_ask reuses the same planned dice and protocol action in a rewrite. It asks for new words but does not reroll a new angle/stakes plan, and the protocol action can contain the original stock phrase.
+6. Existing RS2, CALLARC1, RESOLVE1/2/3 and WRAP1 already direct reactions, arcs and endings. Reuse them instead of creating a parallel controller.
+7. orchestrator_s3.py:831 propose_table only edits an existing table; it rejects unknown ids. Confirm blocks autonomous table proposals. The section allowlist excludes caller structures. This desk needs explicit add-option/new-wheel/node proposal capabilities if it is to expand these systems.
+8. system3_runtime.py:414 can already register station-owned draws into versioned STATION/POOL tables. This accounts for existing dice; it does not establish that the orchestrator can generate fresh conversational options after rejection.
+9. Table families are validated in system3.py:560; conversation_graph.py currently accepts a limited set of generic draw families. New call-specific wheels require planner, validator, node editor and receipt integration. Merely saving an extra table will not cause it to be rolled.
+
+Approved implementation
+See call-randomization-proposal-2026-10-02.json for approved option cues, weights, integration points and validation requirements.
+- CALLOPEN1: 8 opening intents; requires a real pickup/invitation with fresh words, no name before introduction.
+- CALLANGLE1: 10 ways to develop the same premise.
+- CALLSTAKES1: 8 stakes lenses.
+- CALLPROBE1: 8 grounded follow-up actions, quoting a brief anchor rather than the entire caller sentence.
+All proposed table, category and option weights are 1.0. Their product is 5,120 combinations before existing reaction, arc and ending choices. This is a planning space, not evidence that the writer will realize 5,120 distinct calls.
+- call_diversity_plan: draw and attach intents before the writer, through System Three and the Rolodex.
+- call_diversity_repair: on a genuine collision, keep the premise and reroll the affected intent combination and downstream reactions/ending. Repair dependent replies coherently, validate the entire call, then bind its revision before recording.
+- Draw retries uniformly among remaining valid combinations; record every exclusion. Persistent failures suggest additional distinct outcomes. Equal base weights must not silently receive state multipliers that make these wheels unequal.
+- Use current writer-visit caps. Deferral preserves owed work and call identity; it should not consume a diversity retry or penalize an option.
+- New options must have stable ids, provenance, validation and version history before they are eligible. Their creation, eligibility, draw and realized wording all need receipts visible from the Rolodex.
+
+Room flow
+Planning -> writing -> full-call validation -> recording -> cupboard admission -> broadcast must reference the same call id, node/turn ids and script revision. A pre-recording collision returns to the System Three recovery node. A writer deferral remains queued. Changed words invalidate their audio takes and dependent replies. A later stale-shelf collision sends affected work back for preparation rather than silently losing a required opening at the microphone. Monitor completion time and finished-audio throughput as well as rejection rate.
+
+What was changed and verified
+Implemented call_diversity.py, engine/runtime integration, both main caller source paths, the Rolodex table families and descriptions, and orchestrator proposal doors for options, new wheels and structures. The engine version is now system3-engine/6. The five approved caller wheels are added through the existing versioned default-table migration at runtime startup. Eligible positive options have equal effective weights; zero disables an option. Unavailable sources are excluded with a reason and failures reroll among remaining eligible sources.
+
+All 82 sampled full generated calls carried the same heat premise. All carried Speakerbox material, 32 had a topic-plan insertion, and 16 had a news detour; none had a CTS subject draw. CALLSOURCE1 now chooses Speakerbox, the full topic database, internet search or real current station context, and the generated/scheduled caller paths share that node. An explicit operator theme or established story still takes precedence. Default heat no longer overrides every randomly sourced call.
+
+Local repair draws one fresh approved intent for each affected node within existing visit caps. The first whole-call similarity rewrite keeps call id, trace id, caller, premise and source while drawing a new plan (including independently rolled reactions and ending), increments the revision and refuses to replace a plan already bound to audio. It checks station air-history repeats before recording and briefly reserves candidate line/sentence keys across concurrent writers. Reservations expire after five minutes; the normal air-history check remains authoritative at broadcast. Empty drafts have their own failure reason.
+
+Persistent attributed copy-gate holds on at least two distinct calls generate a bounded LLM option proposal, at most once per wheel per hour, tied to the current config. Resource deferrals do not trigger this sensor. Proposals cannot be rolled until operator confirmation. New wheels and valid node/structure edits have the same review/confirm path and versioned saves. This sensor proposes options; it does not autonomously invent unsupported engine node types.
+
+The operator additionally requested RW1: dramatic, hip hop rap battle, innuendo/inappropriate comedy, Speakerbox plot, occasional application-feature pitch, and fictional station ultimatum. The rejection rewrite node rolls one request per scenario and sends its resolved instruction as an actual LLM system message. The feature slot uses the existing H3 tagged application-feature release-log catalog, with its own seeded RWFEATURE receipt. Missing required material excludes the affected request visibly. A special pass grants a bounded rewrite attempt and does not bypass final validation or authorize stale audio.
+
+Initial verification: 94 targeted tests ran successfully (91 passed, three existing optional-tool tests skipped). Tests cover equal eligible weights, deterministic replay, source availability/failure receipts, each source reaching the premise, operator-theme precedence, preserved independent emotions, bounded repair, revision identity, all six RW1 requests, feature receipts, and operator-only confirmation/undo. Final validation and activation receipts are recorded separately below.
+
+Final verification: 96 targeted tests ran successfully (93 passed, three optional-tool tests skipped). JavaScript module syntax and the complete live-mounted app Python syntax passed. Activation is being attempted with the existing quiet-handoff tool, preserving pending page audio; the activation JSON records whether a restart actually occurred.

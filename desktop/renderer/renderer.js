@@ -1031,6 +1031,8 @@ function playheadBridge(frame) {
         t: Number(got.t) || 0,
         file: String(got.file || ""),
         duration: Number(got.duration) || 0,
+        rows: Array.isArray(got.rows) ? got.rows : [],
+        pending: Array.isArray(got.pending) ? got.pending : [],
         /* Stamped on arrival, not at the sender: the two documents share
          * a machine but not necessarily a clock reading, and all this
          * value is ever asked is "how old are you". */
@@ -1083,12 +1085,72 @@ function activeFrame() {
 function wireFrame(frame) {
   if (frame.dataset.wired) return;
   frame.dataset.wired = "1";
+  let retryTimer = null, attempts = 0, failed = false;
+  let retrySource = String(frame.src || "");
+  const cancel = () => {
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
+  };
+  const reset = () => {
+    cancel(); attempts = 0; failed = false;
+    retrySource = String(frame.src || "");
+  };
+  const retry = (why, manual = false) => {
+    if (manual) { cancel(); attempts = 0; }
+    const source = String(frame.src || "");
+    if (!source || frame.isConnected === false) { reset(); return false; }
+    if (source !== retrySource) { reset(); retrySource = source; }
+    failed = true;
+    if (retryTimer) return true;
+    // Server recovery can happen without a LAN "online" event. Continue
+    // at the capped interval until this destination answers or is retired.
+    const delay = manual ? 0 : Math.min(30000, 1000 * (2 ** Math.min(attempts, 5)));
+    setText("agentState", "Reconnecting to station in " + Math.ceil(delay / 1000)
+      + "s (" + String(why || "connection lost") + ")");
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!failed || frame.isConnected === false || String(frame.src || "") !== source) { reset(); return; }
+      attempts += 1;
+      try { frame.reload(); }
+      catch (error) { retry(error.message || "reload failed"); }
+    }, delay);
+    return true;
+  };
+  frame.pineConnection = {
+    retry: () => retry("restore playback", true),
+    state: () => ({failed, attempts, pending: !!retryTimer})
+  };
+  // A new destination owns its own retry budget; an old timer cannot navigate it.
+  if (typeof MutationObserver === "function") {
+    new MutationObserver(() => {
+      if (String(frame.src || "") !== retrySource) reset();
+    }).observe(frame, {attributes: true, attributeFilter: ["src"]});
+  }
+  window.addEventListener("online", () => { if (failed) retry("network restored", true); });
+  window.addEventListener("beforeunload", reset);
+  window.addEventListener("pagehide", reset);
   frame.addEventListener("dom-ready", () => applyAppVolumeToFrame(frame));
-  frame.addEventListener("did-finish-load", () => applyAppVolumeToFrame(frame));
+  frame.addEventListener("did-finish-load", () => { reset(); applyAppVolumeToFrame(frame); });
   frame.addEventListener("did-fail-load", (event) => {
-    if (event.errorCode !== -3) setText("agentState", event.errorDescription || "load failed");
+    if (event.errorCode === -3 || event.isMainFrame === false) return;
+    retry(event.errorDescription || "load failed");
   });
+  frame.addEventListener("render-process-gone", (event) => retry(event.reason || "player process stopped"));
 }
+
+window.pineReconnectStationFrames = function () {
+  const notes = [];
+  ["controlFrame", "radioFrame", "system2Frame", "guideFrame"].forEach(id => {
+    const frame = $(id);
+    if (frame && frame.src) {
+      wireFrame(frame);
+      if (frame.pineConnection.state().failed && frame.pineConnection.retry()) {
+        notes.push(id + " reconnecting");
+      }
+    }
+  });
+  return notes;
+};
 
 /* THE TABLET'S GLASS, FROM THE SIDEBAR.
  *
@@ -2351,6 +2413,10 @@ async function pollDesktopRadio() {
   if (!config) return;
   try {
     const clock = await api.get(`/api/radio/clock?listener=${desktopListenerId}`);
+    const rosterIds = (playersRoster?.listeners || []).flatMap(row => [row.listener, ...(row.ids || [])]);
+    if (clock.audio_owner && (!rosterIds.includes(clock.audio_owner) || !rosterIds.includes(desktopListenerId))) {
+      try { playersRoster = await api.get('/api/radio/listeners'); } catch { /* retain the gate until the next poll */ }
+    }
     desktopClockAt = Date.now();
     /* #1008, THE HALF THIS SHELL WAS MISSING.
      *
@@ -2368,15 +2434,25 @@ async function pollDesktopRadio() {
      * about itself. */
     /* [airplayers:shell] ...and a shell whose receiver is switched off in
      * Playing it is hushed by the same clock, like the panel beside it. */
-    window.__pineGagged = !!(clock && clock.hushed)
-      || (!!(clock && clock.audio_owner)
-          && clock.audio_owner !== desktopListenerId);
+    window.__pineGagged = desktopAudioGagged(clock, playersRoster, desktopListenerId);
     syncDesktopRadio(clock);
     pollPlayers();
   } catch {
     const player = $("desktopRadioPlayer");
     if (player) player.pause();
   }
+}
+
+function desktopAudioGagged(clock, roster, listener) {
+  if (clock?.hushed) return true;
+  const owner = String(clock?.audio_owner || '');
+  if (!owner || owner === listener) return false;
+  // The shell's videos and the embedded DJ player are surfaces of one app.
+  // A grouped roster row identifies both without allowing other devices to sound.
+  return !(roster?.listeners || []).some(row => {
+    const ids = [row.listener, ...(row.ids || [])];
+    return row.kind === 'app' && ids.includes(listener) && ids.includes(owner);
+  });
 }
 
 function renderChecks(status) {
@@ -3192,6 +3268,8 @@ const THREEJS_VIEWS = [
     what: "Take every 3D scene down",
     desc: "Closes every experience in the right order, disarms the auto-reopeners, closes every pop-up the gallery opened, and leaves the page flat and quiet." },
 ];
+
+window.PinePopupScenes = THREEJS_VIEWS;
 
 function threejsTip(item, anchor) {
   let tip = $("threejsTip");

@@ -60,6 +60,26 @@ class Build(unittest.TestCase):
         self.assertTrue(text.strip().endswith("END  aired"))
 
 
+class CompleteRoulette(unittest.TestCase):
+    def test_full_options_exclusions_commands_and_properties_survive(self):
+        candidates = [{"id": str(i), "label": "Option %s" % i, "text": "Command %s" % i,
+                       "weight": 1, "p": 1 / 20} for i in range(20)]
+        event = {"event_id": "audit", "family": "RW", "turn_index": -1,
+                 "selected": {"text": "rewrite dramatically"},
+                 "meta": {"node": "rewrite", "prior_revision": 1},
+                 "state_before": {"tension": .2}, "state_after": {"tension": .6},
+                 "stages": [{"stage": "item", "selected": "7", "candidates": candidates,
+                             "excluded": [{"id": "off", "why": "source unavailable"}], "draw": {"u": .35}}]}
+        node = fc.decision_node(event)
+        self.assertEqual(len(node["losers"]), 19)
+        self.assertEqual(node["more"], 0)
+        self.assertEqual(node["stages"][0]["candidates"], candidates)
+        self.assertEqual(node["stages"][0]["excluded"][0]["why"], "source unavailable")
+        self.assertTrue(node["previous_revision"])
+        self.assertEqual(node["selected"]["text"], "rewrite dramatically")
+        self.assertEqual(node["state_after"]["tension"], .6)
+
+
 class Route(unittest.TestCase):
     def test_the_routes_are_installed(self):
         import app

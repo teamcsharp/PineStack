@@ -28,6 +28,29 @@
  */
 const { contextBridge, clipboard, nativeImage, ipcRenderer } = require("electron");
 
+// Only forward gestures; the remote page never receives desktop IPC access.
+window.addEventListener('message', (event) => {
+  if (event.source !== window || !event.data) return;
+  if (event.data.type === 'pine-pip-count' && Number.isInteger(event.data.count) && event.data.count >= 0 && event.data.count < 100) {
+    const slots = Array.isArray(event.data.slots) ? event.data.slots.slice(0, 100).map(slot => ({
+      width: Math.max(0, Math.min(16384, Number(slot?.width) || 0)), height: Math.max(0, Math.min(16384, Number(slot?.height) || 0)), poster: String(slot?.poster || '').slice(0, 100000),
+      label: String(slot?.label || 'Video').slice(0, 200), source: String(slot?.source || '').slice(0, 200)
+    })) : [];
+    ipcRenderer.sendToHost('pine-pip-count', event.data.count, slots); return;
+  }
+  if (event.data.type === 'pine-pip-time') {   /* [pip-playbar] the playing video's clock, or null when none plays */
+    const t = event.data.time;
+    ipcRenderer.sendToHost('pine-pip-time', t && typeof t === 'object' ? { at: Math.max(0, Number(t.at) || 0), dur: Math.max(0, Number(t.dur) || 0), playing: t.playing === true } : null); return;
+  }
+  if (event.data.type === 'pine-pip-voices' && Array.isArray(event.data.readings)) {
+    ipcRenderer.sendToHost('pine-pip-voices', event.data.readings.slice(0, 16).map(r => ({ who: String(r?.who || '').slice(0, 100), level: Math.max(0, Math.min(1, Number(r?.level) || 0)), bars: Array.isArray(r?.bars) ? r.bars.slice(0, 24).map(n => Math.max(0, Math.min(1, Number(n) || 0))) : [] }))); return;
+  }
+  if (event.data.type !== 'pine-pip-gesture') return;
+  if (event.data.action === 'expand' || event.data.action === 'menu') {
+    ipcRenderer.sendToHost('pine-pip-gesture', event.data.action);
+  }
+});
+
 contextBridge.exposeInMainWorld("pineDesktop", {
   /* Named exactly as the chrome's, so every existing caller works with no
    * change: app.py already prefers this road and falls back on its own. */
@@ -103,10 +126,21 @@ function reportPlayhead() {
         t: Number(a.currentTime) || 0,
         file: src.split("/").pop() || "",
         duration: Number(a.duration) || 0,
+        rows: JSON.parse(a.dataset.pineRows || '[]'),
         at: Date.now()
       };
     }
   } catch (err) { msg = null; }
+  // The isolated preload cannot read page globals. The panel stamps only
+  // upcoming cue identities onto its audio element, alongside the live clip.
+  try {
+    const carrier = document.querySelector('audio[data-pine-cues]:not([data-pine-cues="[]"])');
+    const pending = carrier ? JSON.parse(carrier.dataset.pineCues || '[]') : [];
+    if (pending.length) {
+      if (!msg) msg = {id: '', t: 0, file: '', duration: 0, rows: [], at: Date.now()};
+      msg.pending = pending;
+    }
+  } catch (err) { /* a malformed cue hint never affects audio */ }
   /* Silence is a reading too: the host has to learn that nothing is
    * sounding, or the last line stays lit after the round has ended. */
   const key = msg ? msg.id + "|" + msg.file : "";

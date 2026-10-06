@@ -2016,6 +2016,7 @@
     var canEdit = has('replayEdit');
     var s = sheet(canEdit ? 'Edit the last recorded moment' : 'Save the last …', 'hc-export', {duck: false});
     var body = s.body;
+    body.appendChild(make('p', 'hc-dim', 'Includes the mix you heard, with its recorded levels and mutes.'));
     var big = make('div', 'hc-big', '');
     var range = make('input', 'hc-range');
     range.type = 'range';
@@ -2040,7 +2041,7 @@
      * so the flag changed nothing and the wording cost nothing. Now that a
      * cut carries the broadcast, ticking this is the difference between
      * sound and none - so it says that. */
-    videoOnlyRow.appendChild(make('span', '', 'Record the picture only - no broadcast audio'));
+    videoOnlyRow.appendChild(make('span', '', 'Picture only - no captured sound'));
     /* [direct-export] 2026-09-30, the operator: "Put a button here for direct
      * export. So whatever I have the slider set to export it to the folder at
      * that time range. So I don't even go into the editor." The same road the
@@ -2290,7 +2291,7 @@
         range.disabled = true;
         videoOnly.disabled = true;
         toast('Preparing the last ' + fmtSeconds(seconds) + ' for editing\u2026');
-        Promise.resolve(bridge().replayEdit({seconds: seconds, video_only: videoOnly.checked})).then(function (got) {
+        Promise.resolve(bridge().replayEdit({seconds: seconds, video_only: videoOnly.checked, require_audio: !videoOnly.checked})).then(function (got) {
           captureBusy = false;
           save.disabled = range.disabled = videoOnly.disabled = false;
           if (!got || !got.ok) {
@@ -2330,7 +2331,7 @@
       if (direct) direct.disabled = true;
       toast('exporting the last ' + fmtSeconds(seconds) + '…');
       Promise.resolve(bridge().replayExport({seconds: seconds, upload: true,
-        video_only: !!(canEdit && videoOnly.checked)})).then(function (got) {
+        video_only: !!(canEdit && videoOnly.checked), require_audio: !(canEdit && videoOnly.checked)})).then(function (got) {
         btn.disabled = false;
         if (direct) direct.disabled = false;
         if (!got || !got.ok) {

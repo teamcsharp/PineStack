@@ -42,7 +42,7 @@
 
   var ui = {
     badge: null, pop: null, visible: false, barObserver: null,
-    groups: null, picked: {}, snapshot: true, plan: null, planSeq: 0, planTimer: 0,
+    groups: null, picked: {}, snapshot: true, plan: null, planSeq: 0, planTimer: 0, groupsReading: null,
     jobs: null, pollTimer: 0, hold: null, unwatch: null, unback: null, restoreOpen: false
   };
 
@@ -86,7 +86,7 @@
   function request(method, path, body) {
     var b = bridge();
     var fn = b && (method === 'GET' ? b.get : b.post);
-    if (fn) return withTimeout(fn.call(b, path, method === 'GET' ? undefined : (body || {})), REQUEST_MS, path);
+    if (fn) return withTimeout(fn.call(b, path, method === 'GET' ? undefined : (body || {})), path.indexOf('/api/filemgr/groups') === 0 ? 60000 : REQUEST_MS, path);
     if (typeof root.fetch !== 'function') return Promise.reject(new Error('no road to the station on this screen'));
     var headers = {};
     var key = stationKey();
@@ -106,7 +106,7 @@
         }
         return data;
       });
-    }), REQUEST_MS, path);
+    }), path.indexOf('/api/filemgr/groups') === 0 ? 60000 : REQUEST_MS, path);
   }
   function get(path) { return request('GET', path); }
   function post(path, body) { return request('POST', path, body); }
@@ -233,9 +233,9 @@
     toSfx.appendChild(ico('c:archive', ''));
     toSfx.appendChild(make('span', '', 'SFX database'));
     toSfx.addEventListener('click', function () {
-      if (!(root.PineSfxDb && typeof root.PineSfxDb.open === 'function')) return;
-      closePopup();
-      root.PineSfxDb.open();
+      var ready = root.PineSfxDb ? Promise.resolve(root.PineSfxDb)
+        : root.pineLoadTool ? root.pineLoadTool('PineSfxDb') : Promise.reject(new Error('The SFX database is unavailable.'));
+      ready.then(function (database) { closePopup(); database.open(); }, function (error) { ui.sub.textContent = error.message; });
     });
     head.appendChild(toSfx);
     var refresh = make('button', 'fm-iconbtn');
@@ -439,14 +439,16 @@
     paintBadge();
     loadGroups(false);
     loadJobs();
-    loadQuarantine();     /* [qrelease] */
-    loadCam(ui.camOpen);  /* [cam-files] */
+    if (ui.qOpen) loadQuarantine();
+    if (ui.camOpen) loadCam(true);
   }
   function closePopup() {
     if (!ui.pop) return;
     ui.visible = false;
     ui.pop.hidden = true;
     cancelHold();
+    root.clearTimeout(ui.planTimer);
+    ui.planSeq++;
     camStop();            /* [cam-files] a closed popup plays nothing */
     var j = ui.jobs && ui.jobs.jobs && ui.jobs.jobs[0];
     if (j && (j.state === 'done' || j.state === 'failed') && load(JOB_KEY) === j.id) store(JOB_KEY, null);
@@ -456,19 +458,31 @@
   /* ================================================== groups + presets */
 
   function loadGroups(fresh) {
-    ui.sub.textContent = 'measuring...';
-    return get('/api/filemgr/groups' + (fresh ? '?fresh=1' : '')).then(function (g) {
+    if (ui.groupsReading) return ui.groupsReading;
+    ui.sub.textContent = ui.groups ? 'Updating file measurements...' : 'Reading file groups and sizes...';
+    if (!ui.groups) {
+      ui.list.replaceChildren(make('p', 'fm-dim', 'Measuring the station files. You can close this window while it reads; opening it again keeps the same request.'));
+    }
+    ui.groupsReading = get('/api/filemgr/groups' + (fresh ? '?fresh=1' : '')).then(function (g) {
       ui.groups = g;
       paintPresets();
       paintList();
-      schedulePlan();
+      if (ui.visible) schedulePlan();
       var total = 0, files = 0;
       (g.groups || []).forEach(function (r) { total += r.bytes || 0; files += r.files || 0; });
       ui.sub.textContent = count((g.groups || []).length, 'group') + ' - ' + count(files, 'file')
         + ', ' + bytes(total) + ' - measured in ' + (g.took_s || 0) + ' s';
     }, function (e) {
       ui.sub.textContent = 'the station did not answer: ' + e.message;
-    });
+      if (!ui.groups) {
+        ui.list.replaceChildren(make('p', 'fm-sum-refuse', ui.sub.textContent));
+        var retry = make('button', 'fm-preset', 'Retry reading files');
+        retry.type = 'button';
+        retry.addEventListener('click', function () { loadGroups(false); });
+        ui.list.appendChild(retry);
+      }
+    }).finally(function () { ui.groupsReading = null; });
+    return ui.groupsReading;
   }
 
   function paintPresets() {

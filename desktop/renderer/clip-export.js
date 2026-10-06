@@ -11,10 +11,9 @@
  * the same channels, the same gains, the same mono decision, the same in and
  * out points. What you hear is what ffmpeg is told to make.
  *
- * The video element is kept muted throughout and every sound comes from Web
- * Audio, because the recording has no audio track of its own and the two
- * WAVs have to be placed against the picture by hand anyway - the tablet's
- * ear starts before the camera does, on purpose.
+ * Recent recordings play their captured stereo soundtrack directly from
+ * the video through Web Audio. Forward recordings use their separate WAVs
+ * placed against the picture; the tablet's ear starts before the camera.
  */
 'use strict';
 
@@ -49,6 +48,8 @@ const tracks = {
 };
 
 let context = null;
+let embeddedSource = null;
+let embeddedGain = null;
 let voices = [];
 let playing = false;
 let raf = 0;
@@ -254,7 +255,8 @@ function paintWave(name) {
   if (!buffer) {
     ctx.fillStyle = '#4a5b68';
     ctx.font = '11px "Segoe UI", system-ui, sans-serif';
-    ctx.fillText('nothing captured', 8, height / 2 + 4);
+    ctx.fillText(clip?.embeddedAudio && name === 'broadcast'
+      ? 'captured with video' : 'nothing captured', 8, height / 2 + 4);
     return;
   }
   const data = buffer.getChannelData(0);
@@ -285,7 +287,21 @@ function gainOf(name) {
   return db === 0 ? 1 : Math.pow(10, db / 20);
 }
 
+function prepareEmbeddedAudio() {
+  const audio = ensureContext();
+  if (!embeddedSource) {
+    embeddedSource = audio.createMediaElementSource(film);
+    embeddedGain = audio.createGain();
+    embeddedSource.connect(embeddedGain).connect(audio.destination);
+  }
+  embeddedGain.gain.value = tracks.broadcast.use ? gainOf('broadcast') : 0;
+  film.muted = false;
+}
+
 function applyGains() {
+  if (clip?.embeddedAudio && embeddedGain) {
+    embeddedGain.gain.value = tracks.broadcast.use ? gainOf('broadcast') : 0;
+  }
   for (const voice of voices) {
     if (voice.gain) voice.gain.gain.value = gainOf(voice.name);
   }
@@ -294,6 +310,7 @@ function applyGains() {
 function start() {
   const audio = ensureContext();
   stopVoices();
+  if (clip?.embeddedAudio) { prepareEmbeddedAudio(); return; }
   for (const name of ['broadcast', 'mic']) {
     const state = tracks[name];
     if (!state.there || !state.use || !state.buffer) continue;
@@ -813,7 +830,16 @@ async function decode(name, dataUrl, offset) {
      * which is exactly what it does. */
     film.addEventListener('timeupdate', function () { paintHead(); });
 
-    await decode('broadcast', clip.broadcastUrl, clip.broadcastOffset);
+    if (clip.embeddedAudio) {
+      mono = false;
+      tracks.broadcast.there = true;
+      tracks.broadcast.use = true;
+      prepareEmbeddedAudio();
+      paintWave('broadcast');
+      paintTrack('broadcast');
+    } else {
+      await decode('broadcast', clip.broadcastUrl, clip.broadcastOffset);
+    }
     await decode('mic', clip.micUrl, clip.micOffset);
 
     row('broadcast').querySelector('.detail').textContent = tracks.broadcast.there

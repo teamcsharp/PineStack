@@ -31,13 +31,29 @@
         android:orientation="vertical"
         android:padding="12dp">
 
-        <TextView
+        <LinearLayout
             android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+        <TextView
+            android:layout_width="0dp"
+            android:layout_weight="1"
             android:layout_height="wrap_content"
             android:text="@string/rail_title"
             android:textColor="@color/pine_ink"
             android:textSize="20sp"
             android:textStyle="bold" />
+        <ImageButton
+            android:id="@+id/railPineLens"
+            style="@style/PineChip"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_weight="0"
+            android:contentDescription="@string/rail_pinelens"
+            android:tooltipText="@string/rail_pinelens"
+            android:src="@drawable/ic_pinelens" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/railConn"
@@ -114,6 +130,20 @@
                 android:text="@string/rail_fix_idle"
                 android:textColor="@color/pine_dim"
                 android:textSize="11sp" />
+
+            <LinearLayout
+                android:id="@+id/updateStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+                <TextView android:id="@+id/updateCaption" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="11sp" android:textColor="@color/pine_dim" />
+                <ProgressBar android:id="@+id/updateBuildProgress" style="?android:attr/progressBarStyleHorizontal" android:layout_width="match_parent" android:layout_height="8dp" android:max="100" />
+                <ProgressBar android:id="@+id/updateInstallProgress" style="?android:attr/progressBarStyleHorizontal" android:layout_width="match_parent" android:layout_height="8dp" android:max="100" />
+                <TextView android:id="@+id/updateConsole" android:layout_width="match_parent" android:layout_height="16dp" android:fontFamily="monospace" android:maxLines="1" android:textSize="10sp" android:textColor="@color/pine_dim" android:ellipsize="end" android:accessibilityLiveRegion="polite" />
+                <TextView android:id="@+id/updateConsoleLast" android:layout_width="match_parent" android:layout_height="16dp" android:fontFamily="monospace" android:maxLines="1" android:textSize="10sp" android:textColor="@color/pine_dim" android:ellipsize="end" android:accessibilityLiveRegion="polite" />
+                <Button android:id="@+id/updateInstall" style="@style/PineChip" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Install compiled update" android:visibility="gone" />
+            </LinearLayout>
 
             <!-- [smart-reinit] THE QUESTION AFTER EVERY CURE. What was found
                  and what was done are in fixNote above; the answer steers

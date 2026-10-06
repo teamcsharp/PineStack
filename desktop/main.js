@@ -2,6 +2,8 @@ const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
 const { spawn, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { stageRendererUpdates } = require('./hot-renderer.cjs');
+const { fetchJson: readStationJson } = require('./json-request.cjs');
 const { LcdAgent, deviceRequest } = require("./lcd-agent.cjs");
 const { LcdSerial, usbDisplays } = require("./lcd-serial.cjs");
 const { LcdFirmware } = require("./lcd-firmware.cjs");
@@ -37,10 +39,19 @@ const LOOPBACK_HERE = process.platform === "win32";
 /* #1205c: PANEL_FRAME_FOR_AUDIO.
  *
  * The station's own page, as a frame the capture can be pointed at. The
- * broadcast plays in the panel, not in this shell, so this is the frame that
- * has the sound. Kept up to date rather than looked up on demand: the handler
+ * broadcast usually plays in the panel; other app sounds also use the shell. This frame
+ * is one source in the discovered mix. Kept up to date: the handler
  * runs inside a capture negotiation and must not go searching. */
 let panelFrame = null;
+// Audio requests are serialized by the trusted recorder. Each selection is
+// consumed once, and can name only frames attached to this Pine window.
+let ringAudioTarget = 'panel';
+const { ReplayAudioFrames } = require('./replay-audio-frames.cjs');
+const ringAudioFrames = new ReplayAudioFrames({ getWindow: () => win, getPanel: panelFrameNow,
+  onChanged: catalog => {
+    try { if (win && !win.isDestroyed()) win.webContents.send('replay-audio-sources-changed', catalog); }
+    catch (_) { /* a closing renderer will discover the catalog on its next start */ }
+  } });
 
 /* #1205c / #1207: THE LINE THAT CAUGHT THIS.
  *
@@ -81,7 +92,7 @@ function watchPanelFrame(host) {
           const url = String(contents.getURL() || "");
           /* The station, on whatever host this desk is pointed at. The other
            * webviews in this window are the radio, the guide, System2 and the
-           * slides; only this one carries the broadcast. */
+           * slides; their audio sources are tracked separately below. */
           if (/\/(?:$|\?)/.test(url) || url.indexOf("/panel") >= 0
               || url === String((readConfig() || {}).baseUrl || "") + "/") {
             panelFrame = contents;
@@ -94,6 +105,7 @@ function watchPanelFrame(host) {
       contents.on("destroyed", () => {
         if (panelFrame === contents) panelFrame = null;
       });
+      ringAudioFrames.track(contents);
     });
   } catch (error) { /* an older Electron simply never sets it */ }
 }
@@ -106,9 +118,28 @@ const glassParts = require("./terminal-glass.cjs");
 const os = require("node:os");
 
 let win;
+require('./audio-mixer.cjs').install({ ipcMain, getWindow: () => win, isToolsSender: e => pinePipTools.isSender(e) });
+const stationTroubleshooter = require('./station-troubleshooter.cjs').install({
+  getToolsWindow: () => pinePipTools.getWindow(),
+  publishTools: state => pinePipTools.getWindow()?.webContents.send('station-troubleshooter:state',state), isToolsSender: e => pinePipTools.isSender(e), ipcMain, getWindow: () => win, restoreDesktop: restorePineWindow,
+  audioOutput: repair => require('./audio-output.cjs').inspect(repair),
+  request: (route, body) => fetchJson(`${readConfig().baseUrl}${route}`, { signal: AbortSignal.timeout(route === '/api/broadcast/fix/repair' ? 95000 : 45000), ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }) })
+});
+const pinePipTools = require('./pip-tools-window.cjs').install({ app, BrowserWindow, ipcMain, getWindow: () => win, rendererDir: path.join(__dirname,'renderer'), preload: path.join(__dirname,'preload.js'), readConfig, writeConfig });
+const pinePipWindow = require('./pip-window.cjs').install({
+  repairPlayback: () => { stationTroubleshooter.open(); stationTroubleshooter.run('playback').catch(error => console.error('[playback repair] ' + error.message)); },
+  openTools: want => pinePipTools.open(want), isToolsSender: e => pinePipTools.isSender(e), publishTools: s => pinePipTools.publish(s),
+  ipcMain, getWindow: () => win, readConfig, writeConfig, troubleshoot: () => stationTroubleshooter.open(),
+  /* [pip-update] what this app owes itself, and the rebuild that settles it */
+  updateOwed: () => pineUpdateOwed(), rebuild: () => reconstituteDesktop()
+});
 let backend = null;
 let backendLog = [];
 let reconstituting = false;
+
+const desktopFaults = require("./desktop-health.cjs").install({
+  app, getFile: () => path.join(app.getPath("userData"), "pinebox-health.jsonl")
+});
 
 // A dead stdout must never take the app down. Launched from a wrapper shell
 // whose pipe has closed (or a terminal that went away), any console.* write
@@ -257,14 +288,32 @@ const pineLock = app.requestSingleInstanceLock();
 if (!pineLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    try {
-      if (!win || win.isDestroyed()) return;
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
-    } catch {}
+  app.on("second-instance", (_event, argv) => {
+    restorePineWindow().then(async () => {
+      if (argv.includes('--pip')) await win.webContents.executeJavaScript('window.PinePip?.enter()', true);
+      if (argv.includes('--recover-playback')) {
+        stationTroubleshooter.open();
+        const result = await stationTroubleshooter.run('playback');
+        fs.writeFileSync(path.join(PINE_USER_DATA, 'station-playback-recovery.json'), JSON.stringify(result, null, 2));
+      }
+    }).catch(error => console.error('[show Pine] ' + error.message));
   });
+}
+
+async function restorePineWindow() {
+  if (!win || win.isDestroyed()) {
+    createWindow();
+    const contents = win.webContents;
+    await new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); contents.removeListener('did-finish-load', loaded); contents.removeListener('did-fail-load', failed); };
+      const loaded = () => { cleanup(); resolve(); };
+      const failed = (_event, _code, description, _url, mainFrame) => { if (mainFrame) { cleanup(); reject(new Error(description)); } };
+      const timer = setTimeout(() => { cleanup(); reject(new Error('The Pine window did not finish loading.')); }, 30000);
+      contents.once('did-finish-load', loaded); contents.on('did-fail-load', failed);
+    });
+  }
+  if (win.isMinimized()) win.restore();
+  win.show(); win.focus();
 }
 
 const defaults = {
@@ -324,9 +373,11 @@ async function prepareLcdConnection(host) {
   await lcdSerial.open(port, identity);
 }
 
+let knownAgentRoot;
 function agentRoot() {
   if (process.env.PINE_AGENT_ROOT) return process.env.PINE_AGENT_ROOT;
   if (app.isPackaged) return path.join(process.resourcesPath, "agent");
+  if(knownAgentRoot)return knownAgentRoot;
   const local = path.resolve(__dirname, "..");
   // #828: a bare electron.exe shortcut carries no env, and the local
   // runner's parent is NOT the agent — it has package.json but no
@@ -335,13 +386,13 @@ function agentRoot() {
     if (!fs.existsSync(path.join(local, "app.py"))) {
       const share =
         "\\\\10.89.1.246\\ehm_eckx\\pinevoice-stack\\spark-agent";
-      if (fs.existsSync(path.join(share, "package.json"))) return share;
+      return (knownAgentRoot=share); // Source availability is checked asynchronously by each caller.
     }
   } catch { /* offline — keep the local guess */ }
-  return local;
+  return (knownAgentRoot=local);
 }
 
-function selfSyncFromShare() {
+async function selfSyncFromShare() {
   // #828: EVERY launch refreshes the app from the share, no matter how
   // it was started — the operator's bare electron.exe shortcut kept
   // them on stale code through a whole day of fixes. Renderer files
@@ -356,19 +407,10 @@ function selfSyncFromShare() {
       return;                          // running from the share itself
     }
     const srcDesk = path.join(source, "desktop");
-    if (!fs.existsSync(path.join(srcDesk, "main.js"))) return;
-    const { spawnSync } = require("node:child_process");
-    const r = spawnSync("robocopy", [srcDesk,
-      path.join(runner, "desktop"),
-      "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"],
-      /* 2026-09-14: 25 s was not enough over the share - measured, a
-         launch at 17:33 mirrored NOTHING (sfx-tv.js still the 14:28
-         copy, main.js from the day before) and the operator saw none
-         of the afternoon's work. A mirror that is killed half way is
-         worse than a slow one. */
-      { timeout: 240000 });
+    await fs.promises.access(path.join(srcDesk, "main.js"));
+    const r=await new Promise((resolve,reject)=>{const child=spawn('robocopy',[srcDesk,path.join(runner,'desktop'),'/MIR','/NFL','/NDL','/NJH','/NJS','/NP'],{windowsHide:true,stdio:'ignore'});const timer=setTimeout(()=>child.kill(),240000);child.once('error',error=>{clearTimeout(timer);reject(error);});child.once('exit',status=>{clearTimeout(timer);resolve({status});});});
     try {
-      fs.copyFileSync(path.join(source, "package.json"),
+      await fs.promises.copyFile(path.join(source, "package.json"),
         path.join(runner, "package.json"));
     } catch { /* the old one keeps working */ }
     rememberLog(`[desktop] self-synced from ${srcDesk} rc=${r.status}`);
@@ -610,7 +652,7 @@ function authHeaders(cfg = readConfig()) {
 
 async function fetchJson(url, options = {}) {
   const cfg = readConfig();
-  const response = await fetch(url, {
+  return readStationJson(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -618,14 +660,6 @@ async function fetchJson(url, options = {}) {
       ...(options.headers || {})
     }
   });
-  const text = await response.text();
-  let body = null;
-  try { body = text ? JSON.parse(text) : {}; } catch { body = { text }; }
-  if (!response.ok) {
-    const detail = body && (body.detail || body.error || body.text);
-    throw new Error(detail || `${response.status} ${response.statusText}`);
-  }
-  return body;
 }
 
 async function discoverAgentKey() {
@@ -889,6 +923,9 @@ function createWindow() {
     session.defaultSession.setDevicePermissionHandler(() => true);
   } catch (err) { /* likewise */ }
 
+  // Current replay taps the shell and panel independently and mixes them in
+  // the recorder. The historical measurements below explain why window video
+  // stays separate and why both frame taps must preserve local speaker playback.
   /* #1182: WHICH SCREEN THE RING RECORDS, DECIDED HERE AND NOWHERE ELSE.
    *
    * getDisplayMedia normally raises a picker. Two reasons it must not here:
@@ -952,21 +989,23 @@ function createWindow() {
    *     capturing it, enableLocalEcho true   -28.0 dB   speakers keep it
    *     capturing it, flag left off          -85.4 dB   speakers lose it
    *
-   * The two requests are told apart by `videoRequested` / `audioRequested`,
-   * which Electron puts on the request itself. Nothing is passed out of band
-   * and the page cannot lie its way into the other answer: a request with no
-   * video gets the panel's sound and nothing else, and a request with video
-   * gets the window and no sound, whatever else it asks for. */
+   * The requests are distinguished by videoRequested / audioRequested.
+   * The trusted main renderer selects one discovered app frame through IPC
+   * before each serialized audio request. Embedded pages cannot select or
+   * consume that target. Picture capture uses the separate native window
+   * fallback without sound. */
   try {
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-      if (!win || win.isDestroyed()) return callback({});
+      if (!win || win.isDestroyed()) return callback(null);
       const wantsVideo = !!(request && request.videoRequested);
       const wantsAudio = !!(request && request.audioRequested);
-      /* THE SOUND RING. No picture asked for, so this is the second capture,
-       * and the answer is the panel's frame with its local playback left
-       * alone. */
+      /* The sound ring supplies one selected app frame and preserves its local playback. */
       if (!wantsVideo && wantsAudio) {
-        const frame = panelFrameNow();
+        const ownFrame = win.webContents?.mainFrame;
+        if (!ownFrame || request.frame !== ownFrame) return callback(null);
+        const target = ringAudioTarget;
+        ringAudioTarget = 'panel';
+        const frame = target === 'shell' ? ownFrame : target === 'panel' ? panelFrameNow() : ringAudioFrames.frame(target);
         ringSound("HANDLER sound wantsVideo=false wantsAudio=true frame="
           + (frame ? "yes" : "no")
           + " panel=" + (frame ? String(frame.url || "") : "(none)"));
@@ -974,7 +1013,7 @@ function createWindow() {
           /* Refused, and the renderer says so in words the export sheet
            * prints. Better than answering with a frame that is not the
            * station's and recording the wrong room. */
-          return callback({});
+          return callback(null);
         }
         return callback({ audio: frame, enableLocalEcho: true });
       }
@@ -985,7 +1024,8 @@ function createWindow() {
        * sound ring's back and put the broadcast in the file twice. */
       ringSound("HANDLER picture wantsVideo=" + wantsVideo
         + " wantsAudio=" + wantsAudio);
-      callback({ video: win, audio: false });
+      // Cancel cleanly; the renderer then uses its existing window capture fallback.
+      callback(null);
     }, { useSystemPicker: false });
   } catch (err) { /* older Electron: getDisplayMedia simply will not start */ }
 
@@ -1000,6 +1040,7 @@ function createWindow() {
     minWidth: 520,
     minHeight: 420,
     title: "Pine Box",
+    frame: false, // Native drag regions; PiP must contain only video and widgets.
     // #971: the window icon is what alt-tab and the taskbar button show
     // while the app is RUNNING; the .ico on the shortcut is what the pin
     // shows when it is not. Both have to be the same mark or the button
@@ -1022,16 +1063,36 @@ function createWindow() {
     clearTimeout(boundsTimer);
     boundsTimer = setTimeout(() => {
       try {
-        if (!win || win.isDestroyed() || win.isMinimized()) return;
+        if (!win || win.isDestroyed() || win.isMinimized() || win.__pinePip || win.__pinePipSwitching) return;
         writeConfig({ ...readConfig(), bounds: win.getBounds() });
       } catch (error) {}
     }, 600);
   };
   win.on("resize", rememberBounds);
   win.on("move", rememberBounds);
+  win.once('closed', () => {
+    pipCameraActive = false; pipCameraGeneration++;
+    if (camera && (!cameraWindow || cameraWindow.isDestroyed())) {
+      const previous = camera; camera = null;
+      previous.close().catch(error => console.error('[camera cleanup] ' + error.message));
+    }
+  });
+  pinePipWindow.attach(win);
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
-  win.webContents.once("did-finish-load", () => watchTheShare());
+  win.webContents.once("did-finish-load", () => {watchTheShare();setTimeout(()=>{if(win&&!win.isDestroyed())pinePipTools.prepare();},500);});
   watchPanelFrame(win.webContents);                            /* #1205c */
+  // A panel reload can end its audio tap. Give the recorder a fresh activation
+  // for recovery while keeping an explicitly stopped recorder stopped.
+  const ringRecoveryWindow = win;
+  const ringRecovery = setInterval(() => {
+    if (ringRecoveryWindow.isDestroyed() || ringRecoveryWindow.webContents.isLoading()) return;
+    ringRecoveryWindow.webContents.executeJavaScript(
+      '(function(){var r=window.PineScreenRing;if(!r)return 0;var s=r.state();'
+      + 'if(s.enabled===false)return 0;if(!s.streams.sound.running||s.audio.complete===false){'
+      + 'r.startSound({gesture:true});return 1}return 0})()', true
+    ).catch(() => {});
+  }, 5000);
+  ringRecoveryWindow.once('closed', () => clearInterval(ringRecovery));
   /* #1205: THE GESTURE THE RECORDER CANNOT FIND FOR ITSELF.
    *
    * getDisplayMedia requires transient user activation - #1182c measured
@@ -1052,6 +1113,8 @@ function createWindow() {
    * the first load would go quiet for the rest of the evening after one CSS
    * save. */
   win.webContents.on("did-finish-load", () => {
+    if (hotPending.size) console.log('[hot] staged renderer updates loaded');
+    hotPending.clear();
     setTimeout(() => {
       try {
         if (!win || win.isDestroyed()) return;
@@ -1116,11 +1179,11 @@ function createWindow() {
    that away several times a minute while someone is working on a stylesheet,
    which is precisely when they can least afford it.
 
-   EVERYTHING ELSE RELOADS, because it has to. Script already evaluated
-   cannot be taken back: modules here hold listeners, timers, feed
-   subscriptions and an audio graph, and re-running a file over the top would
-   leave two of each. A reload is the only honest way to load new JavaScript,
-   and it is what F5 would have done if the mirror were fresh.
+   JAVASCRIPT AND HTML ARE STAGED FOR AN EXPLICIT RELOAD. Already evaluated
+   modules hold the live players, timers and audio graph. Reloading them
+   automatically cuts the broadcast every time a source file is saved.
+   Copy the new files into the runner now and log them as pending; they load
+   when the operator explicitly reloads Pine Box or performs a handoff.
 
    MAIN.JS AND PRELOAD.JS ARE NOT HOT. They are this process; changing them
    needs a relaunch, and pretending otherwise is how you get an app running
@@ -1131,6 +1194,25 @@ const HOT_EVERY_MS = 1500;      /* brisk enough to feel immediate           */
 const HOT_SLOW_MS = 5000;       /* when the share is being slow, back off   */
 let hotTimer = null;
 let hotSeen = null;             /* name -> "mtime:size" of what is mirrored */
+const hotPending = new Set();   /* copied JS/HTML waiting for explicit reload */
+/* [pip-update] IS THIS APP OLDER THAN ITS SOURCE?
+ *
+ * "If the Pineapp is out of date, then at the top of the right click menu,
+ *  offer an option to update and rebuild."
+ *
+ * Three things already know. The watcher copies renderer files and holds them
+ * for an explicit reload (hotPending). It also sees this process's own files
+ * change - main.js, preload.js, the .cjs modules - and until now only wrote a
+ * line in the log about it (hotOwed keeps the names). And the build stamp
+ * compares the whole running tree with the share whenever it is asked. The
+ * PiP menu asks pineUpdateOwed(); it adds nothing of its own. */
+const hotOwed = new Set();      /* this process's own files that changed: a relaunch is owed */
+let desktopBuildLast = null;    /* the last answer of desktop:build */
+function pineUpdateOwed() {
+  const relaunch = Array.from(hotOwed), reload = Array.from(hotPending);
+  const stale = !!(desktopBuildLast && desktopBuildLast.stale);
+  return { owed: relaunch.length > 0 || reload.length > 0 || stale, relaunch, reload, stale };
+}
 const hotSelf = new Map();      /* main.js / preload.js, which are not hot   */
 let hotSaidRelaunch = 0;
 
@@ -1197,20 +1279,18 @@ async function hotSelfFilesAsync(source) {
   }
 }
 
-function watchTheShare() {
+async function watchTheShare() {
   if (hotTimer) return;
+  hotTimer="starting";
   let source;
   try {
     source = hotSourceDir();
-    if (!fs.existsSync(source)) {
-      console.log("[hot] no source renderer at " + source + " - not watching");
-      return;
-    }
-    hotSeen = hotScan(source);
+    await fs.promises.access(source);
+    hotSeen = await hotScanAsync(path.join(__dirname,"renderer"));
     console.log("[hot] watching " + source + " (" + hotSeen.size + " files)");
   } catch (error) {
     console.log("[hot] could not read the share: " + error.message);
-    return;
+    hotTimer=setTimeout(()=>{hotTimer=null;watchTheShare();},HOT_SLOW_MS);return;
   }
 
   const tick = async () => {
@@ -1224,7 +1304,7 @@ function watchTheShare() {
         if (hotSeen.get(name) !== stamp) changed.push(name);
       }
       hotSeen = now;
-      if (changed.length) applyHot(source, changed);
+      if (changed.length){const landed=await applyHot(source,changed);for(const name of changed)if(!landed.includes(name))hotSeen.delete(name);}
       /* THIS PROCESS'S OWN FILES. Not hot - see the header - but the
        * operator should hear about it rather than wonder why the change
        * did nothing.
@@ -1241,7 +1321,7 @@ function watchTheShare() {
           const info = await fs.promises.stat(at);  /* [mirror-drop-hotstat] */
           const stamp = Math.round(info.mtimeMs) + ":" + info.size;
           const key = "^" + name;
-          if (hotSelf.has(key) && hotSelf.get(key) !== stamp) hotSayRelaunch(name);
+          if (hotSelf.has(key) && hotSelf.get(key) !== stamp) { hotOwed.add(name); hotSayRelaunch(name); }  /* [pip-update] */
           hotSelf.set(key, stamp);
         } catch {}
       }
@@ -1261,43 +1341,10 @@ function watchTheShare() {
   hotTimer = setTimeout(tick, HOT_EVERY_MS);
 }
 
-function applyHot(source, changed) {
-  const mirror = path.join(__dirname, "renderer");
-  const landed = [];
-  for (const name of changed) {
-    try {
-      fs.copyFileSync(path.join(source, name), path.join(mirror, name));
-      landed.push(name);
-    } catch (error) {
-      console.log("[hot] could not copy " + name + ": " + error.message);
-    }
-  }
-  if (!landed.length) return;
-  if (!win || win.isDestroyed()) return;
-
-  const onlyCss = landed.every((name) => /\.css$/i.test(name));
-  console.log("[hot] " + landed.join(", ") + (onlyCss ? " - swapped" : " - reloading"));
-  if (onlyCss) {
-    /* Bump the href of each stylesheet whose file changed. The browser
-     * re-fetches and re-applies it; nothing else on the page moves. */
-    const list = JSON.stringify(landed);
-    win.webContents.executeJavaScript(
-      "(function(names){try{" +
-      "  names.forEach(function(name){" +
-      "    var links=[].slice.call(document.querySelectorAll('link[rel=stylesheet]'));" +
-      "    links.forEach(function(link){" +
-      "      var href=String(link.getAttribute('href')||'');" +
-      "      if(href.split('?')[0].split('/').pop()!==name) return;" +
-      "      link.setAttribute('href', href.split('?')[0] + '?hot=' + Date.now());" +
-      "    });" +
-      "  });" +
-      "}catch(e){}})(" + list + ");", true
-    ).catch(() => {});
-    return;
-  }
-  win.webContents.reloadIgnoringCache();
+async function applyHot(source, changed) {
+  return stageRendererUpdates({ source, mirror: path.join(__dirname, 'renderer'),
+    changed, window: win, pending: hotPending });
 }
-
 /* main.js and preload.js are THIS process. Said once a minute at most, so a
  * long editing session does not become a wall of the same line. */
 function hotSayRelaunch(name) {
@@ -1579,71 +1626,18 @@ ipcMain.handle("backend:setup", () => createVenvAndInstall());
  * instead of inferred - which is exactly the trap #1148 was, an old main.js
  * quietly serving an old bridge until somebody happened to relaunch.
  */
-function treeStamp(root) {
-  /* THE WHOLE TREE, because a list is a blind spot waiting to happen.
-   *
-   * The first version of this stamped a hand-picked six, back when the
-   * renderer WAS renderer.js and a stylesheet; it grew views of its own
-   * and the mark went on reporting "newest source" about six files while
-   * a dozen others differed. That was fixed by walking renderer/ - and
-   * the fix repeated the mistake one level up. `main.js` and
-   * `preload.js` were still named by hand, so their twenty-one SIBLINGS
-   * were not stamped at all: lcd-agent, terminal-host, tablet-mirror,
-   * clip-mux, shot-enhance, terminal-glass, the two .ps1 workers - every
-   * one of them `require`d by this process at startup, and every one of
-   * them able to differ from the share behind a green line.
-   *
-   * What the mark is really asked is "is my mirror the share's tree",
-   * and the rebuild answers it with `robocopy /MIR` over the WHOLE of
-   * desktop/. So that is the question stamped here: all of it, walked,
-   * with no list to fall out of date. 131 files against the 97 this
-   * stated before - one extra SMB stat per four, once a minute. */
-  const wanted = [];
-  const walk = (relative) => {
-    let entries;
-    try {
-      entries = fs.readdirSync(path.join(root, relative) || root,
-                               { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    for (const entry of entries) {
-      const name = relative ? relative + "/" + entry.name : entry.name;
-      if (entry.isDirectory()) walk(name);
-      else if (entry.isFile()) wanted.push(name);
-    }
-    return true;
-  };
-  if (!walk("")) {
-    /* Unreadable tree: answer something rather than throwing, and let the
-     * missing list say which of the originals could not be reached. */
-    wanted.push("main.js", "preload.js", "renderer/renderer.js",
-                "renderer/index.html", "renderer/webview-preload.js",
-                "renderer/styles.css");
-  }
-  let newest = 0;
-  let bytes = 0;
-  const missing = [];
-  for (const name of wanted) {
-    try {
-      const info = fs.statSync(path.join(root, name));
-      newest = Math.max(newest, info.mtimeMs);
-      bytes += info.size;
-    } catch {
-      missing.push(name);
-    }
-  }
-  return { newest, bytes, missing, counted: wanted.length };
-}
-
+const {treeStamp}=require('./build-stamp.cjs');
+let desktopBuildInFlight;
 ipcMain.handle("desktop:build", () => {
+  if(desktopBuildInFlight)return desktopBuildInFlight;
+  desktopBuildInFlight=(async()=>{
   const source = path.join(process.env.PINE_AGENT_ROOT || agentRoot(),
                            "desktop");
-  const mine = treeStamp(path.resolve(__dirname));
+  const mine = await treeStamp(path.resolve(__dirname));
   let theirs = { newest: 0, bytes: 0, missing: [], counted: 0 };
   let reachable = true;
   try {
-    theirs = treeStamp(source);
+    theirs = await treeStamp(source);
     if (!theirs.newest) reachable = false;
   } catch {
     reachable = false;
@@ -1667,6 +1661,7 @@ ipcMain.handle("desktop:build", () => {
         ? "THIS APP IS OLDER THAN THE SHARE - press the mark to rebuild"
         : "running the newest source on the share",
   };
+  })().then(got=>{desktopBuildLast=got;return got;}).finally(()=>{desktopBuildInFlight=null;});return desktopBuildInFlight;  /* [pip-update] */
 });
 
 /* The terminal provisioner: discovery, the restore image, the GSI and
@@ -1780,41 +1775,44 @@ let vitalsHeld = null;
 let vitalsGoing = null;
 const VITALS_HOLD = 2500;
 
-async function tabletVitals() {
-  const serial = await terminalHost.glassSerial();
-  if (!serial) {
-    vitals = null;
-    return { ok: false, why: "no tablet is attached" };
+function tabletVitals(serialHint = "") {
+  if (vitalsHeld && Date.now() - vitalsAt < VITALS_HOLD
+      && (!serialHint || (vitals && vitals.serial === serialHint))) {
+    return Promise.resolve(vitalsHeld);
   }
-  if (!vitals || vitals.serial !== serial) {
-    const { Vitals } = require("./tablet-vitals.cjs");
-    const tools = terminalHost.tools();
-    vitals = new Vitals({ adb: tools.adb, serial,
-      run: (args) => new Promise((resolve, reject) => {
-        require("node:child_process").execFile(tools.adb, args,
-          { timeout: 20000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
-          (error, stdout, stderr) => {
-            const text = String(stdout || "") + String(stderr || "");
-            if (error && !text) return reject(error);
-            resolve(text);
-          });
-      }) });
-  }
-  if (vitalsHeld && Date.now() - vitalsAt < VITALS_HOLD) return vitalsHeld;
-  /* Two callers arriving together share one sweep rather than starting two. */
-  if (!vitalsGoing) {
-    vitalsGoing = vitals.read().then((said) => {
-      vitalsHeld = said;
-      vitalsAt = Date.now();
-      vitalsGoing = null;
-      return said;
-    }).catch((error) => {
-      vitalsGoing = null;
-      return { ok: false, why: error.message };
-    });
-  }
-  return vitalsGoing;
+  if (vitalsGoing) return vitalsGoing;
+  const pending = (async () => {
+    const serial = serialHint || await terminalHost.glassSerial();
+    if (!serial) {
+      vitals = null;
+      vitalsHeld = null;
+      return { ok: false, why: terminalHost.glassWhy || "no tablet is attached" };   /* [tablet-attach] the reason, when there is one */
+    }
+    if (!vitals || vitals.serial !== serial) {
+      const { Vitals } = require("./tablet-vitals.cjs");
+      const tools = terminalHost.tools();
+      vitals = new Vitals({ adb: tools.adb, serial,
+        run: (args) => new Promise((resolve, reject) => {
+          require("node:child_process").execFile(tools.adb, args,
+            { timeout: 20000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
+            (error, stdout, stderr) => {
+              const text = String(stdout || "") + String(stderr || "");
+              if (error && !text) return reject(error);
+              resolve(text);
+            });
+        }) });
+    }
+    const said = await vitals.read();
+    vitalsHeld = said;
+    vitalsAt = Date.now();
+    return said;
+  })().catch(error => ({ ok: false, why: error.message })).finally(() => {
+    if (vitalsGoing === pending) vitalsGoing = null;
+  });
+  vitalsGoing = pending;
+  return pending;
 }
+
 
 ipcMain.handle("tablet:vitals", () => tabletVitals());
 
@@ -1829,6 +1827,65 @@ ipcMain.handle("tablet:vitals", () => tabletVitals());
  * window around it. */
 let mirror = null;
 let mirrorWindow = null;
+const { MirrorLifecycle } = require("./mirror-lifecycle.cjs");
+const mirrorLifecycle = new MirrorLifecycle();
+
+function mirrorEncoderOwner() {
+  const remembered = String((readConfig() || {}).mirrorEncoderOwner || "");
+  if (/^mirror_[a-f0-9]{32}$/i.test(remembered)) return remembered;
+  const owner = "mirror_" + require("node:crypto").randomUUID().replaceAll("-", "");
+  writeConfig({ mirrorEncoderOwner: owner });
+  return owner;
+}
+
+function closeTabletMirror(lease) {
+  if (!lease) return mirrorLifecycle.closing;
+  if (mirror === lease.mirror) mirror = null;
+  if (mirrorWindow === lease.window) mirrorWindow = null;
+  if (lease.poke) {
+    lease.poke.close();
+    if (poke === lease.poke) poke = null;
+    lease.poke = null;
+  }
+  return mirrorLifecycle.close(lease, async () => {
+    if (!lease.mirror) return;
+    try { await lease.mirror.closeGently(); }
+    catch (error) { lease.mirror.close(); }
+  });
+}
+
+// Cancel delayed discovery/measurement before it can create a window or encoder.
+// Revival exits directly, so it shares quit's cleanup before releasing the app lock.
+let mirrorQuitReady = false;
+let mirrorExitCleanup = null;
+function prepareTabletMirrorExit(deadlineMs = 2000) {
+  if (mirrorExitCleanup) return mirrorExitCleanup;
+  mirrorQuitReady = true;
+  const lease = mirrorLifecycle.current;
+  mirrorLifecycle.stop();
+  const cleanup = closeTabletMirror(lease);
+  let deadline;
+  mirrorExitCleanup = Promise.race([cleanup, new Promise(resolve => {
+    deadline = setTimeout(resolve, deadlineMs);
+  })]).catch(() => {}).finally(() => {
+    clearTimeout(deadline);
+    if (lease && lease.mirror) lease.mirror.close();
+    for (const closing of mirrorLifecycle.cleaning) {
+      if (closing.mirror) closing.mirror.close();
+    }
+  });
+  return mirrorExitCleanup;
+}
+app.on("before-quit", event => {
+  if (mirrorQuitReady) return;
+  if (!mirrorLifecycle.current && !mirrorLifecycle.opening && !mirrorLifecycle.cleaning.size) {
+    mirrorQuitReady = true;
+    mirrorLifecycle.stop();
+    return;
+  }
+  event.preventDefault();
+  prepareTabletMirrorExit().finally(() => app.quit());
+});
 
 /* [mirror-pip] THE WINDOW IS THE ZOOM.
  *
@@ -1914,18 +1971,23 @@ function mirrorPresetSize(shape, area, frame) {
   return { width: pictureW, height: pictureH + MIRROR_STRIP };
 }
 
-async function openTabletMirror(options) {
-  const { Mirror } = require("./tablet-mirror.cjs");
-
-  if (mirrorWindow && !mirrorWindow.isDestroyed()) {
+function openTabletMirror(options) {
+  const lease = mirrorLifecycle.current;
+  if (lease && lease.isCurrent() && mirrorWindow && !mirrorWindow.isDestroyed()) {
     if (mirrorWindow.isMinimized()) mirrorWindow.restore();
     mirrorWindow.focus();
     if (options && options.full) mirrorWindow.setFullScreen(true);
-    return { ok: true, already: true };
+    return Promise.resolve({ ok: true, already: true });
   }
+  return mirrorLifecycle.open(lease => createTabletMirror(options || {}, lease));
+}
+
+async function createTabletMirror(options, lease) {
+  const { Mirror } = require("./tablet-mirror.cjs");
 
   const tools = terminalHost.tools();
   let serial = await terminalHost.glassSerial();
+  if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
   if (!serial) {
     /* On a first run there may be no remembered serial yet. The station's
      * tablet doctor already knows the current LAN address; use that same
@@ -1933,6 +1995,7 @@ async function openTabletMirror(options) {
     try {
       const look = await fetchJson(readConfig().baseUrl + "/api/tablet/look",
         { signal: AbortSignal.timeout(4000) });
+      if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
       if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(look.host || ""))) {
         const candidate = look.host + ':5555';
         const attached = await new Promise((resolve) => execFile(tools.adb,
@@ -1940,6 +2003,7 @@ async function openTabletMirror(options) {
           (error, stdout, stderr) => resolve(!error
             && /\b(?:already )?connected to\b/i.test(
               String(stdout || '') + String(stderr || '')))));
+        if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
         if (attached) {
           /* Replace a stale remembered IP before glassSerial checks it. */
           if (readConfig().tabletSerial !== candidate) writeConfig({ tabletSerial: candidate });
@@ -1948,6 +2012,7 @@ async function openTabletMirror(options) {
       }
     } catch (error) { /* the regular unreachable answer below is enough */ }
   }
+  if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
   if (!serial) return { ok: false, why: "no tablet is reachable over adb" };
   /* Remember the selected wireless transport so the next open can restore
    * it after adb loses its local device list. */
@@ -1955,25 +2020,13 @@ async function openTabletMirror(options) {
     writeConfig({ tabletSerial: serial });
   }
 
-  /* WHAT THE TABLET WAS DRAWING BEFORE THIS OPENED, so the panel can say
-   * what watching costs rather than only what the tablet costs. Taken
-   * before the encoder starts, which is the only moment it means anything. */
-  try {
-    const before = await tabletVitals();
-    if (vitals && before && before.ok) vitals.mark(before);
-  } catch (error) { /* a missing baseline just hides one row */ }
-
+  if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
   const found = clipMux.findFfmpeg((readConfig() || {}).ffmpeg);
-  mirror = new Mirror({ adb: tools.adb, serial, ffmpeg: found.path });
-  /* How big the tablet actually is, asked once, so a third and a half are
-   * fractions of the real screen rather than of a guess. */
-  await mirror.measure((args) => new Promise((resolve) => {
-    require("node:child_process").execFile(tools.adb, args,
-      { timeout: 15000, windowsHide: true },
-      (error, stdout, stderr) => resolve(String(stdout || "") + String(stderr || "")));
-  }));
-
-  const real = mirror.real;
+  const instance = new Mirror({ adb: tools.adb, serial, ffmpeg: found.path,
+    encoderOwner: mirrorEncoderOwner() });
+  lease.mirror = instance;
+  mirror = instance;
+  const real = instance.real;
   /* [mirror-pip-open] Opens where the operator last left it - remembered
    * size and place, the way the panel window is (#786) - or at half the
    * tablet's size on a first run. The window is CREATED at those bounds,
@@ -1983,7 +2036,7 @@ async function openTabletMirror(options) {
   const cfgAt = readConfig() || {};
   const openAt = mirrorOpenBounds(cfgAt.mirrorBounds,
     require("electron").screen, real, MIRROR_STRIP);
-  mirrorWindow = new BrowserWindow({
+  const window_ = new BrowserWindow({
     width: openAt.width,
     height: openAt.height,
     ...(Number.isFinite(openAt.x) ? { x: openAt.x, y: openAt.y } : {}),
@@ -2002,7 +2055,9 @@ async function openTabletMirror(options) {
       sandbox: false
     }
   });
-  mirrorWindow.setMenuBarVisibility(false);
+  lease.window = window_;
+  mirrorWindow = window_;
+  window_.setMenuBarVisibility(false);
   /* [mirror-pip-lock] THE FRAME KEEPS THE TABLET'S SHAPE. Dragging any edge
    * scales the whole picture; without this, most of a drag grows letterbox
    * instead. setAspectRatio is the native guide where Electron has one, but
@@ -2013,33 +2068,33 @@ async function openTabletMirror(options) {
    * window's shape. */
   const mirrorFrameEdge = () => {
     try {
-      const outer = mirrorWindow.getSize();
-      const inner = mirrorWindow.getContentSize();
+      const outer = window_.getSize();
+      const inner = window_.getContentSize();
       return { x: outer[0] - inner[0], y: outer[1] - inner[1] };
     } catch (error) { return { x: 0, y: 0 }; }
   };
   const mirrorHoldRatio = () => {
-    if (typeof mirrorWindow.setAspectRatio !== "function") return;
+    if (typeof window_.setAspectRatio !== "function") return;
     try {
-      if (mirrorWindow.isFullScreen()) return mirrorWindow.setAspectRatio(0);
-      const now = mirrorWindow.getBounds();
+      if (window_.isFullScreen()) return window_.setAspectRatio(0);
+      const now = window_.getBounds();
       if (now.width > 0 && now.height > 0) {
-        mirrorWindow.setAspectRatio(now.width / now.height);
+        window_.setAspectRatio(now.width / now.height);
       }
     } catch (error) { /* a missing guide only softens the drag */ }
   };
-  mirrorWindow.on("will-resize", (event, wants, details) => {
-    if (mirrorWindow.isFullScreen()) return;
-    const locked = mirrorAspectBounds(wants, mirror ? mirror.real : real,
+  window_.on("will-resize", (event, wants, details) => {
+    if (window_.isFullScreen()) return;
+    const locked = mirrorAspectBounds(wants, instance.real || real,
       details && details.edge, mirrorFrameEdge());
     if (!locked) return;
     event.preventDefault();
-    mirrorWindow.setBounds(locked);
+    window_.setBounds(locked);
   });
-  mirrorWindow.on("resized", mirrorHoldRatio);
-  mirrorWindow.on("enter-full-screen", mirrorHoldRatio);
-  mirrorWindow.on("leave-full-screen", mirrorHoldRatio);
-  mirrorWindow.once("ready-to-show", mirrorHoldRatio);
+  window_.on("resized", mirrorHoldRatio);
+  window_.on("enter-full-screen", mirrorHoldRatio);
+  window_.on("leave-full-screen", mirrorHoldRatio);
+  window_.once("ready-to-show", mirrorHoldRatio);
   /* The operator's last size and place, written down the way the panel's
    * is: debounced while it moves, once more as it closes. Fullscreen and
    * minimised are moments, not sizes, and are never written. */
@@ -2048,64 +2103,124 @@ async function openTabletMirror(options) {
     clearTimeout(mirrorBoundsAt);
     mirrorBoundsAt = setTimeout(() => {
       try {
-        if (!mirrorWindow || mirrorWindow.isDestroyed()
-          || mirrorWindow.isMinimized() || mirrorWindow.isFullScreen()) return;
-        writeConfig({ mirrorBounds: mirrorWindow.getBounds(), mirrorFull: false });
+        if (!window_ || window_.isDestroyed()
+          || window_.isMinimized() || window_.isFullScreen()) return;
+        writeConfig({ mirrorBounds: window_.getBounds(), mirrorFull: false });
       } catch (error) { /* a forgotten size only costs the next open */ }
     }, 600);
   };
-  mirrorWindow.on("resize", mirrorRemember);
-  mirrorWindow.on("move", mirrorRemember);
-  mirrorWindow.on("close", () => {
+  window_.on("resize", mirrorRemember);
+  window_.on("move", mirrorRemember);
+  window_.on("close", () => {
     clearTimeout(mirrorBoundsAt);
     try {
-      if (mirrorWindow.isMinimized()) return;
-      if (mirrorWindow.isFullScreen()) {
+      if (window_.isMinimized()) return;
+      if (window_.isFullScreen()) {
         /* Closed fullscreen: the windowed bounds underneath are already
          * remembered - fullscreen never overwrote them - so only the flag
          * is written, and the next open comes back fullscreen with the
          * same window waiting behind it. */
         writeConfig({ mirrorFull: true });
       } else {
-        writeConfig({ mirrorBounds: mirrorWindow.getBounds(), mirrorFull: false });
+        writeConfig({ mirrorBounds: window_.getBounds(), mirrorFull: false });
       }
     } catch (error) { /* fine */ }
+    closeTabletMirror(lease).catch(() => {});
   });
-  mirrorWindow.on("closed", () => {
-    mirrorWindow = null;
-    /* The held input shell belongs to this window. Leaving it open would
-     * keep an adb shell alive on the tablet for no reader. */
-    if (poke) { poke.close(); poke = null; }
-    /* The encoder on the tablet stops when nobody is watching. A mirror
-     * left running behind a closed window is a battery being spent on a
-     * picture nobody can see. [mirror-pause] ...and it stops cleanly. */
-    if (mirror) {
-      const going = mirror;
-      mirror = null;
-      Promise.resolve(going.closeGently()).catch(() => going.close());
-    }
+  window_.on("closed", () => {
+    closeTabletMirror(lease).catch(() => {});
   });
   /* [mirror-pause] minimised or hidden is not watching either: the tablet's
    * screenrecord stops (SIGINT, its own clean stop) and comes back when the
    * window does. One encoder on the tablet instead of two whenever the
    * picture is out of sight - see tablet-mirror.cjs pause(). */
-  const mirrorAway = () => { if (mirror) mirror.pause().catch(() => {}); };
-  const mirrorBack = () => {
-    if (mirror && mirrorWindow && !mirrorWindow.isDestroyed()
-      && !mirrorWindow.isMinimized() && mirrorWindow.isVisible()) mirror.resume();
+  const mirrorAway = () => {
+    if (lease.isCurrent()) instance.pause().catch(() => {});
   };
-  mirrorWindow.on("minimize", mirrorAway);
-  mirrorWindow.on("hide", mirrorAway);
-  mirrorWindow.on("restore", mirrorBack);
-  mirrorWindow.on("show", mirrorBack);
-  mirrorWindow.loadFile(path.join(__dirname, "renderer", "tablet-mirror.html"));
+  const mirrorBack = () => {
+    if (lease.isCurrent() && !window_.isDestroyed()
+      && !window_.isMinimized() && window_.isVisible()) instance.resume();
+  };
+  window_.on("minimize", mirrorAway);
+  window_.on("hide", mirrorAway);
+  window_.on("restore", mirrorBack);
+  window_.on("show", mirrorBack);
   /* [mirror-pip-refull] A mirror closed fullscreen comes BACK fullscreen,
    * with the remembered windowed bounds waiting underneath - leaving
    * fullscreen lands exactly where it used to. options.full (the
    * double-click open) still asks for it directly. */
   if ((options && options.full) || cfgAt.mirrorFull === true) {
-    mirrorWindow.once("ready-to-show", () => mirrorWindow.setFullScreen(true));
+    window_.once("ready-to-show", () => window_.setFullScreen(true));
   }
+  // A rejected page load must stay inside this open request, with ownership cleaned up.
+  try {
+    await window_.loadFile(path.join(__dirname, "renderer", "tablet-mirror.html"));
+  } catch (error) {
+    desktopFaults.record("mirror-load-failed", { error: String(error.stack || error).slice(0,6000) });
+    await closeTabletMirror(lease).catch(() => {});
+    if (!window_.isDestroyed()) window_.destroy();
+    return { ok: false, why: "the tablet window could not load: " + error.message };
+  }
+  if (!lease.isCurrent() || window_.isDestroyed()) {
+    return { ok: false, cancelled: true, why: "the mirror was closed" };
+  }
+  desktopFaults.record("mirror-opened", { generation: lease.generation });
+  // A crashed renderer leaves its native window alive; reload only the view.
+  let viewRecovery = null;
+  let viewCrashes = [];
+  window_.webContents.on("render-process-gone", (_event, details) => {
+    if (!lease.isCurrent() || window_.isDestroyed() || viewRecovery
+        || details.reason === "clean-exit") return;
+    const now = Date.now();
+    viewCrashes = viewCrashes.filter(at => now - at < 60000);
+    if (viewCrashes.length >= 2) {
+      desktopFaults.record("mirror-view-recovery-stopped", { reason: details.reason });
+      closeTabletMirror(lease).catch(() => {});
+      if (!window_.isDestroyed()) window_.destroy();
+      return;
+    }
+    viewCrashes.push(now);
+    const recovery = Promise.resolve().then(async () => {
+      if (!lease.isCurrent() || window_.isDestroyed()) return;
+      desktopFaults.record("mirror-view-recovering", { reason: details.reason });
+      try {
+        const { reloadMirrorView } = require("./mirror-view-reload.cjs");
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          if (!lease.isCurrent() || window_.isDestroyed()) return;
+          try { await reloadMirrorView(window_.webContents); break; }
+          catch (error) {
+            if (!lease.isCurrent() || window_.isDestroyed()) return;
+            if (attempt === 2) throw error;
+            desktopFaults.record("mirror-view-reload-retry", { error: error.message });
+          }
+        }
+        if (lease.isCurrent() && !window_.isDestroyed()) desktopFaults.record("mirror-view-recovered");
+      } catch (error) {
+        desktopFaults.record("mirror-view-recovery-failed", { error: String(error.stack || error).slice(0,6000) });
+        await closeTabletMirror(lease).catch(() => {});
+        if (!window_.isDestroyed()) window_.destroy();
+      }
+    }).finally(() => { if (viewRecovery === recovery) viewRecovery = null; });
+    viewRecovery = recovery;
+  });
+  tabletVitals(serial).then(before => {
+    if (lease.isCurrent() && !instance.running && vitals && vitals.serial === serial
+        && before && before.ok) vitals.mark(before);
+  }).catch(() => {});
+  const initialShape = { ...instance.real };
+  instance.measure(args => {
+    if (!lease.isCurrent()) return Promise.resolve("");
+    return new Promise(resolve => execFile(tools.adb, args,
+      { timeout: 4000, windowsHide: true },
+      (error, stdout, stderr) => resolve(String(stdout || "") + String(stderr || ""))));
+  }).then(() => {
+    if (!lease.isCurrent() || window_.isDestroyed()) return;
+    mirrorHoldRatio();
+    if (instance.running && (initialShape.width !== instance.real.width
+        || initialShape.height !== instance.real.height)) {
+      instance.rebuild("tablet display dimensions changed");
+    }
+  }).catch(() => {});
   return { ok: true };
 }
 
@@ -2149,8 +2264,9 @@ ipcMain.handle("mirror:sound", async (_event, want) => {
  * does any more. */
 let camera = null;
 let cameraWindow = null;
+let pipCameraActive = false, pipCameraGeneration = 0, pipCameraQueue = Promise.resolve();
 
-async function openCameraWindow(facing) {
+async function startTabletCamera(facing) {
   const { CameraGlass } = require("./tablet-mirror.cjs");
   const tools = terminalHost.tools();
   const serial = await terminalHost.glassSerial();
@@ -2159,6 +2275,7 @@ async function openCameraWindow(facing) {
   /* Ask the tablet to put its camera on the socket BEFORE connecting: the
    * service opens the lens when a reader arrives, so the order matters. */
   const glass = await terminalHost.glass();
+  await glass.wake().catch(() => ({ ok: false }));
   const told = await glass.say(
     "(async function () { var b = window.pineDesktop;"
     + " if (!b || !b.cameraOpen) return JSON.stringify({ok:false,"
@@ -2171,6 +2288,12 @@ async function openCameraWindow(facing) {
 
   if (!camera) camera = new CameraGlass({ adb: tools.adb, serial });
   const where = await camera.open(facing);
+  return where;
+}
+
+async function openCameraWindow(facing) {
+  const where = await startTabletCamera(facing);
+  if (!where.ok) return where;
 
   if (cameraWindow && !cameraWindow.isDestroyed()) {
     cameraWindow.focus();
@@ -2204,7 +2327,7 @@ async function openCameraWindow(facing) {
      * nothing more, and stopping the service would mean the next tap on the
      * icon had to start one and wait for it. "Available whenever I want" is
      * a service that is already there. */
-    if (camera) { await camera.close(); camera = null; }
+    if (camera && !pipCameraActive) { await camera.close(); camera = null; }
   });
   cameraWindow.loadFile(path.join(__dirname, "renderer", "tablet-camera.html"));
   return Object.assign({ ok: true }, where);
@@ -2230,6 +2353,31 @@ ipcMain.handle("camera:open", async (_event, want) => {
   } catch (error) {
     return { ok: false, why: error.message };
   }
+});
+
+ipcMain.handle('camera:pip', async (event, want) => {
+  if (event.sender !== win?.webContents) throw new Error('Open camera PiP from the Pine desktop.');
+  const generation = ++pipCameraGeneration;
+  const task = pipCameraQueue.catch(() => {}).then(async () => {
+  if (generation !== pipCameraGeneration) return { ok: false, why: 'Camera selection changed.' };
+  try {
+    if (want?.off) {
+      pipCameraActive = false;
+      if (camera && (!cameraWindow || cameraWindow.isDestroyed())) { await camera.close(); camera = null; }
+      return { ok: true };
+    }
+    pipCameraActive = true;
+    const where = await startTabletCamera(want?.facing);
+    if (generation !== pipCameraGeneration) {
+      if (!pipCameraActive && camera && (!cameraWindow || cameraWindow.isDestroyed())) { await camera.close(); camera = null; }
+      return { ok: false, why: 'Camera selection changed.' };
+    }
+    if (!where.ok) pipCameraActive = false;
+    return where;
+  } catch (error) { if (generation === pipCameraGeneration) pipCameraActive = false; return { ok: false, why: error.message }; }
+  });
+  pipCameraQueue = task;
+  return task;
 });
 
 /* A CAMERA FRAME ON THE CLIPBOARD, through the same mill the screenshots
@@ -2410,12 +2558,16 @@ ipcMain.handle("tablet:camera", async (_event, want) => {
 
 ipcMain.handle("mirror:touch", async (_event, act) => {
   try {
+    const lease = mirrorLifecycle.current;
+    if (!lease || !lease.isCurrent()) return { ok: false, why: "the mirror is not open" };
     if (!poke) {
       const { TabletInput } = require("./tablet-input.cjs");
       const tools = terminalHost.tools();
-      const serial = await terminalHost.glassSerial();
-      if (!serial) return { ok: false, why: "no tablet is attached" };
+      const serial = lease.mirror.serial || await terminalHost.glassSerial();
+      if (!serial) return { ok: false, why: terminalHost.glassWhy || "no tablet is attached" };   /* [tablet-attach] */
+      if (!lease.isCurrent()) return { ok: false, cancelled: true, why: "the mirror was closed" };
       poke = new TabletInput({ adb: tools.adb, serial });
+      lease.poke = poke;
     }
     const what = (act && act.do) || "";
     if (what === "tap") return poke.tap(act.x, act.y);
@@ -2440,9 +2592,18 @@ ipcMain.handle("mirror:show", async (_event, options) => {
 ipcMain.handle("mirror:open", async (_event, shape) => {
   if (!mirror) return { ok: false, why: "the mirror is not set up" };
   try {
-    const opened = await mirror.open(shape || {});
+    const instance = mirror;
+    const lease = mirrorLifecycle.current;
+    const opened = await instance.open(shape || {});
+    if (!lease || !lease.isCurrent() || mirror !== instance) {
+      return { ok: false, cancelled: true, why: "the mirror was closed" };
+    }
+    const window_ = lease.window;
+    if (window_ && (window_.isDestroyed() || window_.isMinimized() || !window_.isVisible())) {
+      await instance.pause();
+    }
     mirrorQualityWatch();
-    return opened;
+    return Object.assign({}, opened, instance.how());
   } catch (error) {
     return { ok: false, why: error.message };
   }
@@ -2467,12 +2628,14 @@ let mirrorQualityTimer = null;
 async function mirrorQualityFromTablet() {
   if (mirrorQualityAsking || !mirror || !mirror.running || mirror.paused) return;
   mirrorQualityAsking = true;
+  const instance = mirror;
   try {
     const said = await (await terminalHost.glass()).say(MIRROR_QUALITY_ASK);
+    if (mirror !== instance || !instance.running || instance.paused) return;
     if (said && said.ok && said.at && said.at !== mirrorQualitySeen
         && said.q >= 0.1 && said.q <= 1) {
       mirrorQualitySeen = said.at;
-      mirror.requality(said.q);
+      instance.requality(said.q);
     }
   } catch (error) { /* a sleeping tablet keeps the quality in force */ }
   finally { mirrorQualityAsking = false; }
@@ -3568,7 +3731,7 @@ function reviveRested() {
  * answer at all means it declined - a revival does not return, because the
  * process is gone".
  */
-ipcMain.handle("app:revive", (_event, opts) => {
+ipcMain.handle("app:revive", async (_event, opts) => {
   try {
     const why = String((opts && opts.why) || "");
     if (!opts || !opts.now) {
@@ -3601,7 +3764,6 @@ ipcMain.handle("app:revive", (_event, opts) => {
      * failure the tablet measured at #1317c, where a launch that landed
      * inside the old process's teardown came back half dead. Releasing the
      * lock here closes the window rather than hoping the timing is kind. */
-    try { app.releaseSingleInstanceLock(); } catch (error) { /* never held */ }
     try {
       app.relaunch();
     } catch (error) {
@@ -3613,6 +3775,8 @@ ipcMain.handle("app:revive", (_event, opts) => {
       return { ok: false,
         say: "the app could not arrange to come back: " + error.message };
     }
+    await prepareTabletMirrorExit(12000);
+    try { app.releaseSingleInstanceLock(); } catch (error) { /* never held */ }
     /* Not reached by the caller - the process is gone before this answer can
      * be delivered - but deaf-watch reads `say` if it ever were. */
     app.exit(0);
@@ -3758,16 +3922,40 @@ ipcMain.handle("replay:push", (_event, buffer, meta) => {
  * reason the display-media handler answers with this window and no picker:
  * the wrong choice would quietly record somebody else's screen into a ring
  * that gets exported. */
+ipcMain.handle("replay:audio-target", (event, target) => {
+  if (!win || win.isDestroyed() || event.sender !== win.webContents
+      || event.senderFrame !== win.webContents.mainFrame) {
+    throw new Error('Recording audio selection belongs to the Pine desktop.');
+  }
+  if (!['shell', 'panel'].includes(target) && !ringAudioFrames.targets().includes(target)) {
+    throw new Error('Unknown recording audio source.');
+  }
+  ringAudioTarget = target;
+  return { ok: true, target };
+});
+
+ipcMain.handle("replay:audio-sources", event => {
+  if (!win || win.isDestroyed() || event.sender !== win.webContents
+      || event.senderFrame !== win.webContents.mainFrame) {
+    throw new Error('Recording audio discovery belongs to the Pine desktop.');
+  }
+  return { ok: true, targets: ringAudioFrames.targets(), revision: ringAudioFrames.revision };
+});
+
 ipcMain.handle("replay:source", () => {
   try {
     if (!win || win.isDestroyed()) return { ok: false, detail: "no window" };
     /* #1205: `loopback` travels with the source id so the renderer can say,
      * in the one place a person will read it, whether a silent recording is
      * this platform's limit or a gesture it never got. */
+    const bounds = win.getBounds();
+    const scale = require('electron').screen.getDisplayMatching(bounds).scaleFactor || 1;
     return { ok: true, id: win.getMediaSourceId(), loopback: LOOPBACK_HERE,
+      width: Math.max(1, Math.round(bounds.width * scale)),
+      height: Math.max(1, Math.round(bounds.height * scale)),
       platform: process.platform,
-      detail: LOOPBACK_HERE ? "" : "Electron captures application audio on "
-        + "Windows only, so recordings on " + process.platform + " are silent" };
+      detail: LOOPBACK_HERE ? "" : "System loopback is unavailable on "
+        + process.platform + "; application audio uses separate frame taps" };
   } catch (error) {
     return { ok: false, detail: error.message };
   }
@@ -3792,7 +3980,7 @@ ipcMain.handle("replay:begin", (_event, opts) => {
   } catch (error) { /* a diagnostic may never stop a recording */ }
   try {
     const cfg = readConfig() || {};
-    const held = Number(cfg.replayHoldSeconds || 0) || HOLD_DEFAULT_S;
+    const held = Number(cfg.replayHoldSeconds || 0) || HOLD_MAX_S;
     return screenRing.begin({ holdSeconds: held, ...(opts || {}) });
   } catch (error) { return { ok: false, why: error.message }; }
 });
@@ -3852,25 +4040,32 @@ ipcMain.handle("replay:hold", (_event, seconds) => {
  *
  * This asks the recorder to close the piece it is on. The renderer stops its
  * MediaRecorder, which emits immediately and starts the next, and we wait
- * for the count of landed pieces to move. The ceiling is short on purpose: a
+ * for both streams and preceding writes to be acknowledged. The ceiling is short: a
  * recorder that has died must cost a cut a few hundred milliseconds, never
  * hang it, so the cut goes ahead with whatever is on disk and the answer
  * still says honestly where the window landed. */
 function replayFlush(ms) {
   return new Promise((resolve) => {
     if (!win || win.isDestroyed() || !screenRing.running) return resolve(false);
-    const was = screenRing.taken;
     let done = false;
-    const finish = (got) => { if (done) return; done = true; clearInterval(tick);
-      clearTimeout(stop); resolve(got); };
-    const tick = setInterval(() => { if (screenRing.taken !== was) finish(true); }, 25);
-    const stop = setTimeout(() => finish(false), Math.max(200, Number(ms) || 900));
-    try { win.webContents.send("replay-flush"); }
-    catch (error) { finish(false); }
+    const finish = got => {
+      if (done) return;
+      done = true; clearTimeout(timeout); resolve(!!got);
+    };
+    const timeout = setTimeout(() => finish(false), Math.max(200, Number(ms) || 1500));
+    try {
+      // The renderer resolves after BOTH current streams have reached disk.
+      // A picture counter alone can advance while the latest sound is in flight.
+      Promise.resolve(win.webContents.executeJavaScript(
+        'window.PineScreenRing ? window.PineScreenRing.flush() : false', true
+      )).then(result => finish(result === true || result?.ok === true), () => finish(false));
+    } catch (error) { finish(false); }
   });
 }
 
+
 ipcMain.handle("replay:frames", async (_event, want) => {
+  const endAt = Date.now();
   try {
     const asked = want || {};
     /* THE SCRUB STRIP MAY NOT ASK PAST THE OLD END. `back` is clamped to
@@ -3890,7 +4085,7 @@ ipcMain.handle("replay:frames", async (_event, want) => {
     const askedBack = Math.max(0, Number(asked.back) || 0);
     const back = Math.min(askedBack, Math.max(0, (state.seconds || 0) - seconds));
     const got = await screenRing.frames(
-      { seconds, count: asked.count, edge: Number(asked.edge) || 640, back },
+      { seconds, count: asked.count, edge: Number(asked.edge) || 640, back, end_at: endAt },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     return { ...got, asked_back: askedBack,
       clamped: !!got.clamped || (askedBack - back > 0.6) };
@@ -3899,30 +4094,57 @@ ipcMain.handle("replay:frames", async (_event, want) => {
   }
 });
 
+/* [pip-export-bar] An export tells the window that asked how far it is; the bar at the
+ * foot of Pine (pine-pip.js) draws it with the words over it. ratio null = unknown. */
+function replayProgressTeller(sender, want, view) {
+  let last = -1, lastAt = 0;
+  const tell = (stage, ratio, extra) => {
+    try {
+      if (!sender || sender.isDestroyed()) return;
+      const now = Date.now(), share = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : null;
+      if (stage === 'encode' && share !== null && share - last < .01 && now - lastAt < 400) return;
+      if (share !== null) last = share;
+      lastAt = now;
+      sender.send("replay:progress", { view: view || (want?.view === 'pip' ? 'pip' : 'app'), audio: want?.audio_only === true,
+        stage, ratio: share, at: now, ...(extra || {}) });
+    } catch (_) { /* a window that has gone */ }
+  };
+  return { tell };
+}
+
 ipcMain.handle("replay:export", async (_event, want) => {
+  const endAt = Date.now();
   const asked = Math.max(1, Number((want || {}).seconds) || 30);
+  const teller = replayProgressTeller(_event.sender, want);   /* [pip-export-bar] */
   try {
+    teller.tell('flush', .02);
     await replayFlush(900);
     /* #1205: `video_only` reaches the CUT now rather than only the dressing
      * step. The sound is in the pieces, so "video only" has to mean "do not
      * carry it through the concat" - stripping it afterwards would be a
      * second encode of a file that already had what was refused in it. */
-    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0,
-      video_only: !!((want || {}).video_only) },
-      { ffmpeg: (readConfig() || {}).ffmpeg });
-    if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
-    /* The broadcast goes under the picture here too. A screen recording of a
-     * radio station with no radio on it is half a recording, and the sheet
-     * offers "Allow video without complete audio" precisely because the
-     * sound is meant to be there unless it is refused. */
-    const dressed = await replayWithSound(made, !!((want || {}).video_only));
+    const audioOnly = want?.audio_only === true;
+    const made = await screenRing[audioOnly ? 'cutAudio' : 'cut']({ seconds: asked, back: (want || {}).back || 0,
+      video_only: !!((want || {}).video_only), view: want?.view === 'pip' ? 'pip' : undefined, end_at: endAt },
+      { ffmpeg: (readConfig() || {}).ffmpeg, onProgress: share => teller.tell('encode', .05 + share * .85) });
+    if (!made.ok) { teller.tell('failed', null, { detail: made.detail }); return { ok: false, detail: made.detail, held: made.held }; }
+    /* The buffered mix is the sound that played during this picture.
+     * Missing captured audio requires an explicit opt-out. */
+    const dressed = audioOnly ? { path: made.out, audio: made.audio } : await replayWithSound(made, !!((want || {}).video_only));
+    if (!want?.video_only && want?.require_audio !== false
+        && (!dressed.audio?.present || !dressed.audio?.complete)) {
+      clipMux.forget(made.dir);
+      teller.tell('failed', null, { detail: 'the complete audio mix is not in the buffer yet' });
+      return { ok: false, detail: 'The saved buffer does not contain the complete audio mix heard during this video. Let the audio buffer fill and try again, or choose picture only.', audio: dressed.audio };
+    }
     made.out = dressed.path;
     made.bytes = fs.statSync(dressed.path).size;
     const folder = replayFolder();
-    const name = String((want || {}).name || "") || replayName(made.seconds);
+    const name = String((want || {}).name || "") || (audioOnly ? replayName(made.seconds).replace('screen-', 'mix-').replace(/\.mp4$/, '.wav') : replayName(made.seconds));
     const where = path.join(folder, name.replace(/[^\w.-]+/g, "-"));
+    teller.tell('save', .93);
     try {
-      fs.copyFileSync(made.out, where);
+      await fs.promises.copyFile(made.out, where);
     } catch (error) {
       clipMux.forget(made.dir);
       return { ok: false, detail: "could not write " + where + ": " + error.message };
@@ -3932,6 +4154,7 @@ ipcMain.handle("replay:export", async (_event, want) => {
      * file on this machine is already written by the time this runs. */
     let uploaded = null;
     if (want && want.upload) {
+      teller.tell('upload', .96);
       uploaded = { ok: false, detail: "not attempted" };
       try {
         const cfg = readConfig() || {};
@@ -3951,10 +4174,12 @@ ipcMain.handle("replay:export", async (_event, want) => {
       }
     }
     clipMux.forget(made.dir);
+    teller.tell('done', 1, { seconds: made.seconds, where });
     return { ok: true, where, bytes: made.bytes, asked,
       seconds: made.seconds, held: made.held, clamped: !!made.clamped,
-      uploaded, audio: dressed.audio, detail: "" };
+      uploaded, audio: dressed.audio, video: made.video || null, detail: "" };
   } catch (error) {
+    teller.tell('failed', null, { detail: error.message });
     return { ok: false, detail: error.message };
   }
 });
@@ -3969,10 +4194,9 @@ ipcMain.handle("replay:export", async (_event, want) => {
  * renderer calling openVideoEditor(undefined) and the operator looking at a
  * broken frame.
  *
- * The broadcast is laid under the picture BEFORE the upload, out of
- * PineAir's ring, for the window the video actually covers - the video is a
- * slice of the past, so the sound must be the same slice of the past, not
- * the last N seconds counted from now. `video_only` skips that.
+ * The captured application mix stays under the same recorded interval
+ * before upload, preserving the levels heard at playback time.
+ * `video_only` explicitly skips that sound.
  *
  * And if the upload fails the captured moment is still written to the
  * recordings folder, said as `original_saved` and `where`. The tablet does
@@ -4000,97 +4224,20 @@ function videoIdentity(value) {
   return id;
 }
 
-/* The picture as it is, with the broadcast laid under it when there is one.
- * Returns {path, dir, audio, notes}.
- *
- * #1205: THE SOUND IS USUALLY ALREADY THERE, AND THEN THIS DOES NOTHING.
- *
- * The ring films with the desk's loopback mix on it, so a cut comes back with
- * the broadcast already under the picture, sample-aligned by construction -
- * one file, one clock, nothing to drift. When that is what happened, this
- * returns the cut untouched and reports the RING's provenance.
- *
- * That is also the rule that keeps the file honest: THE OLD PINEAIR ROAD
- * RUNS ONLY WHEN THE RING CARRIED NOTHING. Muxing both would put the same
- * broadcast in the file twice, a few hundred milliseconds apart - the exact
- * fault the #1182 comment was written to avoid, arriving from the other
- * direction. It is kept as a fallback rather than deleted because it costs
- * nothing when there is no sound to add and because it is the road that
- * works on a surface where these modules are injected into the panel itself
- * (the tablet), where PineAir genuinely can hear the broadcast.
- *
- * On this desk it will almost never fire, and when it does not fire it says
- * why: PineAir.start() has one caller in the whole renderer (sampler.js:3247)
- * and it taps the shell, while the broadcast plays in the panel webview. */
+/* Recent recordings carry the application mix saved at playback time.
+ * Keep that audio and its measured coverage intact. A later source-file or
+ * sampler reconstruction cannot reproduce the levels and sound that were heard. */
 async function replayWithSound(made, videoOnly) {
-  const notes = [];
-  const fromRing = (made && made.audio) || null;
-  if (fromRing && fromRing.present && !videoOnly) {
-    return { path: made.out, dir: made.dir, audio: fromRing, notes };
-  }
-  if (videoOnly) {
-    return { path: made.out, dir: made.dir,
-      audio: fromRing || { source: AUDIO_SOURCE, present: false, complete: false,
-        state: "unavailable", detail: "video only, as asked",
-        coverage_ratio: 0, gaps: 0, video_only_explicit: true },
-      notes };
-  }
-  const audio = { ...(fromRing || {}), source: "pine-air-ring", present: false,
-    complete: false, state: "unavailable", detail: "",
-    ring_detail: (fromRing && fromRing.detail) || "",
-    video_only_explicit: !!videoOnly };
-  let wav = null;
-  try {
-    const raw = await win.webContents.executeJavaScript(
-      glassParts.broadcastQuestion(made.from.toFixed(3), made.to.toFixed(3)), true);
-    const got = JSON.parse(String(raw));
-    if (got && got.ok) wav = Buffer.from(got.b64, "base64");
-    else audio.detail = String((got && got.why) || "the ring did not answer");
-  } catch (error) {
-    audio.detail = error.message;
-  }
-  if (!wav || wav.length <= 44) {
-    audio.state = "unavailable";
-    if (!audio.detail) audio.detail = "the broadcast ring held nothing for that window";
-    /* Both roads are named, because "no audio" with one reason reads like a
-     * fault and this is two different ones stacked: the recording had no
-     * loopback, and the after-the-fact tap had nothing either. */
-    if (audio.ring_detail) audio.detail = audio.ring_detail + "; " + audio.detail;
-    notes.push("no broadcast audio: " + audio.detail);
-    return { path: made.out, dir: made.dir, audio, notes };
-  }
-  const wavPath = path.join(made.dir, "broadcast.wav");
-  const out = path.join(made.dir, "with-sound.mp4");
-  try {
-    fs.writeFileSync(wavPath, wav);
-    await clipMux.mux({ video: made.out, broadcast: { path: wavPath, offset: 0 },
-      mic: null, gains: {}, inPoint: 0, outPoint: made.seconds, out },
-      { ffmpeg: (readConfig() || {}).ffmpeg });
-    audio.present = true;
-    audio.complete = true;
-    audio.state = "captured";
-    audio.coverage_ratio = 1;
-    audio.covered_seconds = made.seconds;
-    audio.gaps = 0;
-    audio.gap_seconds = 0;
-    audio.detail = "the broadcast, from PineAir's ring";
-    return { path: out, dir: made.dir, audio, notes };
-  } catch (error) {
-    /* #1205: "unavailable", not "partial". The file returned here is the
-     * ORIGINAL cut - the mux failed, so it has no audio track at all - and
-     * "partial" makes the editor print "Audio has gaps", which is a claim
-     * that some of the sound is in there. None of it is. */
-    audio.state = "unavailable";
-    audio.present = false;
-    audio.complete = false;
-    audio.coverage_ratio = 0;
-    audio.detail = "the sound would not lay under the picture: " + error.message;
-    notes.push(audio.detail);
-    return { path: made.out, dir: made.dir, audio, notes };
-  }
+  const fromRing = made?.audio || null;
+  return { path: made.out, dir: made.dir,
+    audio: fromRing || { source: AUDIO_SOURCE, present: false, complete: false,
+      state: "unavailable", detail: videoOnly ? "video only, as asked" : "The recorded audio mix is unavailable.",
+      coverage_ratio: 0, gaps: 0, video_only_explicit: !!videoOnly },
+    notes: [] };
 }
 
 ipcMain.handle("replay:edit", async (_event, want) => {
+  const endAt = Date.now();
   const opts = want || {};
   const asked = Math.max(1, Math.min(HOLD_MAX_S, Number(opts.seconds) || 60));
   let made = null;
@@ -4098,10 +4245,15 @@ ipcMain.handle("replay:edit", async (_event, want) => {
   try {
     await replayFlush(900);
     made = await screenRing.cut({ seconds: asked, back: opts.back || 0,
-      video_only: !!opts.video_only },
+      video_only: !!opts.video_only, end_at: endAt },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
     const dressed = await replayWithSound(made, !!opts.video_only);
+    if (!opts.video_only && opts.require_audio !== false
+        && (!dressed.audio?.present || !dressed.audio?.complete)) {
+      clipMux.forget(made.dir);
+      return { ok: false, detail: "The saved buffer does not contain the complete audio mix heard during this video. Let the audio buffer fill and try again, or choose picture only.", audio: dressed.audio };
+    }
     file = dressed.path;
     const bytes = fs.statSync(file).size;
     if (!bytes || bytes > 256 * 1024 * 1024) {
@@ -4261,48 +4413,25 @@ ipcMain.handle("corners:set", (_event, patch) => {
   }
 });
 
-/* THE SAME CUT INTO THE DESK'S OWN TRIM WINDOW - a second road, not a
- * rival. replayEdit above is the one the corner gesture uses, because that
- * is the one the renderer's contract names; this one opens the local clip
- * window (openClipExport) with its trim, its channels and its gains, which
- * is a thing the tablet has no equivalent of and the desk should not lose.
- * It is registered under a name of its own: two handlers on one channel is
- * a throw at startup, not a fallback.
- *
- * openClipExport is the window the forward recorder already opens - trim,
- * channels, gains - and it takes exactly what localClip() returns. So the
- * ring's cut is dressed in that same shape, including the broadcast audio.
- * That is the one piece that has to line up: the video is a slice of the
- * past, so the audio must be the same slice of the past, not the last N
- * seconds counted from now.
- *
- * #1205: AND THE BROADCAST CHANNEL NOW COMES OUT OF THE CUT ITSELF.
- *
- * This window's export runs through clipMux.planArgs, which maps ONLY the
- * channels it is handed and writes `-an` when it is handed none - so a cut
- * that already carries the desk mix would have been exported silent, by a
- * road that was reading the picture and throwing the sound away. The mix is
- * therefore lifted out of the cut into a wav and handed over as the
- * broadcast channel: the operator keeps the checkbox and the gain, the sound
- * is the one that was recorded with the picture, and it is in the file
- * exactly once. PineAir is asked only when the cut had nothing. */
-async function ringAudioAsWav(made) {
-  const out = path.join(made.dir, "ring-audio.wav");
-  const args = ["-hide_banner", "-nostdin", "-y", "-i", made.out,
-    "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out];
-  await clipMux.run(clipMux.findFfmpeg((readConfig() || {}).ffmpeg).path, args, 120000);
-  const wav = fs.readFileSync(out);
-  if (wav.length <= 44) throw new Error("the cut's audio track was empty");
-  return wav;
-}
-
+/* The local trim window receives the original recorded MP4 and embedded mix,
+ * just like the station editor. Audio stays stereo at its captured levels;
+ * the trim/export window can explicitly change those settings afterward. */
 ipcMain.handle("replay:local-edit", async (_event, want) => {
-  const asked = Math.max(1, Number((want || {}).seconds) || 30);
+  const endAt = Date.now();
+  const opts = want || {};
+  const asked = Math.max(1, Number(opts.seconds) || 30);
+  let made = null;
   try {
-    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0,
-      video_only: !!((want || {}).video_only) },
+    await replayFlush(900);
+    made = await screenRing.cut({ seconds: asked, back: opts.back || 0,
+      video_only: !!opts.video_only, end_at: endAt },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
+    if (!opts.video_only && opts.require_audio !== false
+        && (!made.audio?.present || !made.audio?.complete)) {
+      clipMux.forget(made.dir);
+      return { ok: false, detail: "The saved buffer does not contain the complete audio mix heard during this video. Let the audio buffer fill and try again, or choose picture only.", audio: made.audio || null };
+    }
     const notes = ["this window was recorded, not the tablet",
       "cut out of the rolling ring - " + made.seconds.toFixed(1) + "s ending "
       + (made.to <= 0.6 ? "now" : made.to.toFixed(1) + "s ago")];
@@ -4310,41 +4439,18 @@ ipcMain.handle("replay:local-edit", async (_event, want) => {
       notes.push("the ring did not reach the whole way back - it holds "
         + Math.round(made.held) + "s");
     }
-    const audio = { broadcast: null, mic: null };
-    const ring = made.audio || {};
-    if (!(want && want.video_only) && ring.present) {
-      try {
-        audio.broadcast = { wav: await ringAudioAsWav(made), offset: 0 };
-        notes.push("the broadcast was recorded with the picture - "
-          + String(ring.detail || "the desk mix"));
-      } catch (error) {
-        notes.push("the recorded sound would not come out of the cut: " + error.message);
-      }
-    }
-    if (!(want && want.video_only) && !audio.broadcast) {
-      try {
-        const fromAgo = made.from;
-        const toAgo = made.to;
-        const raw = await win.webContents.executeJavaScript(
-          glassParts.broadcastQuestion(fromAgo.toFixed(3), toAgo.toFixed(3)), true);
-        const got = JSON.parse(String(raw));
-        if (got && got.ok) {
-          audio.broadcast = { wav: Buffer.from(got.b64, "base64"), offset: 0 };
-        } else {
-          notes.push("no broadcast audio: " + ((got && got.why) || "the ring did not answer"));
-        }
-      } catch (error) {
-        notes.push("no broadcast audio: " + error.message);
-      }
-    }
+    const embeddedAudio = made.audio?.present === true && !opts.video_only;
+    if (embeddedAudio) notes.push("the captured audio mix stays at its recorded levels");
     const mp4 = fs.readFileSync(made.out);
     clipMux.forget(made.dir);
     openClipExport({ ok: true, mp4, bytes: mp4.length, seconds: made.seconds,
-      at: Date.now(), audio, notes });
+      at: endAt, audio: { broadcast: null, mic: null },
+      audioMeta: made.audio || null, embeddedAudio, notes });
     return { ok: true, seconds: made.seconds, bytes: mp4.length, held: made.held,
       clamped: !!made.clamped, notes, audio: made.audio || null,
-      broadcast: !!audio.broadcast, mic: false };
+      broadcast: embeddedAudio, mic: false };
   } catch (error) {
+    if (made?.dir) clipMux.forget(made.dir);
     return { ok: false, detail: error.message };
   }
 });
@@ -4736,10 +4842,11 @@ function openClipExport(made) {
   const dir = clipMux.stash();
   const held = { dir, video: path.join(dir, "screen.mp4"), broadcast: null,
     mic: null, seconds: made.seconds, notes: made.notes || [],
-    broadcastOffset: 0, micOffset: 0, micQuiet: false };
+    broadcastOffset: 0, micOffset: 0, micQuiet: false,
+    embeddedAudio: made.embeddedAudio === true && made.audioMeta?.present === true };
   fs.writeFileSync(held.video, made.mp4);
   const audio = made.audio || {};
-  if (audio.broadcast && audio.broadcast.wav && audio.broadcast.wav.length > 44) {
+  if (!held.embeddedAudio && audio.broadcast && audio.broadcast.wav && audio.broadcast.wav.length > 44) {
     held.broadcast = path.join(dir, "broadcast.wav");
     fs.writeFileSync(held.broadcast, audio.broadcast.wav);
     held.broadcastOffset = audio.broadcast.offset || 0;
@@ -4801,7 +4908,8 @@ ipcMain.handle("clip:pending", (event) => {
     micUrl: fileUrl(held.mic),
     broadcastOffset: held.broadcastOffset,
     micOffset: held.micOffset,
-    micQuiet: held.micQuiet
+    micQuiet: held.micQuiet,
+    embeddedAudio: held.embeddedAudio
   };
 });
 
@@ -4831,7 +4939,8 @@ ipcMain.handle("clip:export", async (event, choices) => {
     const use = (choices && choices.use) || {};
     const done = await clipMux.mux({
       video: held.video,
-      broadcast: use.broadcast && held.broadcast
+      embeddedAudio: held.embeddedAudio && use.broadcast !== false,
+      broadcast: !held.embeddedAudio && use.broadcast && held.broadcast
         ? { path: held.broadcast, offset: held.broadcastOffset } : null,
       mic: use.mic && held.mic ? { path: held.mic, offset: held.micOffset } : null,
       inPoint: choices.inPoint,
@@ -4927,6 +5036,22 @@ ipcMain.handle("glass:stop", async () => {
     await (await terminalHost.glass()).stopRecording();
   } catch (error) { /* nothing recording is the ordinary case */ }
   return { ok: true };
+});
+
+const tabletReplayExport = require('./tablet-replay-export.cjs').createTabletReplayExporter({
+  glass: () => terminalHost.glass(), mux: clipMux, folder: replayFolder, config: readConfig
+});
+ipcMain.handle('tablet:replay-export', async (event, want) => {
+  if(event.sender!==win?.webContents)throw Error('Tablet exports belong to the Pine desktop.');
+  /* [pip-export-bar] the tablet's cut has no clock to read: the bar sweeps until it is saved */
+  const teller = replayProgressTeller(event.sender, want, 'tablet');
+  teller.tell('encode', null);
+  try {
+    const made = await tabletReplayExport(want);
+    if (made?.ok) teller.tell('done', 1, { seconds: made.seconds, where: made.where });
+    else teller.tell('failed', null, { detail: made?.detail || made?.why || 'PineTab recording unavailable' });
+    return made;
+  } catch (error) { teller.tell('failed', null, { detail: error.message }); throw error; }
 });
 
 ipcMain.handle("glass:clip", async (_event, seconds, options) => {
@@ -5199,8 +5324,43 @@ app.commandLine.appendSwitch(
 );
 
 app.whenReady().then(async () => {
-  selfSyncFromShare();
-  createWindow();
+  await selfSyncFromShare();
+  if (!win || win.isDestroyed()) createWindow();
+  if (process.argv.includes('--pip') || readConfig().pip?.enabled === true) {
+    win.webContents.once('did-finish-load', async () => {
+      try { await win.webContents.executeJavaScript('window.PinePip?.enter()', true); win.show(); win.focus(); }
+      catch (error) { console.error('[PiP startup] ' + error.message); }
+    });
+  }
+  if (process.argv.includes('--recover-audio') || process.argv.includes('--recover-playback')) {
+    win.webContents.once('did-finish-load', () => setTimeout(() => {
+      stationTroubleshooter.open();
+      const playback = process.argv.includes('--recover-playback');
+      stationTroubleshooter.run(playback ? 'playback' : 'audio').then(result => {
+        fs.writeFileSync(path.join(PINE_USER_DATA, playback ? 'station-playback-recovery.json' : 'station-audio-recovery.json'), JSON.stringify(result, null, 2));
+      }).catch(error => console.error('[audio recovery] ' + error.message));
+    }, 2000));
+  }
+  const { PineLens } = require('./pinelens.cjs');
+  const lens = new PineLens({electron: require('electron'), read: readConfig, write: writeConfig,
+    exportFolder: replayFolder,
+    upload: async made => {
+      const cfg = readConfig();
+      const response = await fetch(cfg.baseUrl + '/api/export/upload?what=screen&seconds=' +
+        encodeURIComponent(made.seconds) + '&name=' + encodeURIComponent(path.basename(made.path)),
+        {method: 'PUT', headers: {'Content-Type': 'video/mp4', ...authHeaders(cfg)},
+          body: fs.readFileSync(made.path), signal: AbortSignal.timeout(120000)});
+      if (!response.ok) throw new Error('Lens video saved locally; upload failed: HTTP ' + response.status);
+      return response.json();
+    },
+    window: () => win, python: () => pythonCommand(readConfig()),
+    request: (route, body) => fetchJson(readConfig().baseUrl + route,
+      {method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(5000)})});
+  ipcMain.handle('pinelens:preview', () => lens.capture(true));
+  ipcMain.handle('pinelens:save', (_event, value) => lens.save(value));
+  ipcMain.handle('pinelens:state', () => lens.state());
+  lens.round();
+  app.on('before-quit', () => lens.close());
   /* #1114: the courier starts once the window is up and rounds forever. */
   setTimeout(courierRound, 8000);
   setInterval(courierRound, COURIER_MS);

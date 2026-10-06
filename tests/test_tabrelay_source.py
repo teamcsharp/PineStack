@@ -8,6 +8,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from unittest.mock import patch, Mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +49,14 @@ class Plan(unittest.TestCase):
         # joined but the relay not listening is not a road
         self.assertEqual("dongle", self.plan("auto", rep(listening=False), wanted=False)["use"])
 
+    def test_idle_poll_interval_does_not_cancel_handoff(self):
+        p = self.plan("auto", rep(joined=False, listening=False, age=31))
+        self.assertTrue(p["want_tablet"], "30 s idle polls must remain eligible between reports")
+        p = self.plan("auto", rep(joined=False, listening=False, age=76))
+        self.assertFalse(p["want_tablet"], "a silent idle tablet must still expire")
+        p = self.plan("auto", rep(age=21))
+        self.assertEqual("dongle", p["use"], "active relay reports retain the fast failure limit")
+
     def test_auto_handoff_mbb_then_bbm_then_backoff(self):
         mem = {}
 
@@ -75,6 +84,12 @@ class Plan(unittest.TestCase):
         p = self.plan("auto", rep(joined=False), mem, now=NOW + pl.RELAY_LOSS_S + 1)
         self.assertEqual(("dongle", False), (p["use"], p["want_tablet"]))
         self.assertGreater(mem["fail_until"], NOW)
+
+    def test_rejoin_is_not_cancelled_before_android_join_timeout(self):
+        mem = {}
+        self.plan("auto", rep(), mem, now=NOW)
+        p = self.plan("auto", rep(joined=False, listening=False, age=-39), mem, now=NOW + 40)
+        self.assertEqual(("wait", True, True), (p["use"], p["want_tablet"], p["release_dongle"]))
 
     def test_always_waits_for_the_tablet_and_keeps_the_dongle_off(self):
         p = self.plan("always", rep(joined=False))
@@ -106,9 +121,14 @@ class Road(unittest.TestCase):
             old = (pl.RELAY_PREF_FILE, pl.RELAY_FILE)
             pl.RELAY_PREF_FILE, pl.RELAY_FILE = pref, relay
             try:
-                self.assertEqual({"pref": "auto", "mode": "udp"}, pl.relay_pref())   # no file
+                self.assertEqual({"pref": "never", "mode": "udp"}, pl.relay_pref())   # no file
                 pref.write_text("{not json")
-                self.assertEqual("auto", pl.relay_pref()["pref"])                 # unreadable
+                self.assertEqual("never", pl.relay_pref()["pref"])                # unreadable
+                pref.write_text(json.dumps({"pref": "invalid", "mode": "invalid"}))
+                self.assertEqual({"pref": "never", "mode": "udp"}, pl.relay_pref())
+                for selected in ("auto", "always"):
+                    pref.write_text(json.dumps({"pref": selected}))
+                    self.assertEqual(selected, pl.relay_pref()["pref"])
                 pref.write_text(json.dumps({"pref": "never", "mode": "pass"}))
                 self.assertEqual({"pref": "never", "mode": "pass"}, pl.relay_pref())
                 self.assertEqual({}, pl.relay_report())
@@ -119,8 +139,44 @@ class Road(unittest.TestCase):
             finally:
                 pl.RELAY_PREF_FILE, pl.RELAY_FILE = old
 
+    def test_udp_over_tcp_relay_preserves_packet_reordering(self):
+        for crop in (None, {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}):
+            pl._SRC.update({"use": "tablet", "mode": "udp"})
+            cmd = pl.ffmpeg_cmd(crop)
+            self.assertLess(cmd.index("-reorder_queue_size"), cmd.index("-i"))
+            self.assertEqual("64", cmd[cmd.index("-reorder_queue_size") + 1])
+            pl._SRC["mode"] = "pass"
+            self.assertNotIn("-reorder_queue_size", pl.ffmpeg_cmd(crop))
+            pl._SRC["use"] = "dongle"
+            self.assertNotIn("-reorder_queue_size", pl.ffmpeg_cmd(crop))
+
+    def test_relay_preserves_camera_clock_instead_of_wifi_arrival_jitter(self):
+        for crop in (None, {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}):
+            pl._SRC.update({"use": "tablet", "mode": "udp"})
+            cmd = pl.ffmpeg_cmd(crop)
+            self.assertNotIn("-use_wallclock_as_timestamps", cmd)
+            self.assertLess(cmd.index("-fflags"), cmd.index("-i"))
+            self.assertEqual("+genpts", cmd[cmd.index("-fflags") + 1])
+            pl._SRC["use"] = "dongle"
+            cmd = pl.ffmpeg_cmd(crop)
+            self.assertEqual("1", cmd[cmd.index("-use_wallclock_as_timestamps") + 1])
+
 
 class Tool(unittest.TestCase):
+    def test_tablet_handoff_does_not_wait_for_a_dongle_scan_or_join(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            plan = {"use": "dongle", "want_tablet": True, "why": "tablet joining"}
+            with patch.multiple(pl, LIVE=folder / "live", LOW=folder / "low", CLIPS=folder / "clips",
+                                station_safe=Mock(return_value=True), TsDoor=Mock(),
+                                seen_on_air=Mock(return_value={}), source_turn=Mock(return_value=plan),
+                                linked=Mock(return_value=False), doctor=Mock(), join=Mock(), say=Mock()):
+                pl.supervise(once=True)
+                pl.seen_on_air.assert_not_called()
+                pl.doctor.assert_not_called()
+                pl.join.assert_not_called()
+                pl.say.assert_called_once_with("waiting-tablet", why="tablet joining")
+
     def test_edit_is_idempotent_and_marked(self):
         spec = importlib.util.spec_from_file_location("edit_tabrelay_pinelink", ROOT / "tools" / "edit_tabrelay_pinelink.py")
         tool = importlib.util.module_from_spec(spec)

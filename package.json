@@ -10,7 +10,12 @@
     "desktop:pack": "electron-builder --dir",
     "desktop:dist": "electron-builder",
     "desktop:dist:win": "electron-builder --win nsis portable",
-    "desktop:dist:linux": "electron-builder --linux AppImage deb tar.gz"
+    "desktop:dist:linux": "electron-builder --linux AppImage deb tar.gz",
+    "predesktop": "node tools/sync_station_tools.cjs",
+    "predesktop:pack": "node tools/sync_station_tools.cjs",
+    "predesktop:dist": "node tools/sync_station_tools.cjs",
+    "predesktop:dist:win": "node tools/sync_station_tools.cjs",
+    "predesktop:dist:linux": "node tools/sync_station_tools.cjs"
   },
   "devDependencies": {
     "electron": "^37.3.1",
@@ -27,19 +32,127 @@
       "package.json"
     ],
     "extraResources": [
+      {"from": "sfx_supercut_video.py", "to": "agent/sfx_supercut_video.py"},
+      {
+        "from": "system3.py",
+        "to": "agent/system3.py"
+      },
+      {
+        "from": "system3_runtime.py",
+        "to": "agent/system3_runtime.py"
+      },
+      {
+        "from": "system3_handoff.py",
+        "to": "agent/system3_handoff.py"
+      },
+      {
+        "from": "pantry_lifecycle.py",
+        "to": "agent/pantry_lifecycle.py"
+      },
+      {
+        "from": "pantry_lifecycle_runtime.py",
+        "to": "agent/pantry_lifecycle_runtime.py"
+      },
+      {
+        "from": "orchestrator_visuals.py",
+        "to": "agent/orchestrator_visuals.py"
+      },
+      {
+        "from": "system3_tables.py",
+        "to": "agent/system3_tables.py"
+      },
+      {
+        "from": "conversation_graph.py",
+        "to": "agent/conversation_graph.py"
+      },
+      {
+        "from": "book_mode.py",
+        "to": "agent/book_mode.py"
+      },
+      {
+        "from": "book_preview.py",
+        "to": "agent/book_preview.py"
+      },
+      {
+        "from": "desktop/renderer/book-preview.html",
+        "to": "agent/desktop/renderer/book-preview.html"
+      },
+      {
+        "from": "desktop/renderer/book-preview.js",
+        "to": "agent/desktop/renderer/book-preview.js"
+      },
+      {
+        "from": "desktop/renderer/book-preview.css",
+        "to": "agent/desktop/renderer/book-preview.css"
+      },
+      {
+        "from": "library.py",
+        "to": "agent/library.py"
+      },
+      {
+        "from": "library_extract.py",
+        "to": "agent/library_extract.py"
+      },
+      {
+        "from": "live_session.py",
+        "to": "agent/live_session.py"
+      },
+      {
+        "from": "pinelens.py",
+        "to": "agent/pinelens.py"
+      },
+      {
+        "from": "system3_reply.py",
+        "to": "agent/system3_reply.py"
+      },
       {
         "from": "app.py",
         "to": "agent/app.py"
       },
-      { "from": "script_diagnostics.py", "to": "agent/script_diagnostics.py" },
-      { "from": "script_report_store.py", "to": "agent/script_report_store.py" },
-      { "from": "video_editor.py", "to": "agent/video_editor.py" },
-      { "from": "comfy_workshop.py", "to": "agent/comfy_workshop.py" },
-      { "from": "parody_stinger_queue.py", "to": "agent/parody_stinger_queue.py" },
-      { "from": "desktop/renderer/video-editor.html", "to": "agent/desktop/renderer/video-editor.html" },
-      { "from": "desktop/renderer/video-editor.js", "to": "agent/desktop/renderer/video-editor.js" },
-      { "from": "desktop/renderer/video-editor.css", "to": "agent/desktop/renderer/video-editor.css" },
-      { "from": "desktop/renderer/video-edit-model.js", "to": "agent/desktop/renderer/video-edit-model.js" },
+      {
+        "from": "broadcast_recovery.py",
+        "to": "agent/broadcast_recovery.py"
+      },
+      {
+        "from": "browser_video.py",
+        "to": "agent/browser_video.py"
+      },
+      {
+        "from": "script_diagnostics.py",
+        "to": "agent/script_diagnostics.py"
+      },
+      {
+        "from": "script_report_store.py",
+        "to": "agent/script_report_store.py"
+      },
+      {
+        "from": "video_editor.py",
+        "to": "agent/video_editor.py"
+      },
+      {
+        "from": "comfy_workshop.py",
+        "to": "agent/comfy_workshop.py"
+      },
+      {
+        "from": "parody_stinger_queue.py",
+        "to": "agent/parody_stinger_queue.py"
+      },
+      {
+        "from": "desktop/renderer/video-editor.html",
+        "to": "agent/desktop/renderer/video-editor.html"
+      },
+      {
+        "from": "desktop/renderer/video-editor.js",
+        "to": "agent/desktop/renderer/video-editor.js"
+      },
+      {
+        "from": "desktop/renderer/video-editor.css",
+        "to": "agent/desktop/renderer/video-editor.css"
+      },
+      {
+        "from": "desktop/renderer/video-edit-model.js",
+        "to": "agent/desktop/renderer/video-edit-model.js"
+      },
       {
         "from": "station_flow.py",
         "to": "agent/station_flow.py"
@@ -52,34 +165,100 @@
         "from": "line_review_runtime.py",
         "to": "agent/line_review_runtime.py"
       },
-      { "from": "rejection_workbench.py", "to": "agent/rejection_workbench.py" },
-      { "from": "system2.py", "to": "agent/system2.py" },
-      { "from": "system2_runtime.py", "to": "agent/system2_runtime.py" },
-      { "from": "system2_media.py", "to": "agent/system2_media.py" },
-      { "from": "system2_writing.py", "to": "agent/system2_writing.py" },
-      { "from": "rejection_lab.py", "to": "agent/rejection_lab.py" },
-      { "from": "rejection_lab_runtime.py", "to": "agent/rejection_lab_runtime.py" },
-      { "from": "crystal_contract.py", "to": "agent/crystal_contract.py" },
-      { "from": "crystal_prompts.py", "to": "agent/crystal_prompts.py" },
-      { "from": "crystal_rhyme.py", "to": "agent/crystal_rhyme.py" },
-      { "from": "rhyme_assistance.py", "to": "agent/rhyme_assistance.py" },
-      { "from": "vendor/wordnet", "to": "agent/vendor/wordnet", "filter": ["**/*"] },
-      { "from": "vendor/cmudict", "to": "agent/vendor/cmudict", "filter": ["**/*"] },
-      { "from": "crystal_source.py", "to": "agent/crystal_source.py" },
-      { "from": "segment_contract.py", "to": "agent/segment_contract.py" },
-      { "from": "crystal_acceptance.py", "to": "agent/crystal_acceptance.py" },
-      { "from": "prompt_learning.py", "to": "agent/prompt_learning.py" },
-      { "from": "nabu_audio.py", "to": "agent/nabu_audio.py" },
-        { "from": "sfx_speech_bank.py", "to": "agent/sfx_speech_bank.py" },
-        { "from": "sfx_cadence.py", "to": "agent/sfx_cadence.py" },
-        {
-          "from": "response_bank.py",
-          "to": "agent/response_bank.py"
-        },
-        {
-          "from": "tint_recovery.py",
-          "to": "agent/tint_recovery.py"
-        },
+      {
+        "from": "rejection_workbench.py",
+        "to": "agent/rejection_workbench.py"
+      },
+      {
+        "from": "system2.py",
+        "to": "agent/system2.py"
+      },
+      {
+        "from": "system2_runtime.py",
+        "to": "agent/system2_runtime.py"
+      },
+      {
+        "from": "system2_media.py",
+        "to": "agent/system2_media.py"
+      },
+      {
+        "from": "system2_writing.py",
+        "to": "agent/system2_writing.py"
+      },
+      {
+        "from": "rejection_lab.py",
+        "to": "agent/rejection_lab.py"
+      },
+      {
+        "from": "rejection_lab_runtime.py",
+        "to": "agent/rejection_lab_runtime.py"
+      },
+      {
+        "from": "crystal_contract.py",
+        "to": "agent/crystal_contract.py"
+      },
+      {
+        "from": "crystal_prompts.py",
+        "to": "agent/crystal_prompts.py"
+      },
+      {
+        "from": "crystal_rhyme.py",
+        "to": "agent/crystal_rhyme.py"
+      },
+      {
+        "from": "rhyme_assistance.py",
+        "to": "agent/rhyme_assistance.py"
+      },
+      {
+        "from": "vendor/wordnet",
+        "to": "agent/vendor/wordnet",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "vendor/cmudict",
+        "to": "agent/vendor/cmudict",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "crystal_source.py",
+        "to": "agent/crystal_source.py"
+      },
+      {
+        "from": "segment_contract.py",
+        "to": "agent/segment_contract.py"
+      },
+      {
+        "from": "crystal_acceptance.py",
+        "to": "agent/crystal_acceptance.py"
+      },
+      {
+        "from": "prompt_learning.py",
+        "to": "agent/prompt_learning.py"
+      },
+      {
+        "from": "nabu_audio.py",
+        "to": "agent/nabu_audio.py"
+      },
+      {
+        "from": "sfx_speech_bank.py",
+        "to": "agent/sfx_speech_bank.py"
+      },
+      {
+        "from": "sfx_cadence.py",
+        "to": "agent/sfx_cadence.py"
+      },
+      {
+        "from": "response_bank.py",
+        "to": "agent/response_bank.py"
+      },
+      {
+        "from": "tint_recovery.py",
+        "to": "agent/tint_recovery.py"
+      },
       {
         "from": "resource_guard.py",
         "to": "agent/resource_guard.py"
@@ -87,6 +266,18 @@
       {
         "from": "newspaper_city.py",
         "to": "agent/newspaper_city.py"
+      },
+      {
+        "from": "gazette_editorial.py",
+        "to": "agent/gazette_editorial.py"
+      },
+      {
+        "from": "gazette_media.py",
+        "to": "agent/gazette_media.py"
+      },
+      {
+        "from": "gazette_prompt.py",
+        "to": "agent/gazette_prompt.py"
       },
       {
         "from": "frontend",

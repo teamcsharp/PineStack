@@ -84,7 +84,15 @@ function load() {
 }
 
 // 5. Wired where the players decide.
-assert.strictEqual((app.match(/pineReplyGapFloor\(clip\)\) - Date\.now\(\);\n  pineReplyGapCue\(clip, waitForAir\);/g) || []).length, 2,
+{
+  const {api} = load();
+  api.ended({tail_s: 0}, null, []);
+  const next = {gap_before: {s: 0}, broadcastAt: Date.now() + 180000};
+  assert(api.due(next) <= Date.now(), 'instant handoff follows actual words, not a future reservation');
+  next.retryAt = Date.now() + 1000;
+  assert(api.due(next) >= next.retryAt, 'instant handoff still respects transport retry');
+}
+assert.strictEqual((app.match(/pineReplyGapDue\(clip\) - Date\.now\(\);\n  pineReplyGapCue\(clip, waitForAir\);/g) || []).length, 2,
   'both players wait at least the pause and cue it');
 assert(app.includes('if (pineReplyGapEarly(clip, player, djVoiceQueue)) {'), 'the panel hands over at the words\' end');
 assert(app.includes('if (pineReplyGapEarly(clip, voice, voiceQueue)) {'), 'the tune page too');

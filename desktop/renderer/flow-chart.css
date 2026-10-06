@@ -129,3 +129,21 @@
 /* [fc-line] the line card's buttons */
 .fc-line-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 /* [fc-seat] a tap outside the popup (on the chart) closes it too */
+
+/* Full recorded roulette options, shared by Technical and Design charts. */
+.fc-roulette { min-width: 260px; max-width: 540px; text-align: left; }
+.fc-wheel { margin: 8px 0; }
+.fc-reel { position: relative; max-height: 210px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid #415458; border-radius: 6px; }
+.fc-option { padding: 8px; border-bottom: 1px solid #334347; white-space: normal; overflow-wrap: anywhere; }
+.fc-option b, .fc-option span { display: block; }
+.fc-option p { margin: 4px 0; }
+.fc-option.selected { background: #194749; border-left: 3px solid #70dce0; }
+.fc-option.excluded { opacity: .7; }
+.fc-command { white-space: normal; }
+.fc-properties pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.fd-diarow { flex-wrap: wrap; }
+.fd-diarow > .fc-roulette { flex-basis: 100%; margin-left: 18px; }
+
+/* The speaking reply actions stay marked as its chart unfolds. */
+.fc-current-action > .fc-edge { border-left-color: #65c7da; }
+.fc-active-step > .fc-node, .fc-active-step > .fc-decision { outline: 2px solid #65c7da; outline-offset: 3px; border-radius: 10px; }

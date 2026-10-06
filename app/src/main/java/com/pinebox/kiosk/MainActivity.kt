@@ -32,6 +32,8 @@ import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebViewRenderProcess
+import android.webkit.WebViewRenderProcessClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -97,6 +99,7 @@ class MainActivity : AppCompatActivity() {
         if (!::webView.isInitialized) return
         runCatching {
             webView.evaluateJavascript("window.PineMemory&&window.PineMemory.trim($level)", null)
+            webView.clearCache(false)
         }
         android.util.Log.i("PineMemory", "onTrimMemory $level -> the page lets its loops go")
     }
@@ -1045,6 +1048,28 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = PanelClient()
         webView.webChromeClient = PanelChrome()
+        // A renderer can stay alive while ignoring input. Give a transient
+        // stall ten seconds to recover, then use PanelClient's rebuild path.
+        webView.setWebViewRenderProcessClient(object : WebViewRenderProcessClient() {
+            private var recovery: Runnable? = null
+
+            override fun onRenderProcessUnresponsive(view: WebView, renderer: WebViewRenderProcess?) {
+                if (recovery != null || isFinishing || isDestroyed) return
+                val retry = Runnable {
+                    recovery = null
+                    if (isFinishing || isDestroyed) return@Runnable
+                    Log.e(TAG, "panel renderer is ignoring input; rebuilding")
+                    if (renderer?.terminate() != true) recreate()
+                }
+                recovery = retry
+                view.postDelayed(retry, 10_000)
+            }
+
+            override fun onRenderProcessResponsive(view: WebView, renderer: WebViewRenderProcess?) {
+                recovery?.let { view.removeCallbacks(it) }
+                recovery = null
+            }
+        })
     }
 
     /**

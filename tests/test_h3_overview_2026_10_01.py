@@ -3,6 +3,7 @@ pitched by the model at a whiteboard - its pure half (h3_overview.py) and the
 door's flow (exec'd out of app.py with stubs: no station, no model, no GPU)."""
 import __future__
 import asyncio
+import json
 import re
 import sys
 import time
@@ -64,6 +65,23 @@ class Pure(unittest.TestCase):
                          "carries in a billboard of the git log reading: aaa111 arcs")
         self.assertEqual(h3_overview.fill_action(h3_overview.ACTIONS[5], {}),
                          "carries in a framed picture from the Pine Box gallery")
+
+    def test_oversized_or_unfinished_sentence_is_not_clipped_into_speech(self):
+        long = "When the station pauses the mixer switches to the endless set so listeners continue hearing music."
+        self.assertEqual(h3_overview.parse(json.dumps({"say": long, "do": "draws an arrow"}), 10), {})
+        self.assertEqual(h3_overview.cut_words("The mixer switches to", 19), "")
+        self.assertEqual(h3_overview.cut_words("Listeners keep hearing music. The mixer switches to", 19),
+                         "Listeners keep hearing music.")
+
+    def test_saved_styles_receive_explanation_requirements_without_reseeding(self):
+        msgs = h3_overview.messages("My saved dramatic delivery.", "FEATURE TAG: [pause-bed]", "an engineer", [], 19)
+        self.assertTrue(msgs[0]["content"].startswith("My saved dramatic delivery."))
+        self.assertIn(h3_overview.EXPLANATION_CONTRACT, msgs[0]["content"])
+        self.assertIn("at most 19 words", msgs[1]["content"])
+        self.assertEqual(msgs[0]["content"].count(h3_overview.EXPLANATION_CONTRACT), 1)
+        self.assertIn("at most 19 words TOTAL", msgs[0]["content"])
+        again = h3_overview.messages(msgs[0]["content"], "history", "an engineer", [], 19)
+        self.assertEqual(again[0]["content"], msgs[0]["content"])
 
     def test_operator_s_list_is_the_starting_pool(self):
         joined = " ".join(h3_overview.ACTIONS)
@@ -160,7 +178,8 @@ class Door(unittest.TestCase):
         self.assertEqual(self.book.modes[h3_overview.PROMPT_KIND], "random")
         self.assertEqual(got["system"], h3_overview.SYSTEM_PROMPTS[-1][0])
         msgs = self.asked[0]["messages"]
-        self.assertEqual(msgs[0]["content"], h3_overview.SYSTEM_PROMPTS[-1][1])
+        self.assertTrue(msgs[0]["content"].startswith(h3_overview.SYSTEM_PROMPTS[-1][1]))
+        self.assertIn(h3_overview.EXPLANATION_CONTRACT, msgs[0]["content"])
         self.assertIn("FEATURE TAG: [flowchart]", msgs[1]["content"])
         # [h3-overview-model] a live ask: it waits for a writer slot instead of an empty deferral
         self.assertEqual(self.asked[0]["purpose"], "h3:overview live")

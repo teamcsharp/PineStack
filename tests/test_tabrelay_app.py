@@ -123,6 +123,28 @@ class TabrelayAppTest(unittest.TestCase):
         body.update(extra)
         return run(self.g["pinelink_relay_report_api"](_Req(body), "Bearer k"))
 
+    def test_default_denies_old_tablet_plan(self):
+        pref_file = self.tmp / "pinelink_relay_pref.json"
+        state = {"at": time.time(), "source": {"pref": "always", "use": "tablet", "want_tablet": True}}
+        for raw in (None, "{bad json", "[]", "{}", '{"pref":"invalid"}'):
+            if raw is None:
+                pref_file.unlink(missing_ok=True)
+            else:
+                pref_file.write_text(raw)
+            got = self.g["pinelink_relay_reply"](state, {"capable": True}, time.time(), ["10.89.1.246"])
+            self.assertEqual(got["pref"], "never")
+            self.assertFalse(got["want"])
+            self.assertNotIn("psk", got)
+            self.assertIn("DGX Spark", got["why"])
+
+    def test_explicit_selection_allows_tablet_plan(self):
+        state = {"at": time.time(), "source": {"pref": "never", "use": "tablet", "want_tablet": True}}
+        for pref in ("auto", "always"):
+            (self.tmp / "pinelink_relay_pref.json").write_text(json.dumps({"pref": pref}))
+            got = self.g["pinelink_relay_reply"](state, {"capable": True}, time.time(), ["10.89.1.246"])
+            self.assertEqual(got["pref"], pref)
+            self.assertTrue(got["want"])
+
     # -- the door
     def test_report_needs_the_key(self):
         with self.assertRaises(_Unauthorized):
@@ -195,7 +217,7 @@ class TabrelayAppTest(unittest.TestCase):
     # -- the setting
     def test_pref_default_and_set(self):
         view = run(self.g["pinelink_relay_api"](None))
-        self.assertEqual(view["pref"], "auto")
+        self.assertEqual(view["pref"], "never")
         self.assertIsNone(view["report"] or None)
         with self.assertRaises(_Unauthorized):
             run(self.g["pinelink_relay_set_api"](_Req({"pref": "never"}), None))

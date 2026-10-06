@@ -28,6 +28,11 @@
 
   var box = null;
   var busy = false;
+  var opened = false;
+  var actionId = 0;
+  var preview = null;
+  var previewName = '';
+  var previewId = 0;
 
   function where() {
     try {
@@ -104,9 +109,31 @@
       row.appendChild(n);
     });
     box.appendChild(row);
-    var out = el('pre', 'cd-out');
-    out.hidden = true;
-    box.appendChild(out);
+    var output = el('pre', 'cd-out');
+    output.hidden = true;
+    box.appendChild(output);
+    var frame = el('figure', 'cd-preview');
+    frame.hidden = true;
+    frame.appendChild(el('figcaption', 'cd-preview-title'));
+    preview = el('video', 'cd-preview-video');
+    preview.controls = true;
+    preview.muted = true;
+    preview.playsInline = true;
+    preview.preload = 'auto';
+    preview.setAttribute('aria-label', 'Clip Doctor video preview');
+    preview.addEventListener('playing', function () {
+      if (opened) out('playing ' + previewName);
+    });
+    preview.addEventListener('ended', function () {
+      if (opened) out('Finished ' + previewName + '. Press Play to watch it again.');
+    });
+    preview.addEventListener('error', function () {
+      if (opened && preview.error && preview.hasAttribute('src')) {
+        out('The video could not be loaded or decoded. Try another clip.');
+      }
+    });
+    frame.appendChild(preview);
+    box.appendChild(frame);
     back.appendChild(box);
     /* Tap away and it closes - the one rule every sheet here follows. */
     back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
@@ -121,6 +148,34 @@
     if (!o) return;
     o.hidden = !text;
     o.textContent = String(text || '');
+  }
+
+  function stopPreview() {
+    previewId++;
+    if (!preview) return;
+    preview.pause();
+    preview.removeAttribute('src');
+    preview.load();
+    previewName = '';
+    q('cd-preview').hidden = true;
+  }
+
+  function playPreview(clip) {
+    var url = root.pineMediaUrl ? root.pineMediaUrl(clip.url)
+      : new URL(clip.url, where() || root.location.href).href;
+    stopPreview();
+    previewName = String(clip.sting || 'a clip');
+    q('cd-preview-title').textContent = previewName;
+    q('cd-preview').hidden = false;
+    preview.src = url;
+    var id = previewId;
+    var playing = preview.play();
+    if (playing && playing.catch) playing.catch(function (error) {
+      if (!opened || id !== previewId || preview.getAttribute('src') !== url) return;
+      out(error.name === 'NotAllowedError'
+        ? 'Press Play below to preview ' + previewName + '.'
+        : 'The video could not play (' + error.name + '). ' + error.message);
+    });
   }
 
   /* --------------------------------------------------------------- paint */
@@ -167,18 +222,24 @@
   /* ------------------------------------------------------------- actions */
 
   function act(which) {
-    if (busy) return;
+    if (busy || !opened) return;
     busy = true;
+    var id = ++actionId;
     out('…');
-    var done = function (text) { busy = false; out(text); look(); };
+    var done = function (text) {
+      if (!opened || id !== actionId) return;
+      busy = false; out(text); look();
+    };
     if (which === 'try') {
+      stopPreview();
       Promise.resolve(post('/api/sfx/video/cue', {who: 'doctor'})).then(function (got) {
+        if (!opened || id !== actionId) return;
         var clip = got && got.clip;
-        if (clip) {
-          try { if (root.PineSfxTv && root.PineSfxTv.cut) root.PineSfxTv.cut(clip); }
-          catch (err) { /* it is in the ring either way */ }
-          done('playing ' + String(clip.sting || 'a clip'));
-          setTimeout(close, 900);
+        if (clip && clip.url) {
+          try {
+            playPreview(clip);
+            done('Loading ' + String(clip.sting || 'a clip') + '...');
+          } catch (err) { done('The video address could not be opened. Try another clip.'); }
         } else {
           done(String((got && got.say) || 'no clip'));
         }
@@ -210,6 +271,7 @@
 
   function open(reason) {
     build();
+    opened = true;
     var back = document.getElementById('pineClipDoctor');
     if (back) back.classList.add('show');
     out(reason ? String(reason) : '');
@@ -217,6 +279,10 @@
   }
 
   function close() {
+    opened = false;
+    actionId++;
+    busy = false;
+    stopPreview();
     var back = document.getElementById('pineClipDoctor');
     if (back) back.classList.remove('show');
   }

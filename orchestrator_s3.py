@@ -74,7 +74,7 @@ NOTES_KEEP = 300
 SEVERITY = {"high": 3, "medium": 2, "low": 1, "info": 0}
 RECOVERY = ("page_recovery", "resume", "replay", "recover", "reel")
 UNDECODABLE = re.compile(r"decod|unsupported|media_err|src_not|codec|format", re.I)
-SECTIONS = ("speakerbox", "sfx", "personalities", "sfxguy", "blocks", "split")
+SECTIONS = ("speakerbox", "sfx", "personalities", "sfxguy", "blocks", "split", "structures")
 # [orch-s3b] OVERLAP IS ONLY AMONG THE EXCLUSIVE RECEIVERS (the operator,
 # 2026-09-29: "a web page sounding at the same time as the PineTab is
 # NORMAL"). Still overlap - any two of these sounding at once: PineTab +
@@ -487,7 +487,7 @@ class Desk:
         self.ns = ns
         self.path = Path(path)
         self.lock = threading.RLock()
-        self.book: dict[str, Any] = {"proposals": [], "notes": [], "filed": {}, "asked": {}}
+        self.book: dict[str, Any] = {"proposals": [], "notes": [], "filed": {}, "asked": {}, "diversity": {}}
         self.loaded = False
         self.memo: dict[str, Any] = {"at": 0.0, "value": None, "running": False}
         self.fac: dict[str, dict[str, Any]] = {}
@@ -837,8 +837,84 @@ class Desk:
         for path, value in sets.items():
             set_path(new, path, value)
         import system3
-        system3.validate_table(copy.deepcopy(new))       # refused here, not at confirm
+        new = system3.validate_table(copy.deepcopy(new))       # reviewed odds match saved odds
         return self._proposal("table", table_id, "table %s" % table_id, before=old, after=new, by=by)
+
+    def propose_option(self, table_id, cue, category=None, by="station"):
+        """New model-generated intents enter the proposal book, never the live wheel."""
+        import call_diversity
+        old = next((t for t in self.rt().config["tables"] if t["id"] == table_id), None)
+        if not old or old.get("family") not in call_diversity.EXPANDABLE_FAMILIES:
+            raise ValueError("new intent requires an approved caller intent wheel")
+        cats = copy.deepcopy(old["categories"])
+        cat = next((c for c in cats if category is None or c["id"] == category), None)
+        if cat is None:
+            raise ValueError("unknown category")
+        cue = str(cue).strip()
+        iid = "proposed_" + hashlib.sha256(cue.encode()).hexdigest()[:12]
+        cat["items"].append({"id":iid,"label":cue[:80],"text":cue,"weight":1.0,
+                             "provenance":{"by":by,"approval_required":True}})
+        return self.propose_table(table_id, {"categories":cats}, by=by)
+
+    def propose_wheel(self, table, by="station"):
+        import system3, call_diversity
+        new = system3.validate_table(copy.deepcopy(table))
+        if new["family"] not in call_diversity.EXPANDABLE_FAMILIES:
+            raise ValueError("new wheels must use a supported caller intent family")
+        if any(t["id"] == new["id"] for t in self.rt().config["tables"]):
+            raise ValueError("table already exists; propose an adjustment")
+        return self._proposal("table", new["id"], "new caller wheel %s" % new["id"],
+                              before=None, after=new, by=by)
+
+    async def caller_diversity_failure(self, conv):
+        """Bounded expansion suggestion after a persistent, attributable collision."""
+        import call_diversity
+        self.load()
+        repairs = (conv.get("call_diversity") or {}).get("repairs") or []
+        if not repairs:
+            return None
+        family = (repairs[-1].get("selections") or [{}])[0].get("family")
+        family = family or (repairs[-1].get("families") or [None])[0]
+        if family not in call_diversity.EXPANDABLE_FAMILIES:
+            return None
+        selection = ((conv.get("call_diversity") or {}).get("selections") or {}).get(family) or {}
+        table_id = selection.get("table")
+        if not table_id:
+            return None
+        with self.lock:
+            counts = self.book.setdefault("diversity", {})
+            entry = counts.setdefault(table_id, {"calls":[],"requested":0})
+            current_hash = self._live_hash()
+            if entry.get("config_hash") != current_hash:
+                entry.update(calls=[], requested=0, config_hash=current_hash)
+            cid = conv["identity"]["conversation_id"]
+            if cid in entry["calls"]:
+                return None
+            entry["calls"] = (entry["calls"] + [cid])[-30:]
+            if len(entry["calls"]) < 2 or time.time()-entry["requested"] < 3600:
+                self.save()
+                return None
+            entry["requested"] = time.time()
+            self.save()
+        writer = self._get("ask_model")
+        if not callable(writer):
+            return None
+        table = next(t for t in self.rt().config["tables"] if t["id"] == table_id)
+        cues = [i["text"] for c in table["categories"] for i in c["items"]]
+        try:
+            raw = await writer("Propose ONE new conversational intent for the caller roulette " + family +
+                  ". Return JSON only: {\"text\":\"intent\"}. It must describe an action, never dialogue, "
+                  "be materially different from these existing intents, preserve the premise and quotations, "
+                  "allow connected fictional outlandish details and independently rolled opposite emotions. "
+                  "Existing intents: " + json.dumps(cues) + " Collision: " + repairs[-1]["reason"],
+                  limit=1000, spice=0.8, result_contract="roulette_option")
+            obj = json.loads(str(raw).strip())
+            proposal = self.propose_option(table_id, obj["text"], by="System Three diversity sensor")
+            self.note("Caller diversity proposal %s awaits operator approval" % proposal["id"], cid, "station")
+            return proposal
+        except Exception as exc:
+            self.note("Caller diversity suggestion deferred: " + str(exc)[:200], cid, "station")
+            return None
 
     def propose_section(self, name: str, sets: dict[str, Any], by: str = "operator") -> dict[str, Any]:
         if name not in SECTIONS:
@@ -848,6 +924,12 @@ class Desk:
         new = copy.deepcopy(old)
         for path, value in sets.items():
             set_path(new, path, value)
+        if name == "structures":
+            import system3_tables
+            for road, body in new.items():
+                problems = system3_tables.validate_structure(road, body)
+                if problems:
+                    raise ValueError("; ".join(problems))
         return self._proposal("section", name, "%s section" % name, before=old, after=new, by=by)
 
     def propose_cupboard(self, rid: str, action: str, by: str = "operator") -> dict[str, Any]:
@@ -928,6 +1010,12 @@ class Desk:
             body = system3.validate_split(body)
         elif name == "blocks":
             body = system3.validate_blocks(body)
+        if name == "structures":
+            import system3_tables
+            for road, structure in body.items():
+                problems = system3_tables.validate_structure(road, structure)
+                if problems:
+                    raise ValueError("; ".join(problems))
         config = copy.deepcopy(self.rt().config)
         config[name] = body
         return self._save_config(config, note)
@@ -1019,7 +1107,12 @@ class Desk:
         door, target = p["door"], p["target"]
         try:
             if door == "table":
-                h = self._write_table(p["before"], "table %s undo of %s" % (target, p["id"]))
+                if p["before"] is None:
+                    cfg = copy.deepcopy(self.rt().config)
+                    cfg["tables"] = [t for t in cfg["tables"] if t["id"] != target]
+                    h = self._save_config(cfg, "remove newly approved wheel " + target)
+                else:
+                    h = self._write_table(p["before"], "table %s undo of %s" % (target, p["id"]))
                 say = "put back table %s - live config %s" % (target, h)
             elif door == "section":
                 h = self._write_section(target, p["before"], "%s section undo of %s" % (target, p["id"]))
@@ -1359,9 +1452,11 @@ class Desk:
 
 def install(app: Any, namespace: dict[str, Any]) -> Desk:
     from fastapi import Header, HTTPException, Request
+    globals()["Request"] = Request  # Resolve deferred endpoint annotations for FastAPI.
 
     desk = Desk(namespace, namespace["data_path"](LEDGER_NAME))
     namespace["_ORCH_S3_DESK"] = desk
+    namespace["orch_s3_caller_diversity_failure"] = desk.caller_diversity_failure
     namespace["orch_s3_ask"] = desk.ask
     namespace["orch_s3_verb"] = desk.verb
     namespace["orch_s3_face"] = desk.face
@@ -1404,6 +1499,11 @@ def install(app: Any, namespace: dict[str, Any]) -> Desk:
             b = {}
         b = b if isinstance(b, dict) else {}
         try:
+            if b.get("option"):
+                o = b["option"]
+                return desk.propose_option(str(o["table"]), o["text"], o.get("category"), by="operator")
+            if b.get("wheel"):
+                return desk.propose_wheel(b["wheel"], by="operator")
             if b.get("table"):
                 return desk.propose_table(str(b["table"]), dict(b.get("set") or {}))
             if b.get("section"):

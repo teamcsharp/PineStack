@@ -33,58 +33,110 @@ const glass = document.getElementById('glass');
 const how = document.getElementById('how');
 
 let shown = null;          /* the last answer from the main process */
+let wantSize = 'balanced';
+try {
+  const savedSize = localStorage.getItem('pine-mirror-size');
+  if (['quarter', 'third', 'half', 'balanced', 'full'].includes(savedSize)) wantSize = savedSize;
+} catch (error) { /* first opening uses Balanced */ }
 let full = false;
 let streamAttempt = 0;
 let streamRetry = null;
+let streamFailures = 0;
+let streamUrl = '';
+let boundAt = 0;
+let imageFailed = false;
+let mirrorClosed = false;
+let opening = null;
+let openFailures = 0;
+let nextOpenAt = 0;
+let watching = false;
+let watchTimer = null;
+let watchWake = null;
 
 function bindStream(delay) {
   clearTimeout(streamRetry);
+  if (mirrorClosed) return;
   streamRetry = setTimeout(function () {
-    if (!shown || !shown.url) return;
+    streamRetry = null;
+    if (mirrorClosed || !shown || !shown.url) return;
     streamAttempt += 1;
-    live.src = shown.url + '?connection=' + streamAttempt;
+    streamUrl = shown.url;
+    boundAt = Date.now();
+    live.src = shown.url + (shown.url.includes('?') ? '&' : '?') + 'connection=' + streamAttempt;
   }, Math.max(0, Number(delay) || 0));
 }
 
+function retryImage() {
+  if (mirrorClosed || streamRetry != null) return;
+  streamFailures += 1;
+  bindStream(Math.min(10000, 700 * Math.pow(2, Math.min(streamFailures - 1, 4))));
+}
+
 function cover(words, bad) {
+  if (mirrorClosed) return;
   veil.textContent = words || '';
   veil.classList.toggle('bad', !!bad);
   veil.classList.toggle('gone', !words);
 }
 
+live.addEventListener('load', function () {
+  if (mirrorClosed) return;
+  imageFailed = false;
+  streamFailures = 0;
+  clearTimeout(streamRetry);
+  streamRetry = null;
+  cover('');
+});
+live.addEventListener('error', function () {
+  if (mirrorClosed) return;
+  imageFailed = true;
+  cover('The picture connection was lost. Reconnecting...', true);
+  retryImage();
+});
+
+function stopMirrorView() {
+  mirrorClosed = true;
+  clearTimeout(streamRetry);
+  clearTimeout(watchTimer);
+  if (watchWake) watchWake();
+  streamRetry = watchTimer = watchWake = null;
+}
+window.addEventListener('beforeunload', stopMirrorView);
+
 /* ------------------------------------------------------------ the stream */
 
 async function begin() {
-  let open = null;
-  try {
-    /* [mirror-pip-full] Every open starts at FULL detail: "bring it up in
-     * a hundred percent detail". Asked for in the open itself so the pipe
-     * starts full rather than opening at half and rebuilding. The Detail
-     * buttons and Auto still lower it afterwards, exactly as before. */
-    open = await api.mirrorOpen({ size: "full", quality: wantQuality });
-  } catch (error) {
-    return cover('the tablet mirror would not start: ' + error.message, true);
-  }
-  if (!open || !open.ok) {
-    return cover((open && open.why) || 'the tablet mirror would not start', true);
-  }
-  shown = open;
-  /* [mirror-quality-tab] Not pushed again here: a mirror already running
-   * holds the newest choice, and the tablet's own slider - asked by the main
-   * process as the mirror opens - outranks this window's memory. */
-  paintButtons();
-  /* The first frame clears the veil - "running" is not the same as "there
-   * are pictures", and covering the gap with a black rectangle would make a
-   * dead stream look like a sleeping tablet. */
-  live.addEventListener('load', function () { cover(''); });
-  live.addEventListener('error', function () {
-    cover('the picture stopped coming', true);
-    bindStream(700);
-  });
-  bindStream(0);
+  if (mirrorClosed || opening || Date.now() < nextOpenAt) return;
+  // Observe startup while ADB/listen is pending; a failed open must keep retrying.
   watch();
+  const request = Promise.resolve().then(function () {
+    if (mirrorClosed) return null;
+    return api.mirrorOpen({ size: shown && shown.size || wantSize,
+      quality: shown && shown.quality || wantQuality });
+  });
+  opening = request;
+  try {
+    const open = await request;
+    if (mirrorClosed) return;
+    if (!open || !open.ok || !open.url) {
+      throw new Error(open && (open.why || open.detail) || 'the tablet mirror would not start');
+    }
+    shown = open;
+    openFailures = 0;
+    nextOpenAt = 0;
+    paintButtons();
+    // Keep a healthy multipart connection across encoder restarts.
+    if (streamUrl !== open.url || !live.getAttribute('src')) bindStream(0);
+  } catch (error) {
+    if (mirrorClosed) return;
+    openFailures += 1;
+    nextOpenAt = Date.now() + Math.min(15000, 2000 * Math.pow(2, Math.min(openFailures - 1, 3)));
+    how.textContent = 'Tablet connection unavailable; retrying';
+    if (!live.naturalWidth) cover('The tablet mirror could not connect: ' + error.message + '. Retrying...', true);
+  } finally {
+    if (opening === request) opening = null;
+  }
 }
-
 function paintButtons() {
   for (const button of document.querySelectorAll('.res')) {
     button.classList.toggle('on', !!shown && button.dataset.size === shown.size);
@@ -149,12 +201,20 @@ qualitySlider.addEventListener('change', async function () {
 /* Changing what the tablet sends. Shared by the buttons and by the zoom, so
  * both roads behave identically - including the note that says why the
  * picture is about to stall for a moment. */
-async function setDetail(want, why) {
-  if (!shown || !want || want === shown.size) return false;
+async function setDetail(want, why, remember) {
+  if (!shown || !want) return false;
+  const saveChoice = function () {
+    if (!remember) return;
+    wantSize = want;
+    try { localStorage.setItem('pine-mirror-size', want); }
+    catch (error) { /* retained until this window closes */ }
+  };
+  if (want === shown.size) { saveChoice(); return false; }
   try {
     const said = await api.mirrorSize(want);
     if (!said || !said.ok) return false;
     shown = said;
+    saveChoice();
     paintButtons();
     /* THE ZOOM IS NOT RESET. The <img> is fitted to the glass by CSS, so
      * every detail lays out at the same size and only sharpness changes -
@@ -176,13 +236,14 @@ for (const button of document.querySelectorAll('.res')) {
      * quietly overrule what was just asked for. */
     auto = false;
     paintAuto();
-    setDetail(button.dataset.size, 'Switching the tablet to ');
+    setDetail(button.dataset.size, 'Switching the tablet to ', true);
   });
 }
 
 function label(size) {
   return size === 'quarter' ? 'a quarter'
     : size === 'third' ? 'a third'
+    : size === 'balanced' ? 'balanced detail'
     : size === 'full' ? 'full detail' : 'half';
 }
 
@@ -218,14 +279,14 @@ for (const button of document.querySelectorAll('.zoom')) {
  * piece of arithmetic: place(), rein(), whereOnTablet() and deserved() all
  * read zoom = 1 and pan = 0. */
 const MOST = 1;
-const ORDER = ['quarter', 'third', 'half', 'full'];
+const DETAIL_NAMES = ['quarter', 'third', 'half', 'balanced', 'full'];
 const PART = { quarter: 1 / 4, third: 1 / 3, half: 1 / 2, full: 1 };
 
 let zoom = 1;
 let ox = 0;                 /* pan, in displayed pixels from the centre */
 let oy = 0;
 let panning = null;
-let auto = false;  /* [mirror-pip-auto] full detail holds until asked */
+let auto = false;  /* The chosen detail holds until asked. */
 let sharpenAt = 0;
 
 function frame() {
@@ -271,11 +332,33 @@ function reset() { zoom = 1; ox = 0; oy = 0; place(); sharpenSoon(); }
 
 /* WHICH DETAIL THIS ZOOM DESERVES: the smallest one whose frames do not have
  * to be upscaled to fill the picture as it is currently displayed. */
+function detailShape(name) {
+  if (!shown || !shown.real) return null;
+  const real = shown.real;
+  if (!(real.width > 0 && real.height > 0)) return null;
+  const part = name === 'balanced'
+    ? Math.min(1, 960 / Math.max(real.width, real.height)) : PART[name];
+  if (!part) return null;
+  return {
+    name: name,
+    width: Math.max(2, Math.floor(Math.round(real.width * part) / 2) * 2),
+    height: Math.max(2, Math.floor(Math.round(real.height * part) / 2) * 2)
+  };
+}
+
+function detailChoices() {
+  // Balanced can fall below or above Half, depending on the physical screen.
+  return DETAIL_NAMES.map(detailShape).filter(Boolean).sort(function (a, b) {
+    return a.width * a.height - b.width * b.height;
+  });
+}
+
 function deserved() {
   if (!shown || !shown.real) return null;
-  const acrossNow = frame().wide * zoom;
-  for (const name of ORDER) {
-    if (Math.round(shown.real.width * PART[name]) >= acrossNow * 0.98) return name;
+  const drawn = frame();
+  for (const shape of detailChoices()) {
+    if (shape.width >= drawn.wide * zoom * 0.98 &&
+        shape.height >= drawn.tall * zoom * 0.98) return shape.name;
   }
   return 'full';
 }
@@ -290,11 +373,15 @@ function sharpenSoon() {
   sharpenAt = setTimeout(function () {
     const want = deserved();
     if (!want || want === shown.size) return;
-    const climbing = ORDER.indexOf(want) > ORDER.indexOf(shown.size);
+    const desired = detailShape(want);
+    const current = detailShape(shown.size);
+    if (!desired || !current) return;
+    const climbing = desired.width * desired.height > current.width * current.height;
     if (!climbing) {
       /* A fifth of slack before letting the tablet off again. */
-      const acrossNow = frame().wide * zoom;
-      if (Math.round(shown.real.width * PART[want]) < acrossNow * 1.2) return;
+      const drawn = frame();
+      if (desired.width < drawn.wide * zoom * 1.2 ||
+          desired.height < drawn.tall * zoom * 1.2) return;
     }
     setDetail(want, climbing ? 'Sharpening to ' : 'Easing back to ');
   }, 500);
@@ -804,74 +891,93 @@ ontop.addEventListener('click', async function () {
  * pipe whose children are both alive and which has produced no frame for two
  * seconds is stalled, and the operator needs to know that before they start
  * wondering why the tablet is frozen. */
-async function watch() {
-  let wasLive = null;
-  /* [mirror-drop-veil] The cover means a reconnect is REALLY happening. A
-   * stream that is merely quiet - a still screen, a busy tablet holding a
-   * second or two of frames - keeps its last picture and says so in the
-   * strip. Measured before: 9 covers in 12 minutes, none of them a lost
-   * connection. A main process without the new fields keeps the old rule. */
-  let veiled = false;
-  let reconnected = false;
-  for (;;) {
-    try {
-      const said = await api.mirrorHow();
-      /* [mirror-quality-tab] The tablet has its own slider; when it moves,
-       * the main process retunes and this strip follows. */
-      if (said && said.ok && said.quality && shown && !qualityDragging
-          && said.quality !== shown.quality) {
-        shown.quality = said.quality;
-        shown.bitrate = said.bitrate;
-        wantQuality = said.quality;
-        try { localStorage.setItem('pine-mirror-quality', String(wantQuality)); }
-        catch (error) { /* remembered for this window only */ }
-        paintQuality();
-      }
-      if (said && said.ok && typeof said.reconnecting === 'boolean') {
-        const shape = said.width + '×' + said.height;
-        const held = Math.round((said.sinceFrameMs || 0) / 1000);
-        how.textContent = said.live
-          ? shape + ' · ' + said.frames + ' frames'
-            + (said.restarts ? ' · ' + said.restarts + ' restarts' : '')
-          : said.frames > 0 && !said.reconnecting
-            ? (said.still ? 'still picture · the tablet screen has not changed for ' + held + ' s'
-              : 'waiting on the tablet · ' + held + ' s')
-            : (said.why || 'waiting for the tablet…');
-        if (!said.live && said.frames > 0 && said.reconnecting) {
-          cover('Reconnecting to the tablet… ' + (said.restartReason || ''), true);
-          veiled = true;
-          reconnected = true;
-        } else if (veiled || said.live) {
-          /* live clears any cover, as it always did (a first-load or an
-           * <img> error note); a quiet stream clears only our own. */
-          cover('');
-          veiled = false;
-        }
-        if (said.live && reconnected) {
-          reconnected = false;
-          bindStream(0);
-        }
-      } else if (said && said.ok) {
-        const shape = said.width + '×' + said.height;
-        how.textContent = said.live
-          ? shape + ' · ' + said.frames + ' frames'
-            + (said.restarts ? ' · ' + said.restarts + ' restarts' : '')
-          : (said.why || 'waiting for the tablet…');
-        if (!said.live && said.frames > 0) {
-          cover('The picture has stopped. ' + (said.why || 'Reconnecting…'), true);
-        } else if (said.live) {
-          cover('');
-          /* If the image decoder gave up while the producer was being
-           * repaired, make one fresh local connection after recovery. */
-          if (wasLive === false) bindStream(0);
-        }
-        if (said.frames > 0) wasLive = !!said.live;
-      }
-    } catch (error) { /* the window may be closing */ }
-    await new Promise(function (go) { setTimeout(go, 1000); });
+function followMirror(said) {
+  if (mirrorClosed) return;
+  if (!said || !said.ok) {
+    how.textContent = said && (said.why || said.detail) || 'Tablet status unavailable; retrying';
+    if (!shown && !document.hidden) begin();
+    return;
   }
+  if (said.paused || said.closing) {
+    how.textContent = said.paused ? 'Tablet mirror paused while its window is hidden' : 'Tablet mirror is closing';
+    return;
+  }
+  if (!shown && said.url && said.running) {
+    shown = said;
+    paintButtons();
+  }
+  if (shown && said.url && said.url !== shown.url) {
+    shown.url = said.url;
+    shown.stillUrl = said.stillUrl;
+    bindStream(0);
+  } else if (shown && streamUrl !== shown.url && said.running) {
+    bindStream(0);
+  }
+  if (shown && said.real && said.real.width > 0 && said.real.height > 0) {
+    const changed = !shown.real || shown.real.width !== said.real.width ||
+      shown.real.height !== said.real.height;
+    shown.real = { width: said.real.width, height: said.real.height };
+    if (said.width > 0 && said.height > 0) {
+      shown.width = said.width;
+      shown.height = said.height;
+    }
+    if (changed) { place(); sharpenSoon(); }
+  }
+  if (said.quality && shown && !qualityDragging && said.quality !== shown.quality) {
+    shown.quality = said.quality;
+    shown.bitrate = said.bitrate;
+    wantQuality = said.quality;
+    try { localStorage.setItem('pine-mirror-quality', String(wantQuality)); }
+    catch (error) { /* remembered for this window only */ }
+    paintQuality();
+  }
+
+  const shape = said.width + '\u00d7' + said.height;
+  const held = Math.round((said.sinceFrameMs || 0) / 1000);
+  how.textContent = said.live
+    ? shape + ' \u00b7 ' + said.frames + ' frames'
+      + (said.restarts ? ' \u00b7 ' + said.restarts + ' restarts' : '')
+    : said.reconnecting
+      ? 'Reconnecting to the tablet... ' + (said.restartReason || said.why || '')
+      : said.frames > 0
+        ? (said.still ? 'Still picture; the tablet screen has not changed for ' + held + ' s'
+          : 'Waiting on the tablet; ' + held + ' s')
+        : (said.why || 'Waiting for the tablet...');
+  // The producer can be live before this browser decodes its first picture.
+  // Keep an existing picture during capture/ADB recovery, and do not replace
+  // the image's connection merely because a new encoder has started.
+  if (said.live && live.naturalWidth && !imageFailed) cover('');
+  else if (said.reconnecting && !live.naturalWidth && !imageFailed) {
+    cover('Reconnecting to the tablet... ' + (said.restartReason || ''), true);
+  }
+  // A closed local stream may end cleanly without dispatching an IMG error.
+  if (said.live && said.watchers === 0 && boundAt && Date.now() - boundAt >= 3000) retryImage();
+  // A deliberate minimize/pause is never reversed by the window's poller.
+  if (said.running === false && said.paused === false && !document.hidden) begin();
 }
 
+async function watch() {
+  if (watching || mirrorClosed) return;
+  watching = true;
+  try {
+    while (!mirrorClosed) {
+      try {
+        followMirror(await api.mirrorHow());
+      } catch (error) {
+        if (mirrorClosed) return;
+        how.textContent = 'Tablet status unavailable: ' + error.message + '; retrying';
+        if (!shown && !document.hidden) begin();
+      }
+      if (mirrorClosed) return;
+      await new Promise(function (go) {
+        watchWake = go;
+        watchTimer = setTimeout(function () { watchTimer = watchWake = null; go(); }, 1000);
+      });
+    }
+  } finally {
+    watching = false;
+  }
+}
 if (window.pineIconUpgrade) window.pineIconUpgrade(document);
 paintAuto();
 /* Remembered, like every other panel in this app. */

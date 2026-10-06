@@ -250,6 +250,104 @@
     catch (err) { /* private mode: controls remain usable */ }
   }
 
+  /* [toolbar-touch] Adaptive icon rows share the toolbar height. Sliding previews
+     a control; only release selects it. Range sliders retain their own gesture. */
+  function toolbarTouch(toolbar) {
+    var selector = 'button, [role="switch"]';
+    var pointer = null, chosen = null, bubble = null, blockUntil = 0;
+    function pick(x, y) {
+      var node = document.elementFromPoint(x, y);
+      var target = node && node.closest(selector);
+      return target && toolbar.contains(target) && !target.disabled && !target.hidden ? target : null;
+    }
+    function clear() {
+      if (chosen) chosen.classList.remove('sp-tool-peek');
+      chosen = null;
+      if (bubble) bubble.remove();
+      bubble = null;
+    }
+    function preview(x, y) {
+      var target = pick(x, y);
+      if (target !== chosen) {
+        clear();
+        chosen = target;
+        if (chosen) {
+          chosen.classList.add('sp-tool-peek');
+          bubble = make('div', 'sp-tool-magnifier');
+          bubble.setAttribute('aria-hidden', 'true');
+          var icon = chosen.querySelector('svg');
+          if (icon) bubble.appendChild(icon.cloneNode(true));
+          bubble.appendChild(make('span', '', chosen.getAttribute('aria-label') || chosen.title || chosen.textContent || 'Select'));
+          document.body.appendChild(bubble);
+        }
+      }
+      if (bubble) {
+        bubble.style.left = Math.max(100, Math.min(root.innerWidth - 100, x)) + 'px';
+        bubble.style.top = Math.max(8, y - 100) + 'px';
+      }
+    }
+    toolbar.addEventListener('pointerdown', function (e) {
+      if (pointer !== null || e.button !== 0 || !pick(e.clientX, e.clientY)) return;
+      pointer = e.pointerId;
+      e.preventDefault(); e.stopPropagation();
+      toolbar.setPointerCapture(pointer);
+      preview(e.clientX, e.clientY);
+    }, true);
+    toolbar.addEventListener('pointermove', function (e) {
+      if (e.pointerId !== pointer) return;
+      e.preventDefault(); e.stopPropagation();
+      preview(e.clientX, e.clientY);
+    }, true);
+    function end(e, select) {
+      if (e.pointerId !== pointer) return;
+      e.preventDefault(); e.stopPropagation();
+      var target = select ? pick(e.clientX, e.clientY) : null;
+      var id = pointer;
+      pointer = null;
+      clear();
+      blockUntil = Date.now() + 500;
+      if (toolbar.hasPointerCapture(id)) toolbar.releasePointerCapture(id);
+      if (target) { target.focus({preventScroll: true}); target.click(); }
+    }
+    toolbar.addEventListener('pointerup', function (e) { end(e, true); }, true);
+    toolbar.addEventListener('pointercancel', function (e) { end(e, false); }, true);
+    toolbar.addEventListener('lostpointercapture', function () { pointer = null; clear(); });
+    toolbar.addEventListener('click', function (e) {
+      if (e.isTrusted && e.detail > 0 && Date.now() < blockUntil) {
+        e.preventDefault(); e.stopImmediatePropagation();
+      }
+    }, true);
+    toolbar.addEventListener('contextmenu', function (e) { if (pointer !== null) e.preventDefault(); });
+  }
+
+  function toolbarLayout(toolbar) {
+    function visible(node) { return !node.hidden && node.getClientRects().length > 0; }
+    function update() {
+      if (!toolbar.isConnected) { resize.disconnect(); changes.disconnect(); return; }
+      var width = toolbar.clientWidth;
+      if (!width) return;
+      var groups = toolbar.querySelectorAll('.sp-tool-grid, .s3-bar-tools');
+      var needed = 240; // bounded reply-gap controls, including dice and cards
+      var parts = 1;
+      groups.forEach(function (group) {
+        if (!visible(group)) return;
+        var count = Array.from(group.children).filter(visible).length;
+        if (count) { needed += count * 34 + (count - 1) * 2; parts++; }
+      });
+      var air = toolbar.querySelector('.sp-s3-air');
+      if (air && visible(air)) { needed += 80; parts++; }
+      needed += (parts - 1) * 4 + 3; // group spacing and gap's left margin
+      var stacked = width < needed;
+      if (toolbar.classList.contains('sp-tools-stacked') !== stacked)
+        toolbar.classList.toggle('sp-tools-stacked', stacked);
+    }
+    var resize = new root.ResizeObserver(update);
+    var changes = new root.MutationObserver(update);
+    resize.observe(toolbar);
+    changes.observe(toolbar, {subtree: true, childList: true, attributes: true, attributeFilter: ['hidden']});
+    root.requestAnimationFrame(update);
+  }
+
   function bandController(bands, toolbar, items) {
     var state = bandLoad();
     function apply() {
@@ -4858,6 +4956,9 @@
    * to no conversation on show: one GET, then one conversation fetch, once
    * per round. The pane sits over the script in the script's own grid cell,
    * so the script underneath keeps following the air untouched. */
+  var gazetteView = null;
+  var gazetteScrollHeld = false;
+
   var s3Mode = 'script';
   var s3View = null;
   var s3Opening = null;
@@ -5058,6 +5159,7 @@
   }
 
   function s3SetMode(mode) {
+    if (gazetteView) gazetteView.close();
     if (mode === s3Mode || (mode !== 'technical' && mode !== 'messenger')) mode = 'script';
     s3Mode = mode;
     s3Chrome(mode !== 'script');
@@ -5334,6 +5436,9 @@
     SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff',
     MEMORY: '#d9c9a3', STATION: '#9aa9ab', GRAPH: '#9be15d',
     MEASURE: '#ff6b8b', SFXREACT: '#ffd479', CUTIN: '#c4a1ee', MINIROUND: '#87bfff', HOLD: '#d9c9a3'};   /* [outl-fam] */
+  var mvTileRenderer = root.PineSystem3MessageTile.createRenderer({
+    make: make, familyColors: MV_FAM, merge: mvMerge, wireEntry: mvRrPopWire, matchChip: mvMatchChip
+  });
   var mv = {
     view: 'feed', style: 'digital', flip: null, left: null, pane: null, stage: null,
     sceneBox: null, scene: null, sceneGen: 0, sceneRO: null, menu: null, menuOff: null,
@@ -5506,7 +5611,7 @@
     if (head && mv.flip && mv.flip.parentNode === head) head.insertBefore(seg, mv.flip);
     else pane.appendChild(seg);
     mv.seg = seg;
-    mv.stage = make('div', 'sp-mv-stage');
+    mv.stage = make('div', 'sp-mv-stage' + (mv.style === 'digital' ? ' sp-system3-stage' : ''));
     pane.appendChild(mv.stage);
     mvHistoryWire(pane, mv.stage);             /* [rollplay] scroll back freely */
     var scene = make('div', 'sp-mv-scene');
@@ -5522,6 +5627,7 @@
   function mvStyleSet(style) {
     mvUnpin();                                 /* [rollplay] a restyle rebuilds the bubble */
     mv.style = style === 'classic' ? 'classic' : 'digital';
+    if (mv.stage) mv.stage.classList.toggle('sp-system3-stage', mv.style === 'digital');
     try { localStorage.setItem('sp.mv.style', mv.style); } catch (e) { /* this session only */ }
     if (mv.seg) {
       var bs = mv.seg.querySelectorAll('.sp-mv-style');
@@ -6027,62 +6133,16 @@
 
   /* ------------------------------------------------------ System 3's record */
   function mvStageOf(ev, name) {
-    var st = (ev && ev.stages) || [];
-    for (var i = 0; i < st.length; i += 1) if (st[i] && st[i].stage === name) return st[i];
-    return null;
+    return root.PineSystem3MessageTile.stageOf.apply(null, arguments);
   }
   function mvReel(stg, fallbackDice) {
-    var cands = (stg && stg.candidates) || [];
-    var opts = [], hit = 0, mvW = [];   /* [msgroll] the raffle weights too */
-    for (var i = 0; i < cands.length; i += 1) {
-      var c = cands[i] || {};
-      opts.push(String(c.label || c.id || ''));
-      mvW.push(Math.max(0, Number(c.weight) || 0));   /* [msgroll] */
-      if (String(c.id) === String(stg.selected)) hit = i;
-    }
-    var rrRej = mvRrRejOf(stg);                /* [rollplay] the candidates a rule removed: they pop in, then go grey */
-    return {rej: rrRej, dice: stg && stg.draw && stg.draw.dice != null ? stg.draw.dice : fallbackDice,
-      opts: opts, hit: hit, label: opts[hit] || String((stg && stg.selected) || ''),
-      of: opts.length, stage: String((stg && stg.stage) || ''), weights: mvW};   /* [msgroll] */
+    return root.PineSystem3MessageTile.reel.apply(null, arguments);
   }
   function mvDecisionRow(ev) {
-    var st = (ev && ev.stages) || [];
-    var reels = [], drawn = null, i;
-    for (i = 0; i < st.length; i += 1) {
-      var s = st[i] || {};
-      if (s.draw && s.draw.dice != null && !drawn) drawn = s;
-      if (s.stage !== 'table' && (s.candidates || []).length > 1 && s.selected != null) reels.push(s);
-    }
-    var rng = ev && ev.rng && ev.rng.dice != null ? ev.rng.dice : null;
-    if (!drawn && rng === null) return null;                /* decided by a rule: not a roll */
-    var dice = drawn ? drawn.draw.dice : rng;
-    var cat = mvStageOf(ev, 'category');
-    var item = mvStageOf(ev, 'item');
-    var main = null, sub = null;
-    if (cat && (cat.candidates || []).length > 1) { main = cat; sub = item && (item.candidates || []).length > 1 ? item : null; }
-    else if (item && (item.candidates || []).length > 1) {
-      main = item;
-      var k = reels.indexOf(item);
-      sub = k >= 0 && reels[k + 1] ? reels[k + 1] : null;
-    } else { main = reels[0] || null; sub = reels[1] || null; }
-    var sel = (ev && ev.selected) || {};
-    var landed = String(sel.label || sel.id || (drawn && drawn.selected) || '');
-    var rrTs = mvStageOf(ev, 'table'), rrT0 = rrTs && (rrTs.candidates || [])[0];   /* [msgroll] the table's own name */
-    return {fam: String(ev.family || ''), table: String(sel.table || ev.family || ''), tableLabel: rrT0 ? String(rrT0.label || '') : '',
-      event: String(ev.event_id || ''),
-      main: main ? mvReel(main, dice) : {dice: dice, opts: [landed], hit: 0, label: landed, of: 1, stage: ''},
-      sub: sub ? mvReel(sub, null) : null, failed: mvRrFailed(ev), vrej: mvRrVerdicts(ev),   /* [rollplay] */
-      material: sel.material || null,                                       /* [research-pop] */
-      prompt: sel.prompt_row != null ? {words: String(sel.prompt || ''), row: String(sel.prompt_row || ''),
-        used: !!sel.in_prompt} : null};                                     /* [prompt-share] */
+    return root.PineSystem3MessageTile.decisionRow.apply(null, arguments);
   }
   function mvCounted(fam, table, one, two) {
-    var mk = function (x) {
-      if (!x) return null;
-      return {dice: x.dice != null ? x.dice : null, opts: [String(x.label || '')], hit: 0,
-        label: String(x.label || ''), index: Number(x.index) || 0, of: Number(x.of) || 0, counted: true};
-    };
-    return {fam: fam, table: table, event: '', main: mk(one), sub: mk(two)};
+    return root.PineSystem3MessageTile.countedRow.apply(null, arguments);
   }
   function mvRowsOf(item, ans, decisions) {
     var rows = [], i;
@@ -6741,17 +6801,28 @@
     var job = mv.levelQ.pop();                 /* newest first: the live bubble */
     var L = job.L;
     mv.levelBusy = job;
+    var expired = false, deadline = 0;
+    var abort = typeof root.AbortController === 'function' ? new root.AbortController() : null;
     var done = function () {
-      if (mv.levelBusy !== job) return;        /* the guard already moved on */
+      clearTimeout(deadline);
+      if (mv.levelBusy !== job) return;
       mv.levelBusy = null;
       if (mv.levelQ.length && !mv.levelKick) mv.levelKick = setTimeout(mvLevelsNext, 250);
     };
-    setTimeout(function () {                   /* a fetch that never answers holds nothing up */
-      if (mv.levelBusy === job) { if (!L.ready) L.failed = L.failed || 'timed out'; done(); }
+    deadline = setTimeout(function () {
+      if (mv.levelBusy !== job) return;
+      expired = true;
+      if (!L.ready) L.failed = L.failed || 'timed out';
+      if (abort) abort.abort();
+      /* decodeAudioData cannot be cancelled. Keep its slot until the promise
+         settles, or a timeout can stack another complete PCM allocation. */
     }, 30000);
     var Off = root.OfflineAudioContext || root.webkitOfflineAudioContext;
     if (typeof root.fetch !== 'function' || !Off) { L.failed = 'no decoder here'; done(); return; }
-    root.fetch(stationUrl(job.url), {headers: {Range: 'bytes=0-' + (MV_LV_MAX_BYTES - 1)}}).then(function (r) {
+    var options = {headers: {Range: 'bytes=0-' + (MV_LV_MAX_BYTES - 1)}};
+    if (abort) options.signal = abort.signal;
+    Promise.resolve().then(function () { return root.fetch(stationUrl(job.url), options); }).then(function (r) {
+      if (expired) throw new Error('timed out');
       if (!r.ok) throw new Error('http ' + r.status);
       var len = Number((r.headers && r.headers.get('content-length')) || 0);
       if (r.status !== 206 && len > MV_LV_MAX_BYTES) {
@@ -6760,14 +6831,18 @@
       }
       return r.arrayBuffer();
     }).then(function (buf) {
+      if (expired) throw new Error('timed out');
       if (!buf || buf.byteLength > MV_LV_MAX_BYTES + 65536) throw new Error('too long to measure here');
       var ctx = new Off(1, 1, 22050);
       return new Promise(function (ok, bad) {
         var p = ctx.decodeAudioData(buf, ok, bad);
         if (p && typeof p.then === 'function') p.then(ok, bad);
       });
-    }).then(function (ab) { return mvLevelsCompute(L, ab); }).then(done, function (e) {
-      L.failed = String((e && e.message) || e || 'undecodable');
+    }).then(function (ab) {
+      if (expired) throw new Error('timed out');
+      return mvLevelsCompute(L, ab);
+    }).then(done, function (e) {
+      L.failed = expired ? 'timed out' : String((e && e.message) || e || 'undecodable');
       done();
     });
   }
@@ -6840,16 +6915,19 @@
     g.globalAlpha = 1;
     m.drawn += 1;
   }
-  function mvAsk(item) {
+  function mvAsk(item, live) {
     var lid = item.lid;
+    var answerKey = (live ? "live:" : "") + lid;
+    if (live) answerKey += ':' + JSON.stringify([item.row && item.row.system3 || null,
+      item.row && item.row.decision_events || null, item.row && item.row.sfx_roll || null]);
     if (!lid) return Promise.resolve(null);
-    var have = mv.answers[lid];
+    var have = mv.answers[answerKey];
     if (have) return have;
     var prov = null;                         /* [msgdb] the provenance tree, asked beside it */
     var p = Promise.all([Promise.resolve().then(function () {
       return s3Request('/api/system3/line?line_id=' + encodeURIComponent(lid));
-    }).then(null, function () { return null; }), mvProv(lid), item.kind === 'clip' ? mvFolders() : null,
-      item.kind === 'clip' ? mvRrOrigin(lid) : null]).then(function (two) {   /* [msgmedia] the folder list; [rollplay] a clip's origin */
+    }).then(null, function () { return null; }), live ? null : mvProv(lid), !live && item.kind === 'clip' ? mvFolders() : null,
+      !live && item.kind === 'clip' ? mvRrOrigin(lid) : null]).then(function (two) {   /* [msgmedia] the folder list; [rollplay] a clip's origin */
       var ans = two[0];
       prov = two[1];
       if (two[3]) mvRrFromOrigin(item, two[3]);   /* [rollplay] its roll, its matcher's candidates */
@@ -6885,9 +6963,9 @@
     /* [link-now] "not directed by System 3" can mean "not filed YET": a line
        reaches the feed before its link is written. That answer is never kept -
        the next look asks again. */
-    p.then(function (o) { if (o && !o.answered && mv.answers[lid] === p) delete mv.answers[lid]; });
-    mv.answers[lid] = p;
-    mv.answerOrder.push(lid);
+    p.then(function (o) { if (o && !o.answered && mv.answers[answerKey] === p) delete mv.answers[answerKey]; });
+    mv.answers[answerKey] = p;
+    mv.answerOrder.push(answerKey);
     while (mv.answerOrder.length > 24) delete mv.answers[mv.answerOrder.shift()];
     return p;
   }
@@ -7129,6 +7207,7 @@
   function mvMomentRows(m) {
     var list = mvMomentList();
     var pos = function (x) {
+      if (m.positions && Object.prototype.hasOwnProperty.call(m.positions, x.lid)) return m.positions[x.lid];
       if (x.cur && x.cur.node && x.cur.node.isConnected) return list.indexOf(x.cur.node) * 2;
       for (var i = 0; i < m.members.length; i += 1) {
         var b = m.members[i];
@@ -7202,27 +7281,37 @@
       }
       if (host.all) host.all.appendChild(line);
     });
-    /* ONE sheet on the moment's card: what it rolled, landed and kept, then
-       the new tables rolling after them; the tally stays in view after */
-    var hostFit = host.buildFit;                    /* [reply-gap:buildup] */
-    host.buildFit = cur.preroll ? {ms: cur.preroll.ms, from: from} : null;
-    var sheet = mvRrSheet(host, m.rows, Math.max(1100, 3000 / fresh.length) * m.rows.length);
+    /* Append late decisions to the same sheet. Earlier reels never rebuild. */
+    var hostFit = host.buildFit, hostAppendAt = host.appendAt;
+    var sheet = host.sheet, existing = !!sheet;
+    var elapsed = existing ? Number(sheet.elapsed) || 0 : 0;
+    if (existing && host.t0 && host.phase === 'roll') elapsed = Math.max(elapsed, Date.now() - host.t0);
+    host.buildFit = cur.preroll ? {ms: cur.preroll.ms, from: existing ? sheet.tables.length : 0} : null;
+    host.appendAt = elapsed;
+    var budget = Math.max(1100, 3000 / fresh.length) * fresh.length;
+    if (existing) mvRrAppend(sheet, fresh, host, budget);
+    else sheet = mvRrSheet(host, m.rows, budget);
     host.buildFit = hostFit;
+    host.appendAt = hostAppendAt;
     sheet.keep = true;
     sheet.box.classList.add('sp-rr-keep');
-    host.rolls.textContent = '';
+    if (!existing) { host.rolls.textContent = ''; host.rolls.appendChild(sheet.box); }
     host.rolls.style.display = '';
-    host.rolls.appendChild(sheet.box);
     host.sheet = sheet;
+    host.keepRolls = host.style === 'digital' || !!host.keepRolls;
     host.waitDie = null;
     host.node.classList.add('sp-mv-joined');
-    var at0 = sheet.tables[from] ? sheet.tables[from].at : 0;
-    if (cur.still || host.still) { mvRrAt(sheet, 0, true); mvRrResults(sheet); return; }
-    var t0 = cur.preroll ? cur.preroll.audioAt - cur.preroll.ms : Date.now();   /* [reply-gap:buildup] */
+    var revision = host.joinRollRevision = (host.joinRollRevision || 0) + 1;
+    host.joinRollingSheet = sheet;
+    if (cur.still || host.still) { mvRrResults(sheet); host.joinRollingSheet = null; return; }
+    var t0 = Date.now(), at0 = existing ? elapsed : 0;
     mvRrReserve(sheet);
     (function step() {
-      if (!host.node.isConnected || host.sheet !== sheet) return;
-      if (mvRrAt(sheet, at0 + Date.now() - t0, false) === 'results') return;
+      if (!host.node.isConnected || host.sheet !== sheet || host.joinRollRevision !== revision) return;
+      if (mvRrAt(sheet, Math.max(sheet.elapsed, at0 + Date.now() - t0), false) === 'results') {
+        host.joinRollingSheet = null;
+        return;
+      }
       root.requestAnimationFrame(step);
     })();
   }
@@ -7303,9 +7392,11 @@
     cur.text.classList.remove('typing');
     cur.fill.style.width = '100%';
     cur.phase = 'done';
+    if (cur.style === 'digital' && cur.sheet && cur.joinRollingSheet !== cur.sheet) mvRrResults(cur.sheet);
   }
   function mvPlan(cur, data) {
     cur.data = data;
+    cur.keepRolls = cur.style === 'digital' || !!cur.keepRolls;   /* stable System3 rows stay through typing */
     if (!data.stores) data.stores = mvStores(cur.item, null, null);   /* [msgdb] a record, a live set */
     cur.rolls.textContent = '';
     var rows = (data.rows || []).slice();      /* [onecard-moment] every table the moment rolled - no cap */
@@ -7796,103 +7887,18 @@
      real candidate lists only; a list of one still lands (a short spin).
      Transforms and text only, written on the view's own frame. */
   var RR_WIN = 24;
-  function mvRrStep(reel, sub) {
-    var el = make('div', 'sp-rr-step ' + (sub ? 'sp-rr-sub' : 'sp-rr-cat'));
-    var die = make('span', 'sp-rr-die', '#');
-    var wheel = make('span', 'sp-rr-wheel');
-    var list = make('span', 'sp-rr-list');
-    wheel.appendChild(list);
-    var of = make('i', 'sp-rr-of', '');
-    el.appendChild(die);
-    el.appendChild(wheel);
-    el.appendChild(of);
-    el.style.display = 'none';
-    var rej = mvRrRejChips(el, reel);          /* [rollplay] */
-    var opts = (reel && reel.opts && reel.opts.length) ? reel.opts : [String((reel && reel.label) || '')];
-    var hit = Math.max(0, Math.min(opts.length - 1, Number(reel && reel.hit) || 0));
-    var w = (reel && reel.weights && reel.weights.length === opts.length) ? reel.weights : null;
-    var sum = 0, i;
-    for (i = 0; i < opts.length; i += 1) sum += w ? Math.max(0, Number(w[i]) || 0) : 1;
-    var hOf = function (k) {
-      if (!w || !sum) return RR_WIN;
-      var share = Math.max(0, Number(w[k]) || 0) / sum;
-      return Math.round(Math.max(16, Math.min(44, RR_WIN * 0.6 + share * opts.length * RR_WIN * 0.55)));
-    };
-    /* the reel: the real list (twice when short), then up to the rolled one */
-    var seq = [];
-    var passes = reel && reel.counted ? 0 : (opts.length > 40 ? 1 : 2);
-    for (var p = 0; p < passes; p += 1) for (i = 0; i < opts.length; i += 1) seq.push(i);
-    for (i = 0; i <= hit; i += 1) seq.push(i);
-    if (seq.length < 4) { seq = [hit, hit, hit].concat(seq); }            /* a list of one still spins a little */
-    var y = 0, target = 0;
-    seq.forEach(function (k, n) {
-      var h = hOf(k);
-      var cell = make('span', 'sp-rr-cell' + (n === seq.length - 1 ? ' hit' : ''), reel && reel.counted && n === seq.length - 1 ? reel.label : opts[k]);
-      cell.style.height = h + 'px';
-      cell.style.lineHeight = h + 'px';
-      list.appendChild(cell);
-      if (n === seq.length - 1) target = y - (RR_WIN - h) / 2;
-      y += h;
-    });
-    var landed = reel && reel.counted && reel.of
-      ? (reel.index + ' of ' + reel.of) : (opts.length > 1 ? (hit + 1) + ' of ' + opts.length : 'the only one');
-    return {el: el, die: die, list: list, wheel: wheel, of: of, target: target, reel: reel || {}, landedOf: landed, rej: rej};   /* [rollplay] */
-  }
+  function mvRrStep(reel, sub) { return mvTileRenderer.step(reel, sub); }
   /* [reply-gap:buildup] THE TIMING CONTRACT - reply_gap.py BUILD_* (the
    * station schedules a card's buildup from these very numbers; the test
    * holds the two equal). A card with a scheduled buildup rolls at `per` and
    * is fitted to exactly the scheduled ms. */
-  var MV_BUILD = {per: 1800, one: [0.08, 0.18, 0.60, 0.06], two: [0.08, 0.12, 0.27, 0.06, 0.12, 0.27, 0.06],
-    rejEach: 260, rejBase: 140, rejCap: 0.4, rejMax: 6, fail: 420, between: 40, hold: 1500};
+  var MV_BUILD = root.PineSystem3MessageTile.BUILD;
   /* the fresh tables (from `from` on) laid out again to end exactly `ms`
      after the first of them starts, the 1.5 s hold included */
-  function mvBuildFit(tables, from, ms, at) {
-    var fresh = tables.slice(from || 0);
-    if (!fresh.length || !(ms > 0)) return at;
-    var start = fresh[0].at;
-    var gaps = MV_BUILD.between * fresh.length;
-    var span = at - start - gaps;
-    var want = ms - MV_BUILD.hold - gaps;
-    if (!(span > 0) || !(want > 0)) return at;
-    var k = want / span;
-    if (Math.abs(k - 1) < 0.002) return at;
-    var a = start;
-    fresh.forEach(function (T) {
-      ['dIn', 'dRej', 'dDie', 'dSpin', 'dPop', 'dRej2', 'dDie2', 'dSpin2', 'dPop2', 'dFail'].forEach(function (f) {
-        T[f] = (T[f] || 0) * k;
-      });
-      T.at = a;
-      T.end = a + T.dIn + T.dRej + T.dDie + T.dSpin + T.dPop + T.dRej2 + T.dDie2 + T.dSpin2 + T.dPop2 + T.dFail;
-      a = T.end + MV_BUILD.between;
-    });
-    return a;
-  }
+  function mvBuildFit(tables, from, ms, at) { return mvTileRenderer.buildFit(tables, from, ms, at); }
   /* the card's final height, reserved before a table lands: a hidden copy
      of the sheet, measured as the results and as its last table rolling */
-  function mvRrReserve(sheet) {
-    try {
-      var box = sheet && sheet.box;
-      if (!box || !box.parentNode || !sheet.tables.length) return;
-      var ghost = box.cloneNode(true);
-      ghost.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:0;top:0;min-height:0;width:'
-        + Math.round(box.getBoundingClientRect().width || box.parentNode.getBoundingClientRect().width) + 'px';
-      ghost.classList.add('results');
-      var ts = ghost.querySelectorAll('.sp-rr-t');
-      [].forEach.call(ts, function (t) { t.style.display = ''; t.style.opacity = '1'; t.classList.add('folded'); });
-      box.parentNode.appendChild(ghost);
-      var h2 = ghost.offsetHeight;
-      ghost.classList.remove('results');
-      var lastT = ts[ts.length - 1];
-      if (lastT) {
-        lastT.classList.remove('folded');
-        [].forEach.call(lastT.children, function (c) { c.style.display = ''; });
-      }
-      var h1 = ghost.offsetHeight;
-      ghost.parentNode.removeChild(ghost);
-      var h = Math.max(h1, h2);
-      if (h > 0) box.style.minHeight = Math.ceil(h) + 'px';
-    } catch (e) { /* a card that cannot be measured still plays */ }
-  }
+  function mvRrReserve(sheet) { return mvTileRenderer.reserve(sheet); }
   /* [rr-popup] "If I click on a roulette wheel entry, then show a pop-up listing
    * all of the entries in that roulette ... a table of all the potential
    * alternative entries that could have been reached and also ... a table of
@@ -8227,156 +8233,15 @@
     document.body.appendChild(back);
   }
 
-  function mvRrSheet(cur, rows, budgetMs) {
-    var box = make('div', 'sp-rr');
-    var tables = [];
-    rows.forEach(function (r) {
-      var t = make('div', 'sp-rr-t');
-      t.style.setProperty('--fam', MV_FAM[r.fam] || '#68ced9');
-      t.style.display = 'none';
-      var head = make('div', 'sp-rr-head');
-      head.appendChild(make('b', '', r.table || r.fam));
-      if (r.tableLabel && r.tableLabel !== r.table) head.appendChild(make('span', '', r.tableLabel));
-      t.appendChild(head);
-      var cat = mvRrStep(r.vrej && r.vrej.length ? mvMerge(r.main, {rej: (r.main.rej || []).concat(r.vrej)}) : r.main, false);   /* [rollplay] */
-      t.appendChild(cat.el);
-      var sub = r.sub ? mvRrStep(r.sub, true) : null;
-      if (sub) t.appendChild(sub.el);
-      /* [rollplay] "keep the indented look on the sfx clip when the roulette
-         animation completes instead of putting the items on the same row":
-         the finished table is two rows, the count kept on each */
-      var line = make('div', 'sp-rr-line sp-rr-two');
-      var lc = make('div', 'sp-rr-lc');
-      lc.appendChild(make('b', '', r.table || r.fam));
-      lc.appendChild(make('span', 'sp-rr-ld', r.main && r.main.dice != null ? String(r.main.dice) : '-'));
-      lc.appendChild(make('span', 'sp-rr-ll', (r.main && r.main.label) || ''));
-      if (cat.landedOf && cat.landedOf !== 'the only one') lc.appendChild(make('i', 'sp-rr-lof', cat.landedOf));
-      mvRrPopWire(lc, rows, rows.indexOf(r), 'main');                       /* [rr-popup] */
-      line.appendChild(lc);
-      if (r.sub) {
-        var ls = make('div', 'sp-rr-ls');
-        ls.appendChild(make('span', 'sp-rr-ld', r.sub.dice != null ? String(r.sub.dice) : '-'));
-        ls.appendChild(make('span', 'sp-rr-ll', r.sub.label || ''));
-        if (sub && sub.landedOf && sub.landedOf !== 'the only one') ls.appendChild(make('i', 'sp-rr-lof', sub.landedOf));
-        mvRrPopWire(ls, rows, rows.indexOf(r), 'sub');                     /* [rr-popup] */
-        line.appendChild(ls);
-      }
-      mvRrFoldNote(line, r, cat, sub);            /* [rollplay] the rejected, counted; a failed table's reason */
-      t.appendChild(line);
-      if (r.match && typeof mvMatchChip === 'function') mvMatchChip(head, cur);
-      box.appendChild(t);
-      tables.push({el: t, head: head, cat: cat, sub: sub, line: line, r: r});
-    });
-    var n = Math.max(1, tables.length);
-    var per = Math.max(1100, Math.min(2400, budgetMs / n));
-    var fit = cur && cur.buildFit;                  /* [reply-gap:buildup] the contract's pace */
-    if (fit && fit.ms > 0) per = MV_BUILD.per;
-    var at = 0;
-    tables.forEach(function (T) {
-      var two = !!T.sub;
-      T.at = at;
-      T.dIn = per * 0.08;
-      T.dDie = per * (two ? 0.12 : 0.18);
-      T.dSpin = per * (two ? 0.27 : 0.6);
-      T.dPop = per * 0.06;
-      T.dDie2 = two ? per * 0.12 : 0;
-      T.dSpin2 = two ? per * 0.27 : 0;
-      T.dPop2 = two ? per * 0.06 : 0;
-      T.dRej = mvRrRejMs(T.cat, per);              /* [rollplay] the rejected pop in, go grey */
-      T.dRej2 = T.sub ? mvRrRejMs(T.sub, per) : 0;
-      T.dFail = T.r.failed ? 420 : 0;
-      T.end = at + T.dIn + T.dRej + T.dDie + T.dSpin + T.dPop + T.dRej2 + T.dDie2 + T.dSpin2 + T.dPop2 + T.dFail;
-      at = T.end + 40;
-    });
-    /* [msgroll] then the whole result, readable, for 1.5 s before the message */
-    if (fit && fit.ms > 0) at = mvBuildFit(tables, fit.from || 0, fit.ms, at);   /* [reply-gap:buildup] */
-    return {box: box, tables: tables, rolled: at, total: at + 1500, now: ''};
-  }
-  function mvRrOut(x) { x = Math.max(0, Math.min(1, x)); return 1 - Math.pow(1 - x, 3.2); }
-  function mvRrStepAt(step, dieE, dDie, spinE, dSpin, popE, dPop) {
-    if (dieE < 0) return 'wait';
-    if (step.el.style.display === 'none') step.el.style.display = '';
-    var r = step.reel || {};
-    var face = r.dice == null ? '-' : (dieE >= dDie ? String(r.dice) : String(1 + ((Number(r.dice || 0) * 37 + Math.floor(dieE / 70) * 53) % 100)));
-    if (step.die.textContent !== face) step.die.textContent = face;
-    step.die.classList.toggle('rolling', dieE < dDie);
-    if (dieE < dDie) return 'die';
-    var k = spinE >= dSpin ? 1 : mvRrOut(spinE / dSpin);
-    var tr = 'translateY(' + (-Math.round(k * step.target)) + 'px)';
-    if (step.list.style.transform !== tr) step.list.style.transform = tr;
-    step.wheel.classList.toggle('spinning', spinE >= 0 && spinE < dSpin);
-    if (spinE < dSpin) return 'spin';
-    var popping = popE < dPop;
-    step.wheel.classList.toggle('pop', popping);
-    if (step.of.textContent !== step.landedOf) step.of.textContent = step.landedOf;
-    return popping ? 'pop' : 'done';
-  }
+  function mvRrSheet(cur, rows, budgetMs) { return mvTileRenderer.sheet(cur, rows, budgetMs); }
+  function mvRrAppend(sheet, rows, cur, budgetMs) { return mvTileRenderer.append(sheet, rows, cur, budgetMs); }
+  function mvRrOut(x) { return mvTileRenderer.out(x); }
+  function mvRrStepAt(step, dieE, dDie, spinE, dSpin, popE, dPop) { return mvTileRenderer.stepAt(step, dieE, dDie, spinE, dSpin, popE, dPop); }
   /* every table on one line each - its dice, its category, its sub-result: the
      results screen, held after the roll and shown again by the Result tab */
-  function mvRrResults(sheet) {
-    sheet.box.style.display = '';
-    sheet.tables.forEach(function (T) {
-      T.el.style.display = '';
-      T.el.style.opacity = '1';
-      T.el.classList.add('folded');
-      T.el.classList.remove('arriving');
-      mvRrQuiet(T);
-    });
-    sheet.box.classList.add('results');
-    sheet.now = 'results';
-    sheet.box.setAttribute('data-now', 'results');
-  }
-  function mvRrQuiet(T) {
-    if (T.r && T.r.failed) { T.el.classList.add('sp-rr-failed'); T.el.title = T.r.failed.why; }   /* [rollplay] */
-    mvRrRejAt(T.cat, 1e9, T.dRej || 1);         /* [rollplay] a folded table's rejected rest grey, never mid-pop */
-    if (T.sub) mvRrRejAt(T.sub, 1e9, T.dRej2 || 1);
-    [T.cat, T.sub].forEach(function (st) {
-      if (!st) return;
-      st.die.classList.remove('rolling');
-      st.wheel.classList.remove('spinning');
-      st.wheel.classList.remove('pop');
-    });
-  }
-  function mvRrAt(sheet, ms, skip) {
-    if (!skip && ms >= sheet.rolled) { if (sheet.now !== 'results') mvRrResults(sheet); return 'results'; }
-    var now = '';
-    var done = 0;
-    sheet.tables.forEach(function (T, i) {
-      var e = skip ? 1e9 : ms - T.at;
-      if (e < 0) { if (T.el.style.display !== 'none') T.el.style.display = 'none'; return; }
-      var finished = e >= T.end - T.at;
-      var laterStarted = sheet.tables[i + 1] && (skip || ms >= sheet.tables[i + 1].at);
-      if (laterStarted) {
-        /* folded to one line; only the last folded one stays in view */
-        done += 1;
-        var keep = sheet.keep || i === sheet.tables.length - 1 || !(sheet.tables[i + 2] && (skip || ms >= sheet.tables[i + 2].at));   /* [rollkeep] */
-        T.el.style.display = keep ? '' : 'none';
-        T.el.classList.add('folded');
-        mvRrQuiet(T);
-        return;
-      }
-      if (T.el.style.display === 'none') T.el.style.display = '';
-      T.el.style.opacity = String(Math.min(1, e / Math.max(1, T.dIn)));
-      T.el.classList.toggle('arriving', e < T.dIn);
-      var a0 = e - T.dIn;                          /* [rollplay] the rejected first, then the roll that stood */
-      var q1 = mvRrRejAt(T.cat, a0, T.dRej || 0);
-      var a = a0 - (T.dRej || 0);
-      var s1 = q1 === 'rej' ? 'rej' : mvRrStepAt(T.cat, a, T.dDie, a - T.dDie, T.dSpin, a - T.dDie - T.dSpin, T.dPop);
-      var s2 = 'none';
-      if (T.sub) {
-        var b0 = a - T.dDie - T.dSpin - T.dPop;
-        var q2 = mvRrRejAt(T.sub, b0, T.dRej2 || 0);
-        var b = b0 - (T.dRej2 || 0);
-        s2 = q2 === 'rej' ? 'rej' : (q2 === 'wait' ? 'wait' : mvRrStepAt(T.sub, b, T.dDie2, b - T.dDie2, T.dSpin2, b - T.dDie2 - T.dSpin2, T.dPop2));
-      }
-      var failing = !!T.r.failed && e >= T.end - T.at - (T.dFail || 0);
-      if (T.r.failed) T.el.classList.toggle('sp-rr-failed', failing || finished);
-      if (!finished) now = i + ':' + (e < T.dIn ? 'table' : failing ? 'failed' : (s2 !== 'none' && s2 !== 'wait' ? 'sub-' + s2 : 'cat-' + s1));
-    });
-    sheet.now = now;
-    if (sheet.box.getAttribute('data-now') !== now) sheet.box.setAttribute('data-now', now);
-    return now;
-  }
+  function mvRrResults(sheet) { return mvTileRenderer.results(sheet); }
+  function mvRrQuiet(T) { return mvTileRenderer.quiet(T); }
+  function mvRrAt(sheet, ms, skip) { return mvTileRenderer.at(sheet, ms, skip); }
 
   /* [msgroll] THE RESULT TAB FLIPS A BUBBLE - live or in the history - to its
      results screen and back ("when I click the results tab, I want to
@@ -8391,8 +8256,7 @@
       mvRrResults(cur.sheet);
       if (cur.seedStrip) cur.seedStrip.style.display = 'none';
     } else if (cur.phase === 'air' || cur.phase === 'done') {
-      if (cur.item.kind === 'clip' || cur.keepRolls) { /* a clip's roll stays in view [msgthumb] [rollkeep] */ }
-      else if (cur.style === 'digital') cur.rolls.style.display = 'none';
+      if (cur.item.kind === 'clip' || cur.keepRolls || cur.style === 'digital') { cur.rolls.style.display = ''; }
       else { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }
     }
   }
@@ -8443,13 +8307,6 @@
       }
       if (e < 0) return;
       if (p.wrap.style.display === 'none' && !p.folded) p.wrap.style.display = '';
-      /* listing as it goes: the three newest tables stay in the bubble, the
-         older ones fold away (the Result tab keeps every one) */
-      var k = cur.plan.indexOf(s);
-      if (k >= cur.fit && !skip) {
-        var old = cur.plan[k - cur.fit].p;
-        if (!old.folded) { old.folded = true; old.wrap.style.display = 'none'; }
-      }
       var a = e / s.d1;
       p.die.style.transform = a < 1 ? 'rotate(' + Math.round(a * 540) + 'deg)' : '';
       mvNum(p.num, p.r.main, a);
@@ -8480,22 +8337,11 @@
     }
     if (ms < cur.rollEnd + 1 || !cur.rolledOnce) {
       mvRollAt(cur, ms);
-      if (cur.sheet) mvRrAt(cur.sheet, ms, !!cur.skip);   /* [msgroll] */
+      if (cur.sheet && cur.joinRollingSheet !== cur.sheet) mvRrAt(cur.sheet, ms, !!cur.skip);   /* [msgroll] */
       if (ms >= cur.rollEnd) cur.rolledOnce = true;
     }
-    if (cur.style === 'digital' && cur.parts.length) {
-      var c = (ms - cur.rollEnd) / Math.max(1, cur.collapseEnd - cur.rollEnd);
-      if (c >= 0 && !cur.collapsed) {
-        /* collapse: every row folds into the first; the Result tab keeps them all */
-        cur.parts.forEach(function (p, i) {
-          if (i === 0) { p.wrap.style.display = ''; p.wrap.style.opacity = String(Math.min(1, 0.4 + c)); return; }
-          p.wrap.style.display = (c >= 1 || p.folded) ? 'none' : '';
-          if (c < 1) p.wrap.style.opacity = String(1 - c);
-        });
-        if (c >= 1) { cur.collapsed = true; cur.tab.hidden = false; }
-      }
-    } else if (ms >= cur.collapseEnd && cur.tab.hidden && cur.all.childNodes.length) {
-      cur.tab.hidden = false;   /* [msgroll] Classic has its Result tab too */
+    if (ms >= cur.collapseEnd && cur.tab.hidden && cur.all.childNodes.length) {
+      cur.tab.hidden = false;
     }
     if (cur.style === 'digital' && cur.src && cur.src.main) {
       var a = cur.accFrom != null   /* [rollplay] the hold menu: the Rolodex turns with the words */
@@ -8513,19 +8359,19 @@
       if (cur.phase !== 'air') {
         cur.phase = 'air';
         cur.node.classList.add('sp-mv-onair');
-        /* "then we can clear this out and have the text up here" */
-        if (item.kind === 'clip' || cur.keepRolls) { /* [msgthumb] a clip keeps its roll in view; [rollkeep] so does a tile */ }
-        else if (cur.style === 'digital') cur.rolls.style.display = 'none';
-        else if (cur.creel) cur.creel.style.display = 'none';   /* [msgmedia] the roulette becomes the message */
-        if (cur.sheet && (item.kind === 'clip' || cur.keepRolls)) mvRrResults(cur.sheet);   /* [msgroll] [rollkeep] the roll stays */
-        else if (cur.sheet) { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }   /* [msgroll] */
+        /* Digital reels keep their original nodes and formatting as words appear. */
+        if (item.kind === 'clip' || cur.keepRolls || cur.style === 'digital') {
+          cur.rolls.style.display = '';
+          if (cur.sheet && cur.joinRollingSheet !== cur.sheet && (cur.skip || ms >= cur.sheet.rolled)) mvRrResults(cur.sheet);
+        } else {
+          if (cur.creel) cur.creel.style.display = 'none';
+          if (cur.sheet) { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }
+        }
       }
       if (item.kind === 'speech') {
-        var n = Math.floor((f === null ? 1 : f) * item.text.length + 0.0001);
-        if (n < cur.typed) n = cur.typed;
-        /* behind the audio (the roll took its seconds): type up to it, eased
-           over a few frames - never a jump */
-        if (cur.typed >= 0 && n - cur.typed > 3) n = cur.typed + Math.ceil((n - cur.typed) * 0.3);   /* [msgroll] the first frame starts where the audio is */
+        /* Behind the audio: shared monotonic typewriter with the feed
+           and System3 message tiles, easing catch-up over a few frames. */
+        var n = root.PineSystem3MessageTile.typeCount(cur.typed, f === null ? 1 : f, item.text.length);
         if (n !== cur.typed) {
           cur.typed = n;
           cur.text.textContent = item.text.slice(0, n);
@@ -8716,53 +8562,16 @@
      Roll tab, the hold menu and the diagnostics all share this engine. */
   var RR_REJ_MAX = 6;
   function mvRrRejOf(stg) {
-    var out = [];
-    ((stg && stg.excluded) || []).forEach(function (x) {
-      if (!x || out.length >= RR_REJ_MAX) return;
-      out.push({label: String(x.label || x.id || ''), why: 'rejected: ' + String(x.why || 'a rule removed it')});
-    });
-    return out;
+    return root.PineSystem3MessageTile.rejected.apply(null, arguments);
   }
   function mvRrVerdicts(ev) {
-    var out = [];
-    ((ev && ev.stages) || []).forEach(function (st) {
-      ((st && st.verdicts) || []).forEach(function (v) {
-        if (!v || v.eligible !== false || out.length >= RR_REJ_MAX) return;
-        out.push({label: String(v.label || v.id || ''), why: 'not eligible: ' + String(v.why || 'its rule said no')});
-      });
-    });
-    return out;
+    return root.PineSystem3MessageTile.verdicts.apply(null, arguments);
   }
   function mvRrFailed(ev) {
-    var sel = (ev && ev.selected) || {};
-    var id = String(sel.id || '').toUpperCase();
-    if (id !== 'PASS' && id !== 'NONE') return null;
-    var gate = null;
-    ((ev && ev.stages) || []).forEach(function (st) { if (st && st.threshold != null && !gate) gate = st; });
-    var d = gate && gate.draw ? gate.draw.dice : null;
-    return {why: 'failed: ' + String(sel.label || 'the roll returned nothing')
-      + (gate && gate.rule ? ' - ' + String(gate.rule) : '') + (d != null ? ' (rolled ' + d + ')' : '')};
+    return root.PineSystem3MessageTile.failed.apply(null, arguments);
   }
   function mvRrMatchRej(m) {
-    var out = [];
-    if (!m) return out;
-    var removed = m.removed || {};
-    Object.keys(removed).forEach(function (k) {
-      var n = Number(removed[k]) || 0;
-      if (n > 0 && out.length < RR_REJ_MAX) out.push({label: n + ' removed', why: 'rejected by a rule: ' + k + ' (' + n + ' clip' + (n === 1 ? '' : 's') + ')'});
-    });
-    var won = Number(m.score);
-    (m.candidates || []).forEach(function (x) {
-      if (!x || out.length >= RR_REJ_MAX) return;
-      var sc = Number(x.score);
-      if (!(isFinite(won) && isFinite(sc) && sc < won)) return;   /* a tie may be the one drawn: never greyed */
-      var words = [].concat(x.line || [], x.context || [], x.senses || [], x.folder_words || []).slice(0, 3);
-      out.push({label: String(x.folder || 'a clip') + (words.length ? ' - ' + words.join(', ') : ''),
-        why: 'lost: scored ' + sc.toFixed(2) + ', the pick ' + won.toFixed(2)});
-    });
-    var tied = Number(m.tied) || 0;
-    if (tied > 1 && out.length < RR_REJ_MAX) out.push({label: (tied - 1) + ' tied', why: 'tied at ' + (isFinite(won) ? won.toFixed(2) : '?') + ' - not drawn'});
-    return out;
+    return root.PineSystem3MessageTile.matchRejected.apply(null, arguments);
   }
   function mvRrOrigin(lid) {
     if (!lid) return Promise.resolve(null);
@@ -8789,52 +8598,10 @@
     var sr = {road: road, category: cat || {}, clip: clip || null};
     item.row = mvMerge(item.row || {}, {sfx_roll: sr});
   }
-  function mvRrRejChips(el, reel) {
-    var list = (reel && reel.rej) || [];
-    if (!list.length) return [];
-    el.classList.add('sp-rr-has-rej');
-    var box = make('span', 'sp-rr-rej');
-    var out = [];
-    list.forEach(function (x) {
-      var c = make('span', 'sp-rr-rejc', x.label);
-      c.title = x.why;
-      c.setAttribute('aria-disabled', 'true');
-      c.style.display = 'none';
-      box.appendChild(c);
-      out.push(c);
-    });
-    el.appendChild(box);
-    return out;
-  }
-  function mvRrRejMs(step, per) {
-    var n = step && step.rej ? step.rej.length : 0;
-    return n ? Math.min(per * 0.4, 260 * n + 140) : 0;
-  }
-  function mvRrRejAt(step, e, d) {
-    var c = (step && step.rej) || [];
-    if (!c.length || !d) return 'none';
-    if (e < 0) return 'wait';
-    if (step.el.style.display === 'none') step.el.style.display = '';
-    var gap = d / c.length;
-    for (var k = 0; k < c.length; k += 1) {
-      var t = e - k * gap;
-      var on = t >= 0, grey = t >= gap * 0.55;
-      if (c[k].style.display !== (on ? '' : 'none')) c[k].style.display = on ? '' : 'none';
-      c[k].classList.toggle('pop', on && !grey);
-      c[k].classList.toggle('gone', grey);
-    }
-    return e < d ? 'rej' : 'none';
-  }
-  function mvRrFoldNote(line, r, cat, sub) {
-    var n = ((cat && cat.rej) || []).length + ((sub && sub.rej) || []).length;
-    if (n) {
-      var why = [].concat((cat && cat.rej) || [], (sub && sub.rej) || []).map(function (c) { return c.textContent + ' - ' + c.title; });
-      var tag = make('i', 'sp-rr-rejn', n + ' rejected');
-      tag.title = why.join('\n');
-      line.appendChild(tag);
-    }
-    if (r && r.failed) line.title = r.failed.why;
-  }
+  function mvRrRejChips(el, reel) { return mvTileRenderer.rejectionChips(el, reel); }
+  function mvRrRejMs(step, per) { return mvTileRenderer.rejectionMs(step, per); }
+  function mvRrRejAt(step, e, d) { return mvTileRenderer.rejectionAt(step, e, d); }
+  function mvRrFoldNote(line, r, cat, sub) { return mvTileRenderer.foldNote(line, r, cat, sub); }
 
   /* [rollplay] THE CLIP'S FILE TYPE, off the file itself. "For each clip that
      plays by the SFX guy, show a bubble here that says if it's an MP3 or an
@@ -9168,7 +8935,7 @@
     cur.text.classList.remove('typing');
     cur.fill.style.width = '100%';
     if (cur.plan) cur.skip = true;
-    cur.keepRolls = false;                     /* [rollkeep] */
+    cur.keepRolls = cur.style === 'digital';    /* [rollkeep] preserve the landed Digital reels */
     /* [onecard-moment] the tables stay on the card (mvPlan keeps them) */
     if (cur !== mv.cur) cur.node.classList.add('sp-mv-past');
     mv.pinEnded = (mv.pinEnded || 0) + 1;
@@ -9411,6 +9178,7 @@
     st.chip.textContent = st.style === 'classic' ? 'Classic' : 'Digital';
     st.plays += 1;
     var cur = rtBubble(st);
+    st.stage.classList.toggle('sp-system3-stage', cur.style === 'digital');
     rtOffAir(function () { mvPlan(cur, st.data); });
     cur.skip = false;                        /* asked for: it rolls, whatever the motion setting */
     cur.fit = 3;
@@ -10013,7 +9781,163 @@
     }
   };
 
+  /* The Digital feed renderer in a caller-owned overlay: no Script mount,
+     media player, poller, or extra station page. One frame loop and one
+     record load at a time; invisible history is inert until inspected. */
+  function mvFeedMount(into) {
+    var stage=make('div','sp-mv-stage pip-digital-stage sp-system3-stage');
+    stage.setAttribute('role','log');stage.setAttribute('aria-label','Digital station feed');
+    stage.setAttribute('aria-live','polite');stage.setAttribute('aria-relevant','additions');
+    var empty=make('p','pip-digital-empty','Waiting for station activity');stage.appendChild(empty);into.appendChild(stage);
+    var cards=new Map(),seen=new Set(),active=true,dead=false,joined=false,busy=false,raf=0,lastFrame=0,follow=true,handAt=0;
+    var pending=[],currentId='',recordKey='';
+    var intersections=typeof root.IntersectionObserver==='function'?new root.IntersectionObserver(function(entries){entries.forEach(function(entry){var card=entry.target.__digitalCard;if(card){card.visible=entry.isIntersecting;entry.target.classList.toggle('sp-mv-frozen',!entry.isIntersecting);}});load();wake();},{root:stage,threshold:0}):null;
+    function shown(card){if(intersections)return card.visible;var a=stage.getBoundingClientRect(),b=card.cur.node.getBoundingClientRect();return b.bottom>a.top&&b.top<a.bottom&&b.width>0;}
+    function wake(){if(!dead&&active&&!document.hidden&&!raf)raf=root.requestAnimationFrame(frame);}
+    function settled(card){var cur=card.cur;cur.text.textContent=cur.item.text;cur.text.classList.remove('typing');cur.typed=cur.item.text.length;cur.fill.style.width='100%';cur.phase='done';cur.node.classList.add('sp-mv-past');card.done=true;}
+    function plan(card,data){if(dead||!card.cur.node.isConnected)return;card.cur.node.classList.remove('sp-mv-past');card.data=data||{rows:[],sources:{main:'',others:[]}};rtOffAir(function(){mvPlan(card.cur,card.data);});card.cur.still=!!(root.matchMedia&&root.matchMedia('(prefers-reduced-motion: reduce)').matches);card.cur.skip=card.cur.still;card.cur.began=Date.now();card.cur.t0=0;card.done=false;card.waiting=false;wake();}
+    function ask(card){if(card.queued||card.waiting||card.data)return;card.queued=true;pending.push(card);var wait=make('div','sp-mv-waiting');wait.appendChild(mvGlyph('c:cube','sp-mv-spin'));wait.appendChild(make('span','','asking System 3 how this was rolled...'));card.cur.rolls.appendChild(wait);card.cur.waitDie=wait.firstChild;card.cur.text.textContent='';card.done=false;wake();}
+    function load(){if(busy||!active||dead||document.hidden)return;var index=pending.findIndex(function(c){return c.cur.node.isConnected&&shown(c);});if(index<0)return;var card=pending.splice(index,1)[0];card.queued=false;card.waiting=true;busy=true;mvAsk(card.cur.item).then(function(data){plan(card,data);}).catch(function(){card.waiting=false;try{plan(card,null);}catch(error){settled(card);}}).finally(function(){busy=false;wake();});}
+    function frame(now){raf=0;if(dead||!active||document.hidden||!stage.isConnected)return;
+      if(now-lastFrame<33){wake();return;}lastFrame=now;load();var running=busy;
+      cards.forEach(function(card){if(card.done||!shown(card))return;running=true;var cur=card.cur;
+        if(!cur.plan){if(cur.waitDie)cur.waitDie.style.transform='rotate('+Math.round((now%900)/900*360)+'deg)';return;}
+        rtOffAir(function(){mvFrameItem(cur,Date.now());});var clipDone=rtClipType(card,cur,Date.now());
+        if(cur.phase==='air'&&(cur.item.kind!=='speech'?clipDone:cur.typed>=cur.item.text.length)){card.done=true;cur.fill.style.width='100%';cur.text.classList.remove('typing');cur.tab.hidden=!(cur.data.rows||[]).length;}
+      });
+      if(follow&&stage.scrollTop+stage.clientHeight<stage.scrollHeight-2)stage.scrollTop=stage.scrollHeight;
+      if(running||pending.some(function(c){return shown(c);}))wake();
+    }
+    function append(row,options){options=options||{};var id=String(row.id||'');if(!id)return;var key=(options.event?'event:':'line:')+id,have=cards.get(key);
+      if(have){var words=mvPlain(row.text||'');if(words&&words!==have.cur.item.text){have.cur.item.text=words;have.cur.item.row=row;if(have.data&&have.data.answered===false&&!have.queued&&!have.waiting){have.data=null;have.cur.plan=null;have.cur.rolls.textContent='';ask(have);}if(have.done){have.done=false;have.cur.began=Date.now();have.cur.typed=Math.min(have.cur.typed,words.length);wake();}}return have;}
+      if(seen.has(key)&&!options.live)return;seen.add(key);if(seen.size>800)seen.delete(seen.values().next().value);empty.remove();
+      var item=mvHistItem(row);item.key=key;if(options.event){item.lid='';item.kind='speech';}if(options.record){item.kind='record';item.lid='';}
+      var cur=rtBubbleDom(item,'digital',function(c){if(!card.data){ask(card);return;}if(c.sheet)mvResults(c,!c.showingResults);else c.all.hidden=!c.all.hidden;wake();});
+      cur.node.dataset.feedKey=key;cur.node.classList.add('pip-digital-card');cur.node.style.setProperty('--mv-lines','999');
+      if(item.lid&&root.PineMsgId)cur.node.querySelector('.sp-mv-bubble').appendChild(root.PineMsgId.chip(item.lid,'corner'));
+      var card={cur:cur,data:null,done:false,queued:false,waiting:false,visible:false,clipText:''};cur.node.__digitalCard=card;cards.set(key,card);stage.appendChild(cur.node);if(intersections)intersections.observe(cur.node);
+      if(options.animate===false){settled(card);if(item.lid){cur.tab.hidden=false;cur.tab.title='Show the roulette result for this message';}}
+      else if(options.data||!item.lid)plan(card,options.data);
+      else ask(card);
+      while(cards.size>120){var first=cards.keys().next().value,old=cards.get(first);cards.delete(first);pending=pending.filter(function(c){return c!==old;});if(intersections)intersections.unobserve(old.cur.node);old.cur.node.remove();}
+      if(follow)stage.scrollTop=stage.scrollHeight;wake();return card;
+    }
+    function receive(payload){if(dead||!active)return;var live=payload.now||{},rows=payload.rows||[],previousId=currentId;currentId=String(live.id||'');
+      rows.forEach(function(row){if(row&&row.id&&String(row.id)!==currentId)append(row,{animate:joined,record:!!row.music});});
+      var liveCard=live.id?append(live,{live:true}):null;
+      if(liveCard&&(!joined||previousId!==currentId)){var liveKey='line:'+currentId;cards.delete(liveKey);cards.set(liveKey,liveCard);stage.appendChild(liveCard.cur.node);if(liveCard.done&&!liveCard.data){liveCard.cur.node.classList.remove('sp-mv-past');ask(liveCard);}if(follow)stage.scrollTop=stage.scrollHeight;}
+      var station=payload.station||{},track=station.now||{};if(station.playing&&track.title){var key=String(track.id||track.title);if(key!==recordKey&&!rows.some(function(r){return r.music&&(String(r.id)===key||String(r.id)==='music:'+key);})){recordKey=key;append({id:'record:'+key,name:'Record',text:track.title+(track.artist?' / '+track.artist:'')},{event:true,record:true,animate:joined});}}
+      joined=true;cards.forEach(function(card,key){card.cur.node.classList.toggle('sp-mv-current',key==='line:'+currentId);});load();wake();
+    }
+    function event(id,label,text,kind,data){return append({id:id,name:label,who:kind==='sfx'?'sfx':'',text:text},{event:true,data:data});}
+    function hand(){handAt=Date.now();}['wheel','touchstart','touchmove','pointerdown','keydown'].forEach(function(name){stage.addEventListener(name,hand,{passive:true});});
+    stage.addEventListener('scroll',function(){if(Date.now()-handAt<1200)follow=stage.scrollTop+stage.clientHeight>=stage.scrollHeight-16;load();wake();},{passive:true});
+    var observer=typeof root.ResizeObserver==='function'?new root.ResizeObserver(wake):null;observer&&observer.observe(stage);document.addEventListener('visibilitychange',wake);
+    return {receive:receive,event:event,element:stage,visible:function(on){active=!!on;if(!active&&raf){root.cancelAnimationFrame(raf);raf=0;}else wake();},dispose:function(){dead=true;pending=[];if(raf)root.cancelAnimationFrame(raf);raf=0;observer&&observer.disconnect();intersections&&intersections.disconnect();document.removeEventListener('visibilitychange',wake);stage.remove();cards.clear();},state:function(){return {items:cards.size,pending:pending.length,busy:busy,active:active,raf:!!raf,follow:follow,current:currentId,rolling:Array.from(cards.values()).filter(function(c){return !c.done;}).length,latest:Array.from(cards.values()).slice(-8).map(function(c){return {key:c.cur.item.key,phase:c.cur.phase,typed:c.cur.typed,rows:c.data?(c.data.rows||[]).length:-1};})};}};
+  }
+
+  /* A tile loads the same whole moment as the Digital card: its turn's
+     decisions and the inline sting rolls. No mounted Script cards or moment
+     host state are needed, and the existing canonical row order is kept. */
+  function mvTileData(row, payload, mode) {
+    var item = mvHistItem(row);
+    if (mode && mode.live) return mvAsk(item, true);
+    return mvAsk(item).then(function (own) {
+      if (!own || own.answered === false) return own;
+      var feed = [];
+      try { feed = (root.PineStationFeed && root.PineStationFeed.rows && root.PineStationFeed.rows()) || []; } catch (e) { feed = []; }
+      var rows = (payload && Array.isArray(payload.rows) ? payload.rows : feed).slice();
+      var known = Object.create(null);
+      rows.forEach(function (r) { if (r && r.id) known[String(r.id)] = r; });
+      feed.forEach(function (r) { if (r && r.id && !known[String(r.id)]) { known[String(r.id)] = r; rows.push(r); } });
+      var index = rows.findIndex(function (r) { return r && String(r.id || '') === item.lid; });
+      if (index < 0) { index = rows.length; rows.push(row); }
+      var mates = [], seen = Object.create(null), bases = Object.create(null);
+      seen[item.lid] = 1;
+      bases[mvBaseLid(item.lid)] = 1;
+      function add(r) {
+        var id = String((r && r.id) || '');
+        if (!id || seen[id]) return;
+        seen[id] = 1;
+        bases[mvBaseLid(id)] = 1;
+        mates.push(mvHistItem(r));
+      }
+      [-1, 1].forEach(function (direction) {
+        for (var n = 1; n <= MV_MATES; n += 1) {
+          var r = rows[index + n * direction];
+          if (!r || !r.id || r.music || /^(?:record|music|live|idle)$/.test(String(r.kind || '').toLowerCase())) break;
+          add(r);
+        }
+      });
+      /* A punctuation clip can be omitted from visible feed history. Keep
+         every recorded sting of these adjacent lines, in feed order. */
+      rows.forEach(function (r) {
+        var id = String((r && r.id) || ''), base = mvBaseLid(id);
+        if (bases[base] && (base !== id || id === mvBaseLid(item.lid))) add(r);
+      });
+      if (!mates.length) return own;
+      return Promise.all(mates.map(function (mate) {
+        return mvAsk(mate).then(function (data) { return data ? {item: mate, data: data} : null; }, function () { return null; });
+      })).then(function (got) {
+        var keys = Object.create(null), cid = String(own.cid || (row.system3 && row.system3.conversation_id) || '');
+        mvMomentKeys(item, own).forEach(function (key) { keys[key] = 1; });
+        var members = [{lid: item.lid, base: mvBaseLid(item.lid), cur: null, rows: own.rows || [], n: 0}];
+        /* A punctuation item may know only its base line. Joining its
+           parent discovers the turn key, which can then admit a nearby
+           reaction fetched earlier. Repeat until no new member can join. */
+        var joined = Object.create(null), changed = true;
+        joined[item.lid] = 1;
+        while (changed) {
+          changed = false;
+          got.forEach(function (result) {
+            if (!result) return;
+            var data = result.data, mate = result.item, nextCid = String(data.cid || (mate.row.system3 && mate.row.system3.conversation_id) || '');
+            if (joined[mate.lid] || (cid && nextCid && cid !== nextCid)) return;
+            var nextKeys = mvMomentKeys(mate, data);
+            if (!nextKeys.some(function (key) { return keys[key]; })) return;
+            if (!cid && nextCid) cid = nextCid;
+            nextKeys.forEach(function (key) { keys[key] = 1; });
+            joined[mate.lid] = 1;
+            members.push({lid: mate.lid, base: mvBaseLid(mate.lid), cur: null, rows: data.rows || [], n: members.length});
+            changed = true;
+          });
+        }
+        /* Explicit feed positions give the DOM-independent moment the same
+           order as its host card. A base line always precedes its inline
+           stings, even when the tile currently follows one of those stings. */
+        var sourcePositions = Object.create(null);
+        rows.forEach(function (r, i) { if (r && r.id) sourcePositions[String(r.id)] = i; });
+        var anchors = Object.create(null);
+        members.forEach(function (member) {
+          var p = sourcePositions[member.lid];
+          if (p == null) p = rows.length + member.n;
+          if (anchors[member.base] == null || p < anchors[member.base]) anchors[member.base] = p;
+        });
+        function rank(member) {
+          var base = member.base, child = member.lid !== base;
+          var anchor = sourcePositions[base];
+          if (anchor == null) anchor = anchors[base];
+          var suffix = /-(?:punct-|p)(\d+)$/.exec(member.lid);
+          return [anchor, child ? 1 : 0, suffix ? Number(suffix[1]) : 0, sourcePositions[member.lid] == null ? rows.length + member.n : sourcePositions[member.lid], member.n];
+        }
+        var ordered = members.slice().sort(function (a, b) {
+          var x = rank(a), y = rank(b);
+          for (var i = 0; i < x.length; i += 1) if (x[i] !== y[i]) return x[i] - y[i];
+          return 0;
+        });
+        var positions = Object.create(null);
+        ordered.forEach(function (member, i) { positions[member.lid] = i; });
+        var out = mvMerge(own, {});
+        out.rows = mvMomentRows({members: members, positions: positions});
+        return out;
+      });
+    });
+  }
+
   root.PineMessageView = {
+    tileData: function (row, payload, mode) { return mvTileData(row, payload, mode); },
+    tileEntry: function (element, rows, index, which) { mvRrPopWire(element, rows, index, which); },
+    overlay: mvFeedMount,
     show: function (view) { mvShow(String(view || 'feed')); },
     view: function () { return mv.view; },
     style: function (s) { if (s) mvStyleSet(s); return mv.style; },
@@ -23522,6 +23446,8 @@
     var restore = make('div', 'sp-band-restore');
     restore.setAttribute('role', 'toolbar');
     restore.setAttribute('aria-label', 'Restore Script bands');
+    var iconGrid = make('div', 'sp-tool-grid');
+    restore.appendChild(iconGrid);
     var bandItems = {};
     function addBand(key, content, glyph) {
       var label = BAND_NAMES[key];
@@ -23548,7 +23474,7 @@
       reopen.addEventListener('click', function () {
         bandManager.set(key, false);
       });
-      restore.appendChild(reopen);
+      iconGrid.appendChild(reopen);
       bandItems[key] = {wrap: wrap, content: content,
         collapse: collapse, restore: reopen};
     }
@@ -23564,7 +23490,7 @@
     promptHistory.addEventListener('click', function () {
       if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory, promptDock);
     });
-    restore.appendChild(promptHistory);
+    iconGrid.appendChild(promptHistory);
     /* System 3: this pane cycles script -> technical -> messenger and
        back (s3SetMode). The two stay on the toolbar even when every
        band is open: .sp-band-always keeps the toolbar showing. */
@@ -23582,7 +23508,7 @@
         || (mode === 'technical' ? 'T' : 'M');
       b.addEventListener('click', function () { s3SetMode(mode); });
       s3Buttons[mode] = b;
-      restore.appendChild(b);
+      iconGrid.appendChild(b);
     });
     /* [flowchart] "a button that I can press that toggles between showing the
        script view and showing the technical flowchart view" - the conversation
@@ -23594,7 +23520,7 @@
     flowBtn.setAttribute('aria-label', flowLabel);
     flowBtn.setAttribute('aria-pressed', 'false');
     flowBtn.innerHTML = folderIcon('c:decision-tree', flowLabel) || 'F';
-    restore.appendChild(flowBtn);
+    iconGrid.appendChild(flowBtn);
     /* [speech-gates] "where is the panel for that? i need to be able to edit any
        gate for speech by the station" - every gate, one tap from the script */
     var gatesLabel = 'Speech gates: every check that can refuse the station\'s speech - edit them here';
@@ -23606,10 +23532,11 @@
     gatesBtn.addEventListener('click', function () {
       if (root.PineSpeechGates) root.PineSpeechGates.open();
     });
-    restore.appendChild(gatesBtn);
+    iconGrid.appendChild(gatesBtn);
     /* [reply-gap] the pause between replies, its roulette and its dice:
        right of the chat icon, across the rest of the row. */
     restore.appendChild(gapBar());
+    restore.appendChild(gapUi.hold);
     /* [s3-header] System 3's bar, on this toolbar: its on-air pill in the
        middle and its buttons at the right end (mountEmbedded's chrome),
        shown only while one of its views is up - see s3Chrome(). */
@@ -23623,6 +23550,8 @@
     restore.appendChild(s3Tools);
     top.appendChild(bands);
     top.appendChild(restore);
+    toolbarTouch(restore);
+    toolbarLayout(restore);
     right.appendChild(top);
     bandManager = bandController(bands, restore, bandItems);
 
@@ -23690,6 +23619,7 @@
       root.PineFlowChart.lineSource(function () { return String(sayingLineId || nowLineId || ''); });
     }
     flowBtn.addEventListener('click', function () {
+      if (gazetteView) gazetteView.close();
       var on = flowPane.hidden;
       if (on && s3Mode !== 'script') s3SetMode('script');
       flowPane.hidden = !on;
@@ -23707,6 +23637,22 @@
     s3Pane.id = 'spS3';
     s3Pane.hidden = true;
     right.appendChild(s3Pane);
+    /* The Gazette is another reading of this pane. Its shelf reads on a
+       hand's request; the script and its shared feed subscription stay alive. */
+    if (gazetteView) gazetteView.dispose();
+    if (root.PineGazetteView) gazetteView = root.PineGazetteView.mount({
+      host: host, parent: right, toolbar: iconGrid, titleRow: titleRow, script: script,
+      icon: folderIcon('m:newspaper', 'Gazette view') || '',
+      request: function (path) { return api().get(path); }, url: techUrl,
+      enter: function () { gazetteScrollHeld = readerHeld || !follow; },
+      leave: function (at) {
+        if (gazetteScrollHeld && at != null) {
+          selfScrollUntil = Date.now() + 1000;
+          script.scrollTop = at; readerTop = at;
+        }
+      }
+    });
+
 
     /* #1260: DOUBLE-TAP THE SCRIPT TO READ IT PROPERLY.
      *
@@ -24548,7 +24494,7 @@
     /* [cards-free] "I want the feed to play out every animation ... but I don't
        want it affecting the actual dialogue": off, the pause alone paces the
        dialogue; on, each line waits for its card's whole build first */
-    var hold = make('button', 'sp-gap-hold', 'cards');
+    var hold = make('button', 'sp-gap-hold');hold.setAttribute('aria-label','Cards hold the air');hold.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="7" width="12" height="14" rx="2"/><path d="M6 17H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/><path d="m14 11 2 3-2 3-2-3z"/></svg>';
     hold.type = 'button';
     hold.setAttribute('aria-pressed', 'false');
     hold.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
@@ -24605,6 +24551,7 @@
        so highlight and active are read in the same breath. */
     if (mounted) return Promise.resolve(true);
     build(node);
+    if (root.PineBookMode) root.PineBookMode.mount(host, host.querySelector(".sp-bar"));
     linearReset();          /* [s3-script-linear] a new mount remembers no mark */
     retryReports();
     wirePlayer();
@@ -24763,6 +24710,7 @@
                 start: feedCrawlStart, stop: feedCrawlStop},
     isMounted: function () { return mounted; },
     close: function () {
+      if (gazetteView) { gazetteView.dispose(); gazetteView = null; }
       rejectionClose();
       rejectionItems = [];
       rejectionFirstPage = [];

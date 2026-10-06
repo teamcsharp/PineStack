@@ -31,7 +31,8 @@ class Gain(unittest.TestCase):
                    "DATA_DIR": self.dir, "SFX_TARGET_LUFS": -20.0, "SFX_TP_DB": -6.0, "SFX_LEVEL_TRANSIENT_LU": 3.0,
                    "SFX_LEVELLED": self.dir / "lv", "SFX_VIDEO_LEVEL_MARK": "lu1", "_SFX_DB_LOCK": threading.RLock(),
                    "sfx_db_reader": lambda: self.db, "sfx_id": lambda p: "id_" + p.stem,
-                   "sfx_loudness": lambda p: {"i": -30.0, "tp": -12.0, "peak": -12.0}}
+                   "sfx_loudness": lambda p: {"i": -30.0, "tp": -12.0, "peak": -12.0},
+                   "_sfx_ffmpeg": lambda: "ffmpeg"}   # [sfx-even] the stream command names the box's ffmpeg ([talk-steady]); it lives outside this section
         exec(compile(section(), "app.py", "exec", flags=__future__.annotations.compiler_flag, dont_inherit=True), self.ns)
 
     def tearDown(self):
@@ -71,7 +72,7 @@ class Gain(unittest.TestCase):
         self.assertIsNone(self.ns["sfx_gain_command"](Path("clip.avi"), 2.0))
 
     def test_wired(self):
-        self.assertIn("_streamed = await sfx_gain_stream(raw, float(_gain[\"db\"]), headers)", APP)
+        self.assertIn("_streamed = await sfx_gain_stream(raw, float(_gain[\"db\"]), headers, _gain)", APP)   # [sfx-even] the measurement rides along
         self.assertIn("return path if sfx_gain_known(path) is not None else None", APP)
 
 

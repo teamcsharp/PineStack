@@ -1,0 +1,39 @@
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden}
+body{background:#101b22;color:#e5e6df;font:13px/1.4 system-ui,sans-serif;color-scheme:dark}
+[hidden]{display:none!important}
+.bp-viewer{height:100%;display:flex;flex-direction:column;min-width:0}
+.bp-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 14px;background:#182a32;border-bottom:1px solid #40565c;flex-shrink:0}
+.bp-title{font-weight:600;flex:1 1 130px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bp-toolbar label,.bp-navigation{display:flex;align-items:center;gap:6px}
+.bp-toolbar label{white-space:nowrap}
+.bp-toolbar button,.bp-toolbar select,.bp-toolbar input{font:inherit;background:#263b45;color:#f4e3c3;border:1px solid #54716e;border-radius:5px;min-height:34px;padding:5px 8px}
+.bp-toolbar button{cursor:pointer;min-width:38px;font-size:18px}
+.bp-toolbar button:disabled{opacity:.35;cursor:default}
+.bp-toolbar input{width:62px}
+#bp-chapter{max-width:200px}
+.bp-stage{position:relative;flex:1;min-height:0;min-width:0;overflow:auto;display:flex;padding:14px;outline-offset:-3px;touch-action:pan-x pan-y}
+.bp-spread{position:relative;flex:none;margin:auto;box-shadow:0 9px 28px #0008;--bp-gutter:20px;--bp-page-width:300px;--bp-right-width:300px}
+.bp-paper{position:absolute;top:0;bottom:0;background:#fffef9;color:#555;border:1px solid #ddd8cb;box-shadow:inset 0 0 20px #76684d0a}
+.bp-paper-left{left:0;width:var(--bp-page-width);border-radius:3px 0 0 3px;background:linear-gradient(to right,#fffef9 94%,#ebe7dc 100%)}
+.bp-paper-right{right:0;width:var(--bp-right-width);border-radius:0 3px 3px 0;background:linear-gradient(to left,#fffef9 94%,#ebe7dc 100%)}
+.bp-spine{position:absolute;left:var(--bp-page-width);top:0;bottom:0;width:var(--bp-gutter);background:linear-gradient(90deg,#b4ad9e,#6a655c 48%,#b4ad9e);opacity:.7}
+.bp-page-number{position:absolute;bottom:9px;left:0;width:100%;text-align:center;font:11px Georgia,serif;color:#706859}
+#bp-epub{position:absolute;border:0;background:transparent;display:block}
+.bp-pdf-page{position:absolute;top:0;bottom:0;background:#fff;overflow:hidden}
+.bp-pdf-left{left:0;width:var(--bp-page-width)}
+.bp-pdf-right{right:0;width:var(--bp-right-width)}
+.bp-pdf-page img{width:100%;height:100%;object-fit:contain;display:block}
+.bp-pdf-page img[hidden]{display:none}
+#bp-message{position:absolute;inset:45% 20px auto;text-align:center;margin:0;color:#dfc794;pointer-events:none}
+#bp-status{padding:7px 14px;color:#abc1bc;background:#182a32;border-top:1px solid #40565c;flex:none;font-size:12px}
+@media(max-width:800px){.bp-toolbar{gap:8px;padding:8px}.bp-title{flex-basis:100%}#bp-chapter{max-width:160px}.bp-stage{padding:8px}#bp-status{padding:6px 8px}}
+@media(max-width:520px){.bp-toolbar{gap:5px;font-size:12px}#bp-chapter{max-width:125px}.bp-toolbar input{width:52px}.bp-toolbar button{min-width:32px}.bp-navigation{gap:4px}}
+/* [book-fill] "Fit width": the facing pages take the whole width and the page scrolls; the bar's room is kept so the fit does not jump */
+.bp-stage.bp-fit-width{overflow-y:scroll}
+/* [book-scroll] a page turned by a scroll or a swipe arrives from the way the hand was going */
+@keyframes bp-turn-next{from{opacity:.35;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes bp-turn-prev{from{opacity:.35;transform:translateY(-14px)}to{opacity:1;transform:none}}
+.bp-spread.bp-turn-next{animation:bp-turn-next .16s ease-out}
+.bp-spread.bp-turn-prev{animation:bp-turn-prev .16s ease-out}
+@media(prefers-reduced-motion:reduce){.bp-spread.bp-turn-next,.bp-spread.bp-turn-prev{animation:none}}

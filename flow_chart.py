@@ -88,10 +88,15 @@ def decision_node(ev: dict[str, Any]) -> dict[str, Any] | None:
         "odds": meta.get("odds"),
         "winner": ({"label": str(winner.get("label") or winner.get("id")), "p": _p(winner.get("p")),
                     "why": [str(w) for w in (winner.get("why") or [])][:3]} if winner else None),
-        "losers": [{"label": str(c.get("label") or c.get("id")), "p": _p(c.get("p"))} for c in losers[:LOSERS_SHOWN]],
-        "more": max(0, len(losers) - LOSERS_SHOWN),
+        "losers": [{"label": str(c.get("label") or c.get("id")), "p": _p(c.get("p"))} for c in losers],
+        "more": 0,
         "excluded": len(last.get("excluded") or []),
+        "stages": stages, "selected": ev.get("selected"), "properties": meta,
+        "state_before": ev.get("state_before"), "state_after": ev.get("state_after"),
+        "previous_revision": bool(meta.get("prior_revision")),
         "kind": str(meta.get("kind") or last.get("stage") or ""),
+        "source_turn": str(meta.get("source_turn") or meta.get("target_turn_id") or ""),
+        "turn_credit": int(meta.get("turn_credit") or 0),
     }
 
 
@@ -115,7 +120,8 @@ def build_flow(conv: dict[str, Any], steps: Iterable[dict[str, Any]] = (), now_t
     for ln in conv.get("lines") or []:
         if isinstance(ln, dict) and ln.get("turn_id"):
             lines_by_turn.setdefault(str(ln["turn_id"]), []).append(ln)
-    decisions = [d for d in (decision_node(e) for e in conv.get("decision_events") or [] if isinstance(e, dict)) if d]
+    decisions = [d for d in (decision_node(e) for e in conv.get("decision_events") or [] if isinstance(e, dict)
+                            and not (e.get("meta") or {}).get("superseded_by_revision")) if d]
     decisions.sort(key=lambda d: (d.get("seq") if isinstance(d.get("seq"), int) else 10 ** 6, float(d.get("at") or 0)))
     by_turn: dict[int, list[dict[str, Any]]] = {}
     planning: list[dict[str, Any]] = []
@@ -143,7 +149,7 @@ def build_flow(conv: dict[str, Any], steps: Iterable[dict[str, Any]] = (), now_t
         if isinstance(inputs.get("subject"), dict) else "",
         "structure": str((conv.get("road_structure") or conv.get("call_structure") or {}).get("id") or "")
         if isinstance(conv.get("road_structure") or conv.get("call_structure"), dict) else "",
-        "seed": str(conv.get("seed") or "")[:24], "turns": len(turns),
+        "properties": {**{k: conv.get(k) for k in ("call_diversity", "rewrite_request") if conv.get(k)}, "call_material": inputs.get("call") or {}}, "seed": str(conv.get("seed") or ""), "turns": len(turns),
         "budget": timing.get("turn_budget"), "at": ident.get("created_at") or conv.get("created_at")}]
     nodes += planning
     aired_any = False
@@ -159,7 +165,10 @@ def build_flow(conv: dict[str, Any], steps: Iterable[dict[str, Any]] = (), now_t
         nodes.append({
             "id": "t:%s" % (tid or i), "type": "turn", "index": i, "turn_id": tid, "seat": seat,
             "who": str(names.get(seat) or seat), "leg": str(t.get("leg") or ""), "place": str(t.get("place") or ""),
-            "asked": str(t.get("protocol") or "")[:400],
+            "reply_to": t.get("reply_to"), "turn_credit": int(t.get("turn_credit") or 0),
+            "inner_reply": bool(t.get("inner_reply")), "cast_reaction": bool(t.get("cast_reaction")),
+            "returns_to_topic": str(t.get("graph_node") or "").startswith("__return_"),
+            "properties": {k: t.get(k) for k in ("diversity", "decisions", "performance") if t.get(k)}, "asked": str(t.get("protocol") or ""),
             "feeling": ("%s %s" % (perf.get("emotion") or "", perf.get("intensity") or "")).strip(),
             "said": " ".join(str(ln.get("text") or "") for ln in said)[:600],
             "codes": [str(ln.get("line_id") or "") for ln in said if ln.get("line_id")],
@@ -183,8 +192,14 @@ def build_flow(conv: dict[str, Any], steps: Iterable[dict[str, Any]] = (), now_t
             p = a["winner"].get("p")
             label = "%s%s" % (a["winner"]["label"][:40], " (%d%%)" % round(p * 100) if p is not None else "")
         edges.append({"from": a["id"], "to": b["id"], "label": label})
-    return {"schema": SCHEMA, "key": cid, "road": road, "nodes": nodes, "edges": edges,
+    reply_edges = [{"from": "t:" + t["reply_to"]["turn_id"], "to": "t:" + t["turn_id"],
+                    "kind": "reply", "label": "reacts" if t.get("cast_reaction") else "answers",
+                    "turn_credit": int(t.get("turn_credit") or 0)} for t in turns if t.get("reply_to")]
+    return {"schema": SCHEMA, "key": cid, "revision": ident.get("revision", 1), "road": road, "nodes": nodes, "edges": edges,
+            "reply_edges": reply_edges,
             "counts": {"decisions": len(decisions), "turns": len(turns),
+                       "turn_credits": sum(int(t.get("turn_credit") or 0) for t in turns),
+                       "cast_reactions": sum(bool(t.get("cast_reaction")) for t in turns),
                        "aired": sum(1 for n in nodes if n["type"] == "turn" and n.get("aired_at")),
                        "candidates_lost": sum(len(d.get("losers") or []) + int(d.get("more") or 0) for d in decisions)},
             "now_turn": now_turn_id, "at": time.time()}
@@ -210,6 +225,12 @@ def report_text(flow: dict[str, Any]) -> str:
                 n.get("index"), n.get("seat"), n.get("leg"),
                 ("SAID: " + n["said"][:160]) if n.get("said") else ("ASKED: " + n.get("asked", "")[:160]),
                 ("  codes=" + ",".join(c[:8] for c in n.get("codes") or [])) if n.get("codes") else ""))
+            target = n.get("reply_to")
+            if target:
+                out.append("    %s %s (turn %s)%s" % (
+                    "CAST REACTION ->" if n.get("cast_reaction") else "RETURN TO TOPIC ->" if n.get("returns_to_topic") else "REPLY ->",
+                    target.get("name") or target.get("speaker"), int(target.get("index", 0)) + 1,
+                    "  +%s turn restored" % n["turn_credit"] if n.get("turn_credit") else ""))
         elif t == "gate":
             out.append("    ↳ %s: %s" % (n.get("label"), n.get("text")))
         elif t == "step":

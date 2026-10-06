@@ -11,12 +11,13 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
-const src = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const rawSrc = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const src = rawSrc.replace(/\r\n/g, '\n');
 const css = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.css'), 'utf8');
-for (const dir of ['app/src/main/assets/pine-views', 'C:/_tools/pinebox-android/PineBoxKiosk/app/src/main/assets/pine-views']) {
+for (const dir of ['app/src/main/assets/pine-views']) {
   const k = path.isAbsolute(dir) ? dir : path.join(root, dir);
   if (!fs.existsSync(k)) continue;
-  assert.strictEqual(fs.readFileSync(path.join(k, 'script-page.js'), 'utf8'), src, dir + ': the kiosk copy is the renderer, byte for byte');
+  assert.strictEqual(fs.readFileSync(path.join(k, 'script-page.js'), 'utf8'), rawSrc, dir + ': the kiosk copy is the renderer, byte for byte');
   assert.strictEqual(fs.readFileSync(path.join(k, 'script-page.css'), 'utf8'), css, dir + ': the kiosk css is the renderer\'s');
 }
 
@@ -72,6 +73,7 @@ function world() {
     make: (tag, cls, text) => ({tag, cls, text}),
     mvStatic: r => ({row: r, addEventListener() {}}),
     mvRrSheet: (cur, rows) => ({box: el(), rows: rows.slice(), tables: rows.map((r, i) => ({at: i * 100})), keep: false}),
+    mvRrAppend: (sheet, fresh) => { sheet.rows.push(...fresh); sheet.tables.push(...fresh.map((r,i)=>({at:sheet.tables.length*100+i*100}))); return sheet; },
     mvRrAt: () => 'results', mvRrResults: s => { s.done = true; },
     mvPlan: (cur, data) => { cur.data = data; W.planned.push({cur, rows: data.rows.slice()}); },
     feedDiceOpen() {},
@@ -128,10 +130,15 @@ const GUY = row('SFXGUY', 'SFXGUY', 33, 'react', 'e-guy');
     assert(line.node.cls.has('sp-mv-joined'));
     assert.strictEqual(line.rolls.kids.length, 1, 'never a second sheet beside the first');
 
+    const originalSheet=line.sheet,originalNodes=line.sheet.tables.slice();
+    line.text={textContent:'Oh, for crying'};
     const guy = W.card('G1', 'speech', 'SFX GUY', '');
     W.mv.cur = guy;
     W.mvMomentLand(guy, {rows: [GUY, ES1], tid: 'T1', sources: {}});
     assert.strictEqual(guy.joined, line);
+    assert.strictEqual(line.sheet,originalSheet,'late moment rows append to the original sheet');
+    originalNodes.forEach((n,i)=>assert.strictEqual(line.sheet.tables[i],n,'previous table object remains in place'));
+    assert.strictEqual(line.text.textContent,'Oh, for crying','a late roll keeps the message prefix already typed');
     assert.strictEqual(guy.node.style.display, 'none', 'a roll-only card is not made');
     assert.deepStrictEqual(line.data.rows.map(r => r.table), ['ES1', 'RS1', 'SFX', 'book', 'SFXGUY'], 'each roll once');
 

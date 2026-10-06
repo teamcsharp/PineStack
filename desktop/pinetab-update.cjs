@@ -26,8 +26,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, execFile } = require('child_process');
-const { stamp, stampOf } = require('./pinetab-stamp.cjs');
+const { stampOf } = require('./pinetab-stamp.cjs');
+const { stampAsync } = require('./pinetab-stamp-async.cjs');
 
+const crypto = require('crypto');
 const PKG = 'com.pinebox.kiosk';
 
 function exists(p) { try { return !!p && fs.existsSync(p); } catch (e) { return false; } }
@@ -76,6 +78,7 @@ class PinetabUpdate {
     this.d = deps;
     this.job = null;
     this.last = null;
+    this.ready = null;
   }
 
   cfg() { try { return this.d.readConfig() || {}; } catch (e) { return {}; } }
@@ -92,9 +95,9 @@ class PinetabUpdate {
     try { this.d.send('pinetab-progress', ev); } catch (e) { /* the window may be gone */ }
   }
 
-  wanted() {
+  wanted(fresh = false) {
     const root = this.d.agentRoot();
-    return stamp(root, path.join(root, 'desktop', 'renderer'));
+    return (this.d.sampleStamp || stampAsync)(root, path.join(root, 'desktop', 'renderer'), {fresh});
   }
 
   async look() {
@@ -112,7 +115,7 @@ class PinetabUpdate {
   async check(opts) {
     const out = { at: Date.now() };
     try {
-      const w = this.wanted();
+      const w = await this.wanted(!!(opts && opts.adb));
       out.wanted = w.stamp;
       out.files = w.files;
     } catch (e) {
@@ -175,25 +178,41 @@ class PinetabUpdate {
         this.emit('build', 'Git Bash was not found - deploy.sh needs it (set gitBash in the desk config)', 'fail');
         return resolve(false);
       }
-      const root = this.d.agentRoot();
+      const root = (mode === 'prepare' || mode === 'install') && this.ready && this.ready.root
+        ? this.ready.root : this.d.agentRoot();
       const script = bashPath(path.join(root, 'deploy.sh'));
-      const args = [script].concat(mode === 'resign' ? ['--no-build'] : []);
+      const args = [script].concat(mode === 'resign' ? ['--no-build'] : mode === 'prepare' ? ['--prepare'] : mode === 'install' ? ['--install-only'] : []);
       this.emit('build', 'running deploy.sh' + (mode === 'resign' ? ' --no-build (re-sign and install)' : '')
-        + ' - building, platform-signing, verifying and installing');
-      const child = spawn(bash, args, { cwd: os.tmpdir(), windowsHide: true,
-        env: Object.assign({}, process.env, { PINE_TAB: dev }) });
+        + (mode === 'prepare' ? ' - building and preparing the signed update' : mode === 'install' ? ' - installing the prepared update' : ' - building, platform-signing, verifying and installing'));
+      const env = Object.assign({}, process.env, {
+        PINE_TAB: dev,
+        PINE_PREPARED_APK: bashPath((mode === 'prepare' || mode === 'install') && this.ready ? this.ready.apk : '')
+      });
+      // Keep dependency downloads cached, but avoid another build locking the
+      // shared task-output cache while this isolated preparation runs.
+      if (mode === 'prepare') env.GRADLE_OPTS = (env.GRADLE_OPTS || '') + ' -Dorg.gradle.caching=false';
+      const child = spawn(bash, args, { cwd: os.tmpdir(), windowsHide: true, env });
       this.job.child = child;
       let step = 'build';
-      const take = (buf) => {
-        String(buf).split(/\r?\n/).forEach((line) => {
-          if (!line.trim()) return;
-          const head = /^== (.*)$/.exec(line);
-          if (head) { step = head[1].slice(0, 60); this.emit(step, line.slice(3), 'step'); return; }
-          this.emit(step, line, /REFUSING|FAILED|ERROR/.test(line) ? 'warn' : 'run');
-        });
+      const consume = (line) => {
+        line = line.replace(/\r$/, '');
+        if (!line.trim()) return;
+        const head = /^== (.*)$/.exec(line);
+        if (head) { step = head[1].slice(0, 60); this.emit(step, line.slice(3), 'step'); return; }
+        this.emit(step, line, /REFUSING|FAILED|ERROR/.test(line) ? 'warn' : 'run');
       };
-      child.stdout.on('data', take);
-      child.stderr.on('data', take);
+      const attach = (stream) => {
+        let pending = '';
+        stream.setEncoding('utf8');
+        stream.on('data', (buf) => {
+          const lines = (pending + buf).split('\n');
+          pending = lines.pop();
+          lines.forEach(consume);
+        });
+        stream.on('end', () => { if (pending) consume(pending); });
+      };
+      attach(child.stdout);
+      attach(child.stderr);
       child.on('error', (e) => { this.emit('build', 'deploy.sh could not start: ' + e.message, 'fail'); resolve(false); });
       child.on('close', (code) => {
         this.emit('build', code === 0 ? 'deploy.sh finished' : 'deploy.sh stopped (exit ' + code + ')', code === 0 ? 'ok' : 'fail');
@@ -236,12 +255,92 @@ class PinetabUpdate {
 
   /* mode: "update" (only if out of date), "force" (build and install regardless),
    * "resign" (re-sign and install the APK already built) */
+  async snapshotSource(dir) {
+    const source = this.d.agentRoot();
+    const project = path.join(dir, 'project');
+    const io = fs.promises;
+    for (const sub of ['app', 'gradle', 'tools', 'desktop/renderer']) {
+      await io.mkdir(path.join(project, sub), { recursive: true });
+    }
+    const files = ['build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'deploy.sh',
+      'app/build.gradle.kts', 'app/proguard-rules.pro', 'gradle/libs.versions.toml',
+      'tools/pinetab-stamp.sh', 'tools/kiosk-preflight.sh'];
+    await Promise.all(files.map(file => io.copyFile(path.join(source, file), path.join(project, file))));
+    await io.cp(path.join(source, 'app/src'), path.join(project, 'app/src'), { recursive: true, dereference: true });
+    // Copy the canonical assets this APK declares, without copying build outputs.
+    for (const kind of ['pine-views', 'pine-sampler']) {
+      const assets = await io.readdir(path.join(project, 'app/src/main/assets', kind), { withFileTypes: true });
+      for (const asset of assets) {
+        if (!asset.isFile()) continue;
+        const canonical = path.join(source, 'desktop/renderer', asset.name);
+        try {
+          if ((await io.stat(canonical)).isFile()) {
+            await io.copyFile(canonical, path.join(project, 'desktop/renderer', asset.name));
+          }
+        } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      }
+    }
+    return { root: project, stamp: (await (this.d.sampleStamp || stampAsync)(project, path.join(project, 'desktop', 'renderer'), {fresh:true})).stamp };
+  }
+
+  async prepare() {
+    if (this.job && this.job.running) return { ok: false, why: 'an update is already running' };
+    this.job = { running: true, started: Date.now(), log: [], mode: 'prepare' };
+    this.ready = null;
+    const result = { ok: false };
+    try {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinetab-ready-'));
+        this.ready = { apk: path.join(dir, 'pine-platform.apk') };
+        this.emit('snapshot', 'copying the latest source into an isolated background build directory (attempt ' + attempt + '/3)');
+        const snapshot = await this.snapshotSource(dir);
+        if (snapshot.stamp !== (await this.wanted(true)).stamp) {
+          if (attempt === 3) throw new Error('source is still being edited - wait for the edits to finish, then tap to retry');
+          this.emit('queue', 'source changed while copying - automatically queuing a fresh snapshot', 'warn');
+          continue;
+        }
+        const wanted = snapshot.stamp;
+        this.ready.root = snapshot.root;
+        this.ready.wanted = wanted;
+        this.emit('build', 'building the latest workspace source ' + wanted);
+        if (!(await this.deploy('', 'prepare'))) throw new Error('build failed - see the console output');
+        if (!exists(this.ready.apk)) throw new Error('the build did not produce the prepared APK');
+        if ((await this.wanted(true)).stamp !== wanted) {
+          if (attempt === 3) throw new Error('source is still changing during compilation - wait for edits to finish, then tap to retry');
+          this.emit('queue', 'source changed during compilation - automatically building the newer version', 'warn');
+          continue;
+        }
+        this.ready.digest = crypto.createHash('sha256').update(fs.readFileSync(this.ready.apk)).digest('hex');
+        result.ok = true;
+        result.ready = true;
+        result.wanted = wanted;
+        this.emit('ready', 'update compiled and signed - tap the tablet update button to install', 'ok');
+        break;
+      }
+    } catch (e) {
+      this.ready = null;
+      result.why = e.message;
+      this.emit('fail', e.message, 'fail');
+    } finally {
+      this.job.running = false;
+      this.job.result = result;
+    }
+    return result;
+  }
+
   async update(mode) {
+    if (mode === 'prepare') return this.prepare();
     if (this.job && this.job.running) return { ok: false, why: 'an update is already running', log: this.job.log };
     this.job = { running: true, started: Date.now(), log: [], mode: mode || 'update' };
     const result = { ok: false, mode: this.job.mode };
     try {
-      const wanted = this.wanted().stamp;
+      const wanted = (await this.wanted(true)).stamp;
+      if (mode === 'install') {
+        if (!this.ready || !this.ready.digest || !exists(this.ready.apk)) throw new Error('no compiled update is ready - build it first');
+        if (this.ready.wanted !== wanted) throw new Error('source changed after compilation - build the latest version first');
+        const digest = crypto.createHash('sha256').update(fs.readFileSync(this.ready.apk)).digest('hex');
+        if (digest !== this.ready.digest) throw new Error('the prepared APK changed - build it again');
+      }
       result.wanted = wanted;
       this.emit('check', 'the source builds ' + wanted);
       const dev = await this.locate();
@@ -275,6 +374,7 @@ class PinetabUpdate {
       result.relaunched = true;
       await this.volumeNotRaised(dev, volBefore);
       result.ok = good;
+      if (good && mode === 'install') this.ready = null;
       this.emit('done', good ? 'the tablet is up to date' : 'finished, but the stamp does not match', good ? 'ok' : 'warn');
       return result;
     } catch (e) {
@@ -322,7 +422,7 @@ class PinetabUpdate {
         await run(this.adb(), ['-s', dev, 'shell', 'pm', 'grant', PKG, 'android.permission.CAMERA'], 15000);
         return await run(this.adb(), ['-s', dev, 'shell', 'dumpsys', 'package', PKG], 20000);
       }
-      if (n === 'version') return { ok: true, installed: await this.installedByAdb(dev), wanted: this.wanted().stamp };
+      if (n === 'version') return { ok: true, installed: await this.installedByAdb(dev), wanted: (await this.wanted(true)).stamp };
       return { ok: false, why: 'no such action: ' + n };
     } catch (e) {
       return { ok: false, why: e.message };

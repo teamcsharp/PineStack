@@ -382,7 +382,9 @@ def _read(path: Path) -> str:
 # An insertion a later patch rewrites in place ([reply-gap:buildup] rewrites
 # the page helpers) is recognised by its header: never inserted twice.
 HELPER_HEAD = "/* [reply-gap:door] THE PAUSE BETWEEN MESSAGES, ON THIS PAGE."
-SENTINELS = {"panel helpers": (HELPER_HEAD, 1), "tune helpers": (HELPER_HEAD, 2)}
+SENTINELS = {"panel helpers": (HELPER_HEAD, 1), "tune helpers": (HELPER_HEAD, 2),
+             "panel wait": ("const waitForAir = pineReplyGapDue(clip) - Date.now();", 2),
+             "tune wait": ("const waitForAir = pineReplyGapDue(clip) - Date.now();", 2)}
 
 
 def _sentinel(text: str, name: str) -> bool:

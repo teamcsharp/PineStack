@@ -30,7 +30,15 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
     ("goal", "The brief, filled - only in a road direction (clip, gallery, host).", ""),
     ("station", "The station's name.", "Pine Box FM"),
     ("hour", "The time the hour is made, HH:MM.", "21:05"),
+    ("activeplot", "The active radio plot: title and current act, without future spoilers.", ""),
+    ("topic", "A rolled topic from the station topic bank, for dialogue inspiration.", ""),
     ("speakerbox", "A sentence rolled out of a rolled Speakerbox document.", ""),
+    ("book", "A real EPUB or PDF title rolled from the station library. All book fields in this generation use this title; {book:Title or library ID} binds one explicitly.", "A Test Book"),
+    ("booktopic", "A subject from the selected book's metadata, an actual chapter heading, or a phrase from the selected passage. Used alone, it first rolls a source book.", "The River Garden"),
+    ("bookchapter", "The selected book's actual EPUB chapter or PDF outline title. A PDF without chapter metadata reports its source page instead.", "Chapter Two: The River Garden"),
+    ("booksegment", "A bounded passage of consecutive source sentences from the selected book, for discussion rather than a whole chapter reading.", "The river fed the garden. They shared the harvest."),
+    ("booksentence", "One exact, complete short sentence from the selected book passage (up to 35 words).", "They shared the harvest."),
+    ("booksentences", "Up to three consecutive complete source sentences from that passage, up to 100 words total, for brief quotations.", "The river fed the garden. They shared the harvest."),
     ("mxtape", "An MX mixtape by Ehm Eckx, rolled from the tape folder - the music the scene plays to "
                "(a concert, a performance, a dance).", 'the MX mixtape "MX tape · August 4" by Ehm Eckx'),
     ("fordtape", "A tape by General Ford, rolled from the General Ford folder (setting fordtape_folder, "
@@ -42,8 +50,8 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
     ("convograph", "A flowchart of a REAL conversation System 3 made: its road, topic, the dice it rolled "
                    "and who won - for people to present and argue about.",
      'a flowchart of a real Pine Box conversation on the caller road ...'),
-    ("gazette", "The Pine Box Gazette: a rolled recent edition's front page, its headline and deck, as a "
-                "prop or the scene's subject.", 'the Pine Box Gazette, its front page headline reading "..."'),
+    ("gazette", "The latest Pine Box Gazette: roll a section, then an article inside it; use the article text "
+                "in prompts or dialogue.", 'the Pine Box Gazette, section "news", article "...": ...'),
     ("arena", "An arena built from a rolled Pine Box gallery picture. Use {arena} and {arena2} for two "
               "different arenas.", 'an arena built from the Pine Box gallery picture "neon forest"'),
     # [h3-feature] "the technical overview prompt to grab a feature randomly from the
@@ -59,7 +67,7 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
      'the release log of [tablet-update-ask] (1 commit, +46/-12 lines): 60e37c0 "One press builds..." - ...'),
     ("a|b|c", "One of the options you write between the bars, rolled.", "{funny|grim|tender}"),
 )
-NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena", "feature", "releaselog")
+NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena", "feature", "releaselog", "book", "booktopic", "bookchapter", "booksegment", "booksentence", "booksentences")
 SLOT = re.compile(r"\{((%s)(\d?))\}" % "|".join(NAMED))
 
 SCREENS = (

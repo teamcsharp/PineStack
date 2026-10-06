@@ -3,6 +3,9 @@ package com.pinebox.kiosk.video
 import android.content.Context
 import android.graphics.Color
 import android.media.AudioManager
+import android.media.MediaExtractor
+import android.media.MediaMuxer
+import android.media.MediaCodec
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Looper
@@ -14,9 +17,11 @@ import android.widget.FrameLayout
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.DefaultLoadControl   // [#1212]
 import com.pinebox.kiosk.net.StationClient
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +34,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.log10
 import kotlin.math.roundToInt
@@ -101,6 +107,13 @@ class PineVideoWall(
     private val screen = SurfaceView(context).apply { setZOrderMediaOverlay(true) }
 
     private var player: ExoPlayer? = null
+    @Volatile private var cueOnly = false
+    @Volatile private var cuePending = false
+    private var cueGeneration = 0
+    private var cueAt = 0L
+    private var cueJoined = false
+    @Volatile private var preparedCueId = ""
+    private var cueFixedAt = 0L
     private val running = AtomicBoolean(false)
     /** The page's requested veil. A menu has its own temporary compositor
      *  retirement and must not overwrite this ownership state. */
@@ -224,7 +237,7 @@ class PineVideoWall(
     private val watchdog = object : Runnable {
         override fun run() {
             try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
-            if (running.get()) postDelayed(this, WATCH_MS)
+            if (running.get()) postDelayed(this, if (cueOnly) 200L else WATCH_MS)
         }
     }
 
@@ -384,8 +397,13 @@ class PineVideoWall(
 
     /** Show the wall and keep it fed. Safe to call when already running. */
     fun start(vcr: Boolean = true) {
+        if (cueOnly || cuePending) stop(false)
+        cueOnly = false
         if (!running.compareAndSet(false, true)) return
         onMain {
+            if (preparedCueId.isNotEmpty()) {
+                player?.release(); player = null; listed.clear(); preparedCueId = ""
+            }
             if (vcr) vcrShow() else refreshVisibility()   // [vcrfx] dot -> line -> picture
             build()
         }
@@ -394,7 +412,11 @@ class PineVideoWall(
 
     /** Hide it and let everything go. Safe to call when already stopped. */
     fun stop(vcr: Boolean = true) {
-        if (!running.compareAndSet(true, false)) return
+        cueGeneration += 1
+        cuePending = false
+        cueOnly = false
+        if (!running.getAndSet(false) && preparedCueId.isEmpty()) return
+        preparedCueId = ""
         pump?.cancel()
         pump = null
         fresh?.cancel()
@@ -414,6 +436,63 @@ class PineVideoWall(
     }
 
     fun isRunning(): Boolean = running.get()
+
+    /** A silent picture whose audio is already in the DJ stream. */
+    fun cue(id: String, url: String, seconds: Double, at: Long, warm: Boolean = false) {
+        if (id.isBlank() || url.isBlank() || (running.get() && !cueOnly)) return
+        val generation = if (warm) cueGeneration else ++cueGeneration
+        if (!warm) cuePending = true
+        scope.launch {
+            val file = withContext(Dispatchers.IO) {
+                val base = client.config().base.trimEnd('/')
+                pull(if (url.startsWith("http://") || url.startsWith("https://")) url else "$base/${url.trimStart('/')}", id)?.let { cueFile(it, id) }
+            }
+            if (generation != cueGeneration) return@launch
+            if (warm) {
+                if (file != null) onMain {
+                    if (generation != cueGeneration || running.get() || cuePending) return@onMain
+                    build()
+                    val p = player ?: return@onMain
+                    p.pause(); p.volume = 0f
+                    listed.clear(); listed.add(Clip(id, file, seconds))
+                    preparedCueId = id
+                    p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                    p.prepare()
+                }
+                return@launch
+            }
+            if (file == null) {
+                cuePending = false
+                lastError = "${stamp()} cue $id could not be cached"
+                return@launch
+            }
+            onMain {
+                if (generation != cueGeneration) return@onMain
+                cuePending = false; cueOnly = true; cueAt = at
+                cueJoined = false; cueFixedAt = 0L
+                running.set(true)
+                veiled = false; held = false; menuHidden = false
+                pump?.cancel(); pump = null
+                fresh?.cancel(); fresh = null
+                build()
+                val p = player ?: return@onMain
+                p.pause()
+                val prepared = preparedCueId == id && p.mediaItemCount == 1
+                preparedCueId = ""
+                if (!prepared) {
+                    listed.clear(); listed.add(Clip(id, file, seconds))
+                    p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                } else {
+                    seenMark(p)
+                    onClipChanged?.invoke(id)
+                }
+                applyWallLevel(p)
+                refreshVisibility()
+                if (prepared && p.playbackState == Player.STATE_READY) cueReady(p) else p.prepare()
+                removeCallbacks(watchdog); postDelayed(watchdog, 200L)
+            }
+        }
+    }
 
     /**
      * #1434: take the picture off screen WITHOUT stopping the set.
@@ -559,6 +638,10 @@ class PineVideoWall(
     fun level(): Double = wallLevel.toDouble()
 
     fun state(): JSONObject = JSONObject()
+        .put("cue_capable", true)
+        .put("cue_on", cueOnly)
+        .put("cue_pending", cuePending)
+        .put("cue_at", cueAt)
         .put("on", running.get())
         .put("held", held)                          // [#1386]
         .put("menu_hidden", menuHidden)
@@ -726,9 +809,41 @@ class PineVideoWall(
         refreshVisibility()
     }
 
+    private fun cueReady(p: ExoPlayer) {
+        if (cueJoined) return
+        cueJoined = true
+        val generation = cueGeneration
+        postDelayed({
+            if (generation == cueGeneration && cueOnly && player === p) {
+                val offset = (System.currentTimeMillis() - cueAt).coerceAtLeast(0L)
+                if (offset > 80L) p.seekTo(offset)
+                p.playWhenReady = true
+                cueFixedAt = System.currentTimeMillis()
+            }
+        }, (cueAt - System.currentTimeMillis()).coerceAtLeast(0L))
+    }
+
     private fun watch() {
         val p = player ?: return
         if (!running.get()) return
+        if (cueOnly) {
+            if (held && holdUntil > 0L && android.os.SystemClock.elapsedRealtime() >= holdUntil) {
+                releaseMenuNow(); onHoldExpired?.invoke()
+            }
+            atPos = p.currentPosition; atDuration = p.duration
+            playWhenReady = p.playWhenReady
+            seenCount(p)
+            if (p.playbackState == Player.STATE_ENDED) { stop(false); return }
+            val clock = System.currentTimeMillis()
+            if (clock > cueAt + ((listed.firstOrNull()?.seconds ?: 15.0) * 1000).toLong() + 200L) { stop(false); return }
+            if (!held && cueJoined && p.isPlaying) {
+                val expected = (clock - cueAt).coerceAtLeast(0L)
+                val difference = expected - p.currentPosition
+                val speed = if (difference > 100L) 1.15f else if (difference < -100L) 0.9f else 1f
+                if (p.playbackParameters.speed != speed) p.playbackParameters = PlaybackParameters(speed)
+            }
+            return
+        }
         val now = android.os.SystemClock.elapsedRealtime()
         /* A held wall is standing still ON PURPOSE, but not indefinitely.
          * The main-thread watchdog owns this deadline because WebView timers
@@ -861,9 +976,11 @@ class PineVideoWall(
         val control = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 LOAD_MIN_MS, LOAD_MAX_MS, LOAD_PLAY_MS, LOAD_REPLAY_MS)
-            .setPrioritizeTimeOverSizeThresholds(true)
+            .setTargetBufferBytes(8 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(false)
             .build()
         val p = ExoPlayer.Builder(context).setLoadControl(control).build()
+        p.setSeekParameters(SeekParameters.EXACT)
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         val audioSession = audioManager?.generateAudioSessionId() ?: AudioManager.ERROR
         if (audioSession != AudioManager.ERROR) {
@@ -880,12 +997,15 @@ class PineVideoWall(
         p.playWhenReady = true
         applyWallLevel(p)                                        // [#1192]
         p.addListener(object : Player.Listener {
+            override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+                if (cueOnly) Log.i(TAG, "cue position ${oldPosition.positionMs} -> ${newPosition.positionMs} reason $reason clock ${System.currentTimeMillis() - cueAt}")
+            }
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 val at = p.currentMediaItemIndex
                 showing = listed.getOrNull(at)?.id ?: ""
                 seenMark(p)                                  // [sfxseen]
                 Log.i(TAG, "now showing $showing (item $at of ${p.mediaItemCount})")
-                if (showing.isNotEmpty()) onClipChanged?.invoke(showing)
+                if (showing.isNotEmpty() && running.get()) onClipChanged?.invoke(showing)
                 /* [#1212] NOT ON THE FRAME OF THE JOIN.
                  * Measured over thirteen transitions: four of them went
                  * BUFFERING one millisecond after this line and stayed
@@ -899,6 +1019,7 @@ class PineVideoWall(
 
             override fun onPlaybackStateChanged(state: Int) {
                 playback = stateName(state)  // #1440
+                if (cueOnly && state == Player.STATE_READY && !cueJoined) cueReady(p)
                 Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
             }
 
@@ -916,6 +1037,10 @@ class PineVideoWall(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                if (cueOnly) {
+                    lastError = "${stamp()} cue: ${error.errorCodeName}"
+                    stop(false); return
+                }
                 /* A clip this device cannot decode must not stop the set.
                  * ExoPlayer has already halted on it, so it is thrown away
                  * and the playlist resumed past it. */
@@ -938,7 +1063,7 @@ class PineVideoWall(
          * exactly the thread that stays alive when ExoPlayer stops. */
         removeCallbacks(watchdog)
         stillSince = 0L
-        postDelayed(watchdog, WATCH_MS)
+        postDelayed(watchdog, if (cueOnly) 200L else WATCH_MS)
     }
 
     /**
@@ -987,6 +1112,7 @@ class PineVideoWall(
 
     /** Element volume carries 0..100%; LoudnessEnhancer carries 100..200%. */
     private fun applyWallLevel(p: ExoPlayer) {
+        if (cueOnly) { p.volume = 0f; wallBoost?.enabled = false; return }
         val wanted = wallLevel.coerceIn(0f, 2f)
         p.volume = wanted.coerceAtMost(1f)
         val effect = wallBoost ?: return
@@ -1385,7 +1511,7 @@ class PineVideoWall(
         return try {
             val bytes = client.getMediaBytes(url).first
             if (bytes.size < MIN_BYTES) return null
-            val part = File(den, "$id.part")
+            val part = File.createTempFile("$id-", ".part", den)
             part.writeBytes(bytes)
             if (!part.renameTo(out)) { part.delete(); return null }
             sweepCache()
@@ -1393,6 +1519,52 @@ class PineVideoWall(
         } catch (err: Throwable) {
             Log.w(TAG, "pull $id: ${err.message}")
             null
+        }
+    }
+
+    /** Fragmented server MP4s have no sidx: Media3 adjusts every seek to zero.
+     * Rebuild only their container once, on the cache thread, without decoding. */
+    @Synchronized private fun cueFile(source: File, id: String): File? {
+        val out = File(den, "$id.cue.mp4")
+        if (out.isFile && out.length() > MIN_BYTES) return out
+        val part = File.createTempFile("$id-cue-", ".part", den)
+        val extractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        var started = false
+        return try {
+            extractor.setDataSource(source.absolutePath)
+            val writer = MediaMuxer(part.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = writer
+            val tracks = IntArray(extractor.trackCount)
+            for (i in tracks.indices) {
+                tracks[i] = writer.addTrack(extractor.getTrackFormat(i))
+                extractor.selectTrack(i)
+            }
+            writer.start(); started = true
+            var buffer = ByteBuffer.allocateDirect(1024 * 1024)
+            val info = MediaCodec.BufferInfo()
+            while (extractor.sampleTrackIndex >= 0) {
+                val size = extractor.sampleSize
+                if (size > buffer.capacity()) buffer = ByteBuffer.allocateDirect(size.toInt())
+                buffer.clear()
+                val count = extractor.readSampleData(buffer, 0)
+                if (count < 0) break
+                info.set(0, count, extractor.sampleTime.coerceAtLeast(0L),
+                    if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                writer.writeSampleData(tracks[extractor.sampleTrackIndex], buffer, info)
+                extractor.advance()
+            }
+            writer.stop(); started = false
+            writer.release(); muxer = null
+            if (!part.renameTo(out)) { part.delete(); null } else { sweepCache(); out }
+        } catch (err: Throwable) {
+            Log.w(TAG, "cue remux $id: ${err.message}")
+            null
+        } finally {
+            extractor.release()
+            if (started) try { muxer?.stop() } catch (_: Throwable) { }
+            try { muxer?.release() } catch (_: Throwable) { }
+            part.delete()
         }
     }
 

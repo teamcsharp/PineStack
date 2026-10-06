@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book preview</title>
+<link rel="stylesheet" href="__BOOK_PREVIEW_CSS_URL__">
+</head>
+<body>
+<main class="bp-viewer" aria-label="Two-page book preview">
+  <header class="bp-toolbar">
+    <span id="bp-title" class="bp-title">Book preview</span>
+    <label id="bp-chapter-label" hidden>Chapter <select id="bp-chapter" aria-label="Chapter"></select></label>
+    <div class="bp-navigation">
+      <button id="bp-prev" type="button" aria-label="Previous two pages" title="Previous two pages">&#8592;</button>
+      <label>Page <input id="bp-page-input" type="number" min="1" value="1" aria-label="Go to page"> <span id="bp-page-total"></span></label>
+      <button id="bp-next" type="button" aria-label="Next two pages" title="Next two pages">&#8594;</button>
+    </div>
+    <label>Zoom <select id="bp-zoom" aria-label="Preview zoom"><option value="100">Fit page</option><option value="width">Fit width</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select></label>
+  </header>
+  <section class="bp-stage" aria-label="Book pages" title="Scroll or swipe to turn the pages. Double click to fill the window." tabindex="0">
+    <div class="bp-spread" hidden>
+      <div class="bp-paper bp-paper-left"><span class="bp-page-number" id="bp-left-number"></span></div>
+      <div class="bp-paper bp-paper-right"><span class="bp-page-number" id="bp-right-number"></span></div>
+      <div class="bp-spine" aria-hidden="true"></div>
+      <div class="bp-pdf-page bp-pdf-left" hidden><img alt=""></div>
+      <div class="bp-pdf-page bp-pdf-right" hidden><img alt=""></div>
+      <iframe id="bp-epub" title="Book chapter" sandbox="allow-same-origin" hidden></iframe>
+    </div>
+    <p id="bp-message" role="status">Opening book preview…</p>
+  </section>
+  <footer id="bp-status" aria-live="polite">Preview only</footer>
+</main>
+<script id="bp-config" type="application/json">__BOOK_PREVIEW_CONFIG__</script>
+<script src="__BOOK_PREVIEW_JS_URL__" defer></script>
+</body>
+</html>

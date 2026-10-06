@@ -1,0 +1,71 @@
+/* Shared System3 rollout: category and subcategory reels retain their
+   original nodes, dimensions, and indentation after landing. */
+/* [msgroll] THE ROLL, TABLE BY TABLE: the table rolls in, the category die and its
+   wheel, the indented sub-result die and its wheel, landing hold, next.
+   The results remain in those same reel boxes. */
+.sp-rr { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px; }
+.sp-rr-t { display: flex; flex-direction: column; gap: 3px; padding: 4px 6px; border-left: 3px solid var(--fam, #68ced9); border-radius: 6px; background: rgba(255, 255, 255, .03); }
+.sp-rr-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; letter-spacing: .05em; }
+.sp-rr-head b { color: var(--fam, #68ced9); }
+.sp-rr-head span { color: var(--sp-muted, #8fa0ad); letter-spacing: 0; }
+.sp-rr-step { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sp-rr-sub { margin-left: 18px; padding-left: 8px; border-left: 2px solid var(--fam, #68ced9); }
+.sp-rr-die {
+  flex: none; min-width: 32px; height: 24px; display: inline-grid; place-items: center; box-sizing: border-box;
+  border: 2px solid var(--fam, #68ced9); border-radius: 6px; font: 700 12px ui-monospace, Consolas, monospace; color: #fff; background: #0c1318;
+}
+.sp-rr-wheel {
+  position: relative; flex: 1; min-width: 90px; height: 24px; overflow: hidden; box-sizing: border-box;
+  border: 2px solid #4b5b67; border-radius: 6px; background: #0c1318;
+}
+.sp-rr-wheel::after { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: rgba(255, 255, 255, .12); }
+.sp-rr-wheel.spinning { border-color: var(--fam, #68ced9); }
+.sp-rr-list { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+.sp-rr-cell { display: block; padding: 0 8px; box-sizing: border-box; font-size: 12px; color: #b9c9d2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+.sp-rr-cell.hit { color: #fff; font-weight: 700; }
+.sp-rr-of { flex: none; font-style: normal; font-size: 10.5px; color: var(--sp-muted, #8fa0ad); }
+/* [rollplay] rejected and failed: they pop in, then go grey and inert (reason on hover / long-press) */
+.sp-rr-step.sp-rr-has-rej { flex-wrap: wrap; row-gap: 4px; }
+.sp-rr-rej { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; padding-left: 34px; min-width: 0; }
+.sp-rr-sub .sp-rr-rej { padding-left: 34px; }
+.sp-rr-rejc {
+  max-width: 100%; padding: 0 7px; border: 1px solid var(--fam, #68ced9); border-radius: 6px;
+  font: 11px/18px Inter, "Segoe UI", system-ui, sans-serif; color: #e8f1f5; background: rgba(255, 255, 255, .05);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help;
+  opacity: 0; transform: scale(.6); transition: transform .12s ease-out, opacity .12s linear, filter .25s, color .25s;
+}
+.sp-rr-rejc.pop { opacity: 1; transform: scale(1.08); }
+.sp-rr-rejc.gone { opacity: .5; transform: none; filter: grayscale(1); color: #7d8a93; border-color: #4a5560; text-decoration: line-through; }
+.sp-rr-t.sp-rr-failed { filter: grayscale(1); opacity: .5; cursor: help; }
+.sp-rr-rejn { margin-left: auto; flex: none; font-size: 10px; color: #7d8a93; cursor: help; }
+.sp-rr-t { flex: none; }
+
+/* Reusable message tile viewport and typewriter; host chrome is caller-owned. */
+.pip-system3-stage{width:100%;min-width:0;min-height:0;box-sizing:border-box;overflow:hidden;padding:0;scrollbar-width:none;-ms-overflow-style:none;overscroll-behavior:contain;overflow-anchor:none;}
+.pip-system3-stage-history{overflow-y:auto;}
+.pip-system3-stage::-webkit-scrollbar{display:none;width:0;height:0;}
+.pip-system3-message{position:relative;display:flex;flex-direction:column;max-height:calc(var(--pip-message-max-height,65vh) / var(--pip-message-scale,1));box-sizing:border-box;zoom:var(--pip-message-scale,1);margin-bottom:8px;padding:8px 10px;background:rgb(20 31 37 / var(--pip-message-opacity,.85));border:1px solid #34454e;border-radius:12px;color:#d8e5eb;font:12px/1.4 Inter,Segoe UI,system-ui,sans-serif;overflow:hidden;}
+.pip-system3-message:last-child{margin-bottom:0;}
+.pip-system3-stage-history>.pip-system3-message:last-child{min-height:calc(var(--pip-message-max-height,65vh) / var(--pip-message-scale,1));}
+.pip-system3-rolls{flex:0 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;}
+.pip-system3-rolls .sp-rr{margin:0;}
+.pip-system3-words,.pip-system3-rolls{scrollbar-width:none;overscroll-behavior:contain;overflow-anchor:none;touch-action:pan-y;}
+.pip-system3-words::-webkit-scrollbar,.pip-system3-rolls::-webkit-scrollbar{display:none;width:0;height:0;}
+.pip-system3-words{flex:none;box-sizing:border-box;height:min(var(--pip-message-words-height,calc(1.4em + 11px)),calc(5.6em + 11px),max(0px,calc((var(--pip-message-max-height,65vh) / var(--pip-message-scale,1) - 24px) * .4)));min-height:0;padding:2px 2px 8px;margin-bottom:6px;border-bottom:1px solid #34454e;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;overflow-x:hidden;}
+.pip-system3-words-measure{position:absolute;top:8px;left:10px;right:10px;visibility:hidden;pointer-events:none;box-sizing:border-box;padding:2px 2px 8px;border-bottom:1px solid transparent;white-space:pre-wrap;overflow-wrap:anywhere;}
+.pip-system3-words.typing::after,.pip-system3-words-measure::after{content:'';display:inline-block;width:2px;height:1.05em;margin-left:2px;vertical-align:-2px;background:#65c7da;}
+.pip-system3-empty,.pip-system3-status{margin:0;padding:8px 2px;color:#8fa0ad;font:11px/1.4 system-ui,sans-serif;}
+.pip-system3-history{border-color:#293941;}
+.pip-system3-stage [hidden]{display:none!important;}
+
+/* Message review controls stay attached to the box while its contents scroll. */
+.pip-system3-host:not(.pip-messages){position:relative;}
+.pip-system3-navigation{position:absolute;top:7px;right:9px;z-index:5;display:flex;gap:3px;visibility:hidden;pointer-events:none;}
+.pip-system3-host:hover>.pip-system3-navigation{visibility:visible;pointer-events:auto;}
+.pip-system3-host .pip-system3-navigation button:is(.pip-system3-previous,.pip-system3-next){display:grid;place-items:center;width:22px;height:22px;min-width:0;padding:0;border:1px solid #414950;border-radius:4px;background:#1a1f24;color:#e3e9ed;font:16px/1 system-ui,sans-serif;cursor:pointer;touch-action:manipulation;-webkit-app-region:no-drag;}
+.pip-system3-host .pip-system3-navigation button.pip-system3-previous{background:#363a42;}
+.pip-system3-host .pip-system3-navigation button.pip-system3-previous:hover,.pip-system3-host .pip-system3-navigation button.pip-system3-next:hover{color:#fff;border-color:#606b76;background:#343a42;}
+.pip-system3-host .pip-system3-navigation button.pip-system3-next:disabled{background:#1a1f24;}
+.pip-system3-host .pip-system3-navigation button:is(.pip-system3-previous,.pip-system3-next):disabled{opacity:.35;cursor:default;}
+.pip-system3-host .pip-system3-navigation button:is(.pip-system3-previous,.pip-system3-next):focus-visible{outline:2px solid #65c7da;outline-offset:-2px;}
+.pip-system3-empty{min-height:22px;}

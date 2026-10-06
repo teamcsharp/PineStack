@@ -28,6 +28,16 @@ from typing import Any, Callable
 # A param: key, label, what it means, type, default, lowest, highest, target.
 # A target is "module.ATTR" or "app.OBJ.attr" ("app" is app.py's namespace).
 GATES: tuple[dict[str, Any], ...] = (
+    {"id": "flow", "road": "Every road",
+     "name": "Dialogue flows; System 3 decides",
+     "says": "A wedge on the dialogue path - a final handoff that fails, a conversation the booth calls "
+             "incomplete, a draft held for recovery - asks System 3 instead of refusing. Each answer is a row "
+             "in the flow ledger; the odds per wedge are the desk's STATION1 rows flow.*.",
+     "params": (
+         ("open", "Flow open (1) or every wedge refuses as before (0)", "At 1 a round airs as written when its "
+          "final pass fails and held recovery drafts go back to their shelves.", "int", 1, 0, 1,
+          "app.S3_FLOW_OPEN"),
+     )},
     {"id": "h3_sentence", "road": "Hourly H3 video dialogue",
      "name": "Whole sentences only",
      "says": "The last check a line passes before the hourly video's people say it: every sentence whole, "

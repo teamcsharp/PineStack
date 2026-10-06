@@ -1,4 +1,8 @@
 'use strict';
+/* 2026-10-03: Native 60fps capture, one absolute audio/video interval,
+ * pixel-preserving resize runs, GPU encode with audio-preserving CPU fallback,
+ * and a shared 4GiB audio+video rolling cache. The historical notes below
+ * describe earlier measurements; the current paths supersede 12/25fps eras. */
 /* THE ROLLING RECORD OF THIS WINDOW (2026-09-15, #1182).
  *
  * The operator: "Make sure that the Pine Box app also supports the ability
@@ -196,8 +200,8 @@ const HOLD_MIN_S = 5;
  * a full-length window is not standing on the edge of its own eviction while
  * an export reads it. Two segments. */
 const HOLD_GRACE_S = 4;
-const HOLD_MAX_S = 600;           /* ten minutes */
-const HOLD_MAX_BYTES = 900 * 1024 * 1024;
+const HOLD_MAX_S = 3600;          /* One-hour requests; the existing byte cap still bounds disk use. */
+const HOLD_MAX_BYTES = 4 * 1024 * 1024 * 1024;
 
 /* #1205: the name the provenance carries, said the way the tablet says
  * "android-playback-mix" - what it IS, not which API produced it.
@@ -264,6 +268,7 @@ class ScreenRing {
      * the ring has already let go of but which an export still needs. */
     this.pins = new Map();
     this.doomed = new Set();
+    this.doomedBytes = new Map();
     this.running = false;
     this.detail = 'not started';
     this.startedAt = 0;
@@ -272,6 +277,8 @@ class ScreenRing {
     /* #1182d: bumped on every piece that lands, so a cut can wait for the
      * one it just asked for rather than sleeping a guessed interval. */
     this.taken = 0;
+    this.fileSequence = 0;
+    this.retiredDirs = new Set();
     this.lastError = '';
     /* #1205: WHAT THE RECORDER SAYS ABOUT ITS OWN SOUND, before any cut is
      * asked for. The renderer is the only side that can know whether the
@@ -288,8 +295,7 @@ class ScreenRing {
 
   ensureDir() {
     if (this.dir && fs.existsSync(this.dir)) return this.dir;
-    this.dir = path.join(os.tmpdir(), 'pinebox-screen-ring-' + process.pid);
-    fs.mkdirSync(this.dir, { recursive: true });
+    this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinebox-screen-ring-' + process.pid + '-'));
     return this.dir;
   }
 
@@ -301,7 +307,7 @@ class ScreenRing {
     try {
       const tmp = os.tmpdir();
       for (const name of fs.readdirSync(tmp)) {
-        if (!/^pinebox-screen-ring-(\d+)$/.test(name)) continue;
+        if (!/^pinebox-screen-ring-(\d+)(?:-.+)?$/.test(name)) continue;
         const pid = Number(RegExp.$1);
         if (pid === process.pid) continue;
         let alive = false;
@@ -346,6 +352,7 @@ class ScreenRing {
       present: !!given.present,
       state: String(given.state || (given.present ? 'capturing' : 'unavailable')),
       detail: String(given.detail || ''),
+      complete: given.complete !== false,
       supported: given.supported === null || given.supported === undefined
         ? null : !!given.supported
     };
@@ -374,7 +381,7 @@ class ScreenRing {
     const isSound = String(m.kind || '') === 'a';
     this.ensureDir();
     const file = path.join(this.dir,
-      (isSound ? 'a' : 'p') + String(at) + '.webm');
+      (isSound ? 'a' : 'p') + String(at) + '-' + (++this.fileSequence) + '.webm');
     try {
       fs.writeFileSync(file, Buffer.from(buffer));
     } catch (error) {
@@ -390,7 +397,11 @@ class ScreenRing {
      * picture ring carries no sound and never claims to. */
     const piece = { file, at, ms, bytes: buffer.length,
       w: Math.round(Number(m.w) || 0), h: Math.round(Number(m.h) || 0),
-      a: !!m.a };
+      fps: Math.max(1, Math.min(240, Number(m.fps) || 60)),
+      requested_fps: Math.max(1, Math.min(240, Number(m.requested_fps) || 60)),
+      mime: String(m.mime || ''),
+      audio_complete: m.audio_complete === undefined ? this.audioSaid.complete !== false : m.audio_complete !== false,
+      a: !!m.a, view: m.view === 'pip' ? 'pip' : m.view === 'transition' ? 'transition' : 'app' };
     if (isSound) {
       this.sound.push(piece);
       this.sound.sort((a, b) => a.at - b.at);
@@ -411,45 +422,41 @@ class ScreenRing {
 
   /* Old pieces go, by time first and by weight second. */
   prune() {
-    const keepFrom = nowMs()
-      - ((this.holdSeconds + HOLD_GRACE_S) * 1000);          /* #1211 */
-    while (this.pieces.length > 1) {
-      const first = this.pieces[0];
-      if (first.at + first.ms >= keepFrom) break;
-      this.drop(first);
+    const keepFrom = nowMs() - ((this.holdSeconds + HOLD_GRACE_S) * 1000);
+    for (const lane of ['pieces', 'sound']) {
+      while (this[lane].length > 1 && this[lane][0].at + this[lane][0].ms < keepFrom) {
+        if (lane === 'pieces') this.drop(this.pieces[0]); else this.dropSound(this.sound[0]);
+      }
     }
-    while (this.pieces.length > 1 && this.bytes() > HOLD_MAX_BYTES) {
-      this.drop(this.pieces[0]);
-    }
-    /* #1207: the sound ring is pruned to the same wall clock, on its own, so
-     * neither ring can hold the other's pieces alive. It is not weighed: a
-     * second of opus is about 16 kB against a second of picture at 200 kB,
-     * so the byte ceiling that matters is the picture's. */
-    while (this.sound.length > 1) {
-      const first = this.sound[0];
-      if (first.at + first.ms >= keepFrom) break;
-      this.dropSound(first);
+    // Audio and video share one disk budget and are evicted by oldest timestamp.
+    while (this.bytes() > HOLD_MAX_BYTES && (this.pieces.length > 1 || this.sound.length > 1)) {
+      const picture = this.pieces.length > 1 ? this.pieces[0] : null;
+      const sound = this.sound.length > 1 ? this.sound[0] : null;
+      if (picture && (!sound || picture.at <= sound.at)) this.drop(picture);
+      else this.dropSound(sound);
     }
   }
 
   drop(piece) {
     this.pieces.shift();
     this.dropped += 1;
-    this.erase(piece.file);
+    this.erase(piece.file, piece.bytes);
   }
 
   dropSound(piece) {
     this.sound.shift();
     this.soundDropped += 1;
-    this.erase(piece.file);
+    this.erase(piece.file, piece.bytes);
   }
 
   /* #1211: the one road that removes bytes. A file an export is reading is
    * recorded as doomed and unlinked when that export lets go - the piece
    * still leaves the ring at the right moment, it is only the bytes that
    * outlive it, and only for as long as somebody is actually reading them. */
-  erase(file) {
-    if (this.pins.has(file)) { this.doomed.add(file); return; }
+  erase(file, bytes) {
+    if (this.pins.has(file)) {
+      this.doomed.add(file); this.doomedBytes.set(file, Math.max(0, Number(bytes) || 0)); return;
+    }
     try { fs.unlinkSync(file); } catch (e) { /* already gone */ }
   }
 
@@ -471,27 +478,36 @@ class ScreenRing {
       this.pins.delete(file);
       if (!this.doomed.has(file)) continue;
       this.doomed.delete(file);
+      this.doomedBytes.delete(file);
       try { fs.unlinkSync(file); } catch (e) { /* already gone */ }
     }
+    this.cleanRetiredDirs();
   }
 
   forget() {
     this.running = false;
-    for (const p of this.pieces) { try { fs.unlinkSync(p.file); } catch (e) {} }
-    for (const p of this.sound) { try { fs.unlinkSync(p.file); } catch (e) {} }
+    for (const p of [...this.pieces, ...this.sound]) this.erase(p.file, p.bytes);
     this.pieces = [];
     this.sound = [];
-    this.pins.clear();                                          /* #1211 */
-    this.doomed.clear();
-    if (this.dir) { try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {} }
+    if (this.dir) this.retiredDirs.add(this.dir);
     this.dir = null;
+    this.cleanRetiredDirs();
   }
 
-  /* -------------------------------------------------------------- reads */
+  cleanRetiredDirs() {
+    for (const dir of this.retiredDirs) {
+      if ([...this.pins.keys()].some(file => path.dirname(file) === dir)) continue;
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { continue; }
+      this.retiredDirs.delete(dir);
+    }
+  }
 
-  bytes() {
+  /* Live cache bytes. Pinned retired files temporarily outlive the budget
+   * until their export finishes; they are never removed beneath a reader. */
+  bytes(which) {
     let n = 0;
-    for (const p of this.pieces) n += p.bytes;
+    const pieces = which === 'video' ? this.pieces : which === 'audio' ? this.sound : [...this.pieces, ...this.sound];
+    for (const p of pieces) n += p.bytes;
     return n;
   }
 
@@ -524,7 +540,12 @@ class ScreenRing {
     }
     if (this.lastError) detail += ' (last trouble: ' + this.lastError + ')';
     return { ok: true, running: !!this.running, seconds: Math.round(held * 10) / 10,
-      holds: this.holdSeconds, bytes: this.bytes(), pieces: this.pieces.length,
+      holds: this.holdSeconds, bytes: this.bytes(), byte_limit: HOLD_MAX_BYTES,
+      // Exports may temporarily pin evicted files beyond the live-cache cap.
+      pinned_retired_bytes: [...this.doomedBytes.values()].reduce((n, bytes) => n + bytes, 0),
+      disk_bytes: this.bytes() + [...this.doomedBytes.values()].reduce((n, bytes) => n + bytes, 0),
+      video_bytes: this.bytes('video'), audio_bytes: this.bytes('audio'),
+      fps: this.pieces.at(-1)?.fps || 60, pieces: this.pieces.length,
       dropped: this.dropped, era: this.era(), where: this.dir || '',
       /* #1207: HOW MANY RINGS THIS BUILD KEEPS, and it is a handshake, not a
        * statistic.
@@ -587,49 +608,43 @@ class ScreenRing {
    * absolute window, which is what lets the cut put them on one timeline:
    * `start` and `end` come back so the caller can do that arithmetic without
    * recomputing nowMs() and getting a different answer a millisecond later. */
-  window(seconds, back, which) {
+  window(seconds, back, which, view, interval) {
     const want = Math.max(0.2, Number(seconds) || 0);
     const behind = Math.max(0, Number(back) || 0);
     const sound = which === 'sound';
-    const list = sound ? this.sound : this.pieces;
+    let list = sound ? this.sound : this.pieces;
+    if (!sound && view === 'pip') {
+      const newest = list.findLastIndex(p => p.view === 'pip');
+      if (newest < 0) return { ok: false, held: 0, detail: 'No PinePiP display is buffered yet. Open PinePiP and let the recorder fill.' };
+      let oldest = newest;
+      // A resize stays in the same run. A different display or capture outage does not.
+      while (oldest > 0 && list[oldest - 1].view === 'pip'
+          && list[oldest].at - (list[oldest - 1].at + list[oldest - 1].ms) < 1000) oldest--;
+      list = list.slice(oldest, newest + 1);
+    }
     const held = this.heldSeconds();
-    if (!list.length) {
-      return { ok: false, held: sound ? held : 0, start: 0, end: 0,
-        detail: sound ? 'the sound ring is empty' : 'the ring is empty' };
-    }
-    const end = nowMs() - (behind * 1000);
-    const start = end - (want * 1000);
-    /* The era is the picture's problem alone: it exists because the concat
-     * demuxer refuses pieces whose codec parameters disagree and the window
-     * is resizable. Opus at 48 kHz does not change shape when a window is
-     * dragged, so the sound ring has no eras to keep apart. */
-    const era = sound ? { w: 0, h: 0 } : this.era();
-    const used = [];
-    let clamped = false;
-    for (const p of list) {
-      if (p.at + p.ms <= start) continue;
-      if (p.at >= end) continue;
-      if (era.w && p.w && (p.w !== era.w || p.h !== era.h)) { clamped = true; continue; }
-      used.push(p);
-    }
-    if (!used.length) {
-      return { ok: false, held, clamped, start, end,
-        detail: sound ? 'nothing in the sound ring covers that window'
-          : 'nothing in the ring covers that window' };
-    }
-    const first = used[0];
-    const last = used[used.length - 1];
-    if (first.at > start + 250) clamped = true;
-    /* Where the cut really lands, said the way the tablet says it: seconds
-     * before now, oldest edge and newest edge. */
-    const from = (nowMs() - first.at) / 1000;
-    const to = Math.max(0, (nowMs() - (last.at + last.ms)) / 1000);
-    /* How far into the first piece the wanted window begins. */
-    const offset = Math.max(0, (start - first.at) / 1000);
-    return { ok: true, pieces: used, held, clamped, start, end,
-      from: Math.round(from * 10) / 10, to: Math.round(to * 10) / 10,
-      offset, seconds: Math.min(want, ((last.at + last.ms) - Math.max(start, first.at)) / 1000),
-      w: era.w, h: era.h };
+    if (!list.length) return { ok: false, held: sound ? held : 0, start: 0, end: 0,
+      detail: sound ? 'the sound ring is empty' : 'the ring is empty' };
+    const clock = interval?.clock ?? nowMs();
+    // Freeze the selected window before flush/encoding. A missing tail shortens
+    // the cut rather than moving its start into an earlier part of the mix.
+    const requestedEnd = clock - behind * 1000;
+    const end = interval?.end ?? (interval?.clock != null ? requestedEnd
+      : Math.min(requestedEnd, list.at(-1).at + list.at(-1).ms));
+    const start = interval?.start ?? end - want * 1000;
+    const used = list.filter(p => p.at + p.ms > start && p.at < end);
+    if (!used.length) return { ok: false, held, clamped: false, start, end, clock,
+      detail: sound ? 'nothing in the sound ring covers that window' : 'nothing in the ring covers that window' };
+    const actualStart = Math.max(start, used[0].at);
+    const actualEnd = Math.min(end, used.at(-1).at + used.at(-1).ms);
+    return { ok: true, pieces: used, held, clock, start: actualStart, end: actualEnd,
+      clamped: actualStart > start + 1 || actualEnd < end - 1,
+      from: Math.round((clock - actualStart) / 100) / 10,
+      to: Math.round(Math.max(0, clock - actualEnd) / 100) / 10,
+      offset: Math.max(0, (actualStart - used[0].at) / 1000),
+      seconds: Math.max(0, (actualEnd - actualStart) / 1000),
+      w: Math.max(...used.map(p => p.w)), h: Math.max(...used.map(p => p.h)),
+      fps: Math.max(...used.map(p => p.fps || 60)) };
   }
 
   /* ------------------------------------------------------------ the sound */
@@ -667,7 +682,7 @@ class ScreenRing {
   soundFor(shot, videoOnly, heard, shift) {
     const said = this.audioSaid || {};
     const holds = (heard && heard.ok && heard.pieces) ? heard.pieces : [];
-    const audio = { source: AUDIO_SOURCE, present: false, complete: false,
+    const audio = { source: said.source || AUDIO_SOURCE, present: false, complete: false,
       state: 'unavailable', detail: '', coverage_ratio: 0,
       covered_seconds: 0, window_seconds: 0, gaps: 0, gap_seconds: 0,
       pieces: holds.length, pieces_with_audio: 0,
@@ -711,7 +726,7 @@ class ScreenRing {
      * clock in the same thread, so what remains is the difference between how
      * long each one takes to produce its first sample - bounded by one
      * capture interval of the picture. */
-    audio.align_bound_ms = Math.round(1000 / 12);
+    audio.align_bound_ms = Math.round(1000 / (shot.fps || 60));
     /* Overlap by the clock. Only pieces the recorder said carried a live
      * track count; one that was recorded off a dead capture is a hole. */
     const spans = [];
@@ -751,12 +766,16 @@ class ScreenRing {
       return audio;
     }
     audio.present = true;
-    audio.complete = !gaps;
-    audio.state = gaps ? 'partial' : 'captured';
+    const contentIncomplete = holds.some(p => p.a && p.audio_complete === false
+      && p.at + p.ms > from && p.at < to);
+    audio.complete = !gaps && !contentIncomplete;
+    audio.state = audio.complete ? 'captured' : 'partial';
+    audio.application_audio_complete = !contentIncomplete;
     audio.detail = gaps
       ? ('the broadcast, with ' + gaps + (gaps === 1 ? ' gap' : ' gaps')
          + ' totalling ' + audio.gap_seconds.toFixed(1) + 's')
-      : 'the broadcast, from the panel, laid under the picture';
+      : contentIncomplete ? (said.detail || 'Only part of the application audio was captured; shell music and effects may be missing.')
+        : 'the captured application audio, laid under the picture';
     return audio;
   }
 
@@ -775,166 +794,152 @@ class ScreenRing {
    * and leaves the stop-and-start seam out of the arithmetic entirely, so it
    * cannot accumulate over a ten-minute cut. The last piece has no next, so
    * it declares what it measured. */
-  listFile(dir, pieces, name) {
-    /* #1211: NEVER NAME A FILE THAT IS NOT THERE. One stale name fails the
-     * whole concat, which costs the operator the entire recording instead of
-     * the single moment that went missing. The durations are worked out AFTER
-     * this filter, so every surviving piece still begins at exactly
-     * (at_k - at_0) and the piece before a hole holds its last frame across
-     * it - a freeze over the gap, rather than everything after it sliding
-     * early. */
-    const here = [];
-    let missing = 0;
-    for (const piece of pieces) {
-      let there = false;
-      try { there = fs.existsSync(piece.file); } catch (e) { there = false; }
-      if (there) here.push(piece); else missing += 1;
-    }
+  listFile(dir, pieces, name, endAt) {
+    const here = pieces.filter(piece => fs.existsSync(piece.file));
     const lines = [];
     for (let i = 0; i < here.length; i += 1) {
       const p = here[i];
       lines.push("file '" + p.file.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'");
-      const next = (i + 1 < here.length) ? (here[i + 1].at - p.at) : p.ms;
-      lines.push('duration ' + (Math.max(1, next) / 1000).toFixed(3));
+      // inpoint=0 preserves the file's first-sample offset. Without it concat
+      // subtracts each WebM start_time and silently pulls the first sample early.
+      lines.push('inpoint 0');
+      const next = (i + 1 < here.length) ? here[i + 1].at : (endAt ?? p.at + p.ms);
+      lines.push('duration ' + (Math.max(1, next - p.at) / 1000).toFixed(6));
     }
     const list = path.join(dir, name || 'pieces.txt');
     fs.writeFileSync(list, lines.join('\n') + '\n', 'utf8');
-    return { path: list, missing, count: here.length };
+    return { path: list, missing: pieces.length - here.length, count: here.length,
+      pieces: here, origin: here[0]?.at ?? null };
   }
 
-  /* An mp4 of the window, written to `out`. Output-side -ss and -t, which
-   * is the accurate seek - input-side seeking on a concat of WebM lands on
-   * the nearest keyframe and a "last ten seconds" that is really the last
-   * fourteen is not a cut, it is a guess.
-   *
-   * #1205: THE SOUND COMES OUT OF THE SAME PIECES AS THE PICTURE, which is
-   * the whole point - no second file, no offset arithmetic, nothing to drift.
-   * The audio is transcoded to AAC because the container is MP4 and Opus in
-   * MP4 is a thing several players will not open; 160k stereo at 48k is the
-   * broadcast's own shape.
-   *
-   * WHEN THE ENCODER REFUSES THE SOUND, THE PICTURE STILL LANDS. The concat
-   * demuxer wants every piece to have the same streams, so a window that
-   * spans the moment the loopback appeared or vanished can be refused whole.
-   * That must cost the operator the audio, never the recording - so a refusal
-   * is retried with `-an` and the provenance is DOWNGRADED to unavailable
-   * with the encoder's own words in it. A cut that says "captured" must never
-   * be a cut that is silent. */
-  /* #1207: HOW THE SOUND IS PUT ON THE PICTURE'S TIMELINE.
-   *
-   * Both lists are already anchored to the wall clock by their `duration`
-   * directives, so input 0 at time t is absolute (vfirst.at + t) and input 1
-   * at time t is absolute (afirst.at + t). One shift puts them together:
-   *
-   *   shift = vfirst.at - afirst.at
-   *
-   *   shift > 0  the sound ring began first, so drop `shift` off its front.
-   *              atrim leaves the original timestamps behind it, which is why
-   *              asetpts follows and not the other way round.
-   *   shift < 0  the sound ring began later, so hold it back by that much.
-   *              Here asetpts must come FIRST: asetpts=PTS-STARTPTS after an
-   *              adelay would reset the delay it had just applied, silently,
-   *              and the sound would be early by exactly the amount it was
-   *              supposed to be late.
-   *
-   * aresample=async=1:first_pts=0 closes the arithmetic: it pads the front
-   * with real silence so the stream begins at zero, and it fills the seams
-   * between pieces rather than pulling everything after a seam earlier. */
-  soundFilter(shift) {
-    const bits = [];
-    const ms = Math.round(shift) - ALIGN_NUDGE_MS;
-    if (ms > 0) {
-      bits.push('atrim=start=' + (ms / 1000).toFixed(3));
-      bits.push('asetpts=PTS-STARTPTS');
-    } else if (ms < 0) {
-      bits.push('asetpts=PTS-STARTPTS');
-      bits.push('adelay=' + Math.abs(ms) + ':all=1');
-    } else {
-      bits.push('asetpts=PTS-STARTPTS');
+  /* Preserve sample timestamps when shifting to the single absolute cut
+   * start. PTS-STARTPTS here loses the first decoded sample's offset after
+   * a nonzero seek, and repeats that error after every recorder seam. */
+  soundFilter(shift, input = 1, seconds) {
+    const ms = Number(shift) - ALIGN_NUDGE_MS;
+    const bits = ['asetpts=PTS-(' + (ms / 1000).toFixed(6) + ')/TB',
+      'aresample=48000:async=1:min_hard_comp=0.001:first_pts=0'];
+    if (Number(seconds) > 0) bits.push('apad=whole_dur=' + seconds.toFixed(6), 'atrim=duration=' + seconds.toFixed(6));
+    return '[' + input + ':a]' + bits.join(',') + '[pinesound]';
+  }
+
+  /* Separate geometry runs so a resize never reinitializes a running filter
+   * and drops buffered frames. All runs share one native-sized padded canvas. */
+  videoInputs(dir, got, prefix = 'pieces') {
+    const runs = [];
+    for (const piece of got.pieces) {
+      let run = runs.at(-1);
+      if (!run || piece.w !== run.w || piece.h !== run.h || piece.mime !== run.mime) {
+        run = { pieces: [], w: piece.w, h: piece.h, mime: piece.mime }; runs.push(run);
+      }
+      run.pieces.push(piece);
     }
-    bits.push('aresample=async=1:first_pts=0');
-    return '[1:a]' + bits.join(',') + '[pinesound]';
+    const width = Math.ceil(Math.max(2, got.w) / 2) * 2;
+    const height = Math.ceil(Math.max(2, got.h) / 2) * 2;
+    const inputs = [], filters = [];
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      const start = Math.max(got.start, run.pieces[0].at);
+      const end = i + 1 < runs.length ? Math.min(got.end, runs[i + 1].pieces[0].at) : got.end;
+      const duration = Math.max(0.001, (end - start) / 1000);
+      const listed = this.listFile(dir, run.pieces, prefix + (i ? '-' + i : '') + '.txt', end);
+      if (!listed.count) throw new Error('The picture for this part of the window is no longer buffered.');
+      const seek = Math.max(0, (start - listed.origin) / 1000);
+      inputs.push('-f', 'concat', '-safe', '0', '-i', listed.path);
+      filters.push('[' + i + ':v]trim=start=' + seek.toFixed(6)
+        + ',setpts=PTS-(' + seek.toFixed(6) + ')/TB'
+        + ',fps=' + got.fps + ':start_time=0:round=near'
+        + ',pad=' + width + ':' + height + ':0:0:color=black,setsar=1'
+        + ',tpad=stop_mode=clone:stop_duration=' + duration.toFixed(6)
+        + ',trim=duration=' + duration.toFixed(6) + ',setpts=PTS-STARTPTS[v' + i + ']');
+    }
+    filters.push(runs.length > 1
+      ? runs.map((_, i) => '[v' + i + ']').join('') + 'concat=n=' + runs.length + ':v=1:a=0[pinevideo]'
+      : '[v0]null[pinevideo]');
+    return { inputs, filters, count: runs.length, width, height };
+  }
+
+  async cutAudio(want, options) {
+    const interval = Number.isFinite(want.end_at) && want.end_at > 0 ? { clock: want.end_at } : undefined;
+    const got = this.window(want.seconds, want.back, 'sound', undefined, interval);
+    if (!got.ok) return { ok: false, detail: got.detail, held: got.held };
+    const audio = this.soundFor(got, false, got, 0);
+    if (!audio.present || !audio.complete) return { ok: false, detail: audio.detail || 'The broadcast buffer has gaps.', audio, held: got.held };
+    const held = this.pinPieces(got.pieces), dir = clipMux.stash();
+    try {
+      const listed = this.listFile(dir, got.pieces, 'sound.txt', got.end);
+      if (!listed.count || listed.missing) throw new Error('Some broadcast audio is no longer in the buffer.');
+      const out = path.join(dir, 'broadcast.wav');
+      await clipMux.run(clipMux.findFfmpeg(options?.ffmpeg).path, ['-hide_banner', '-nostdin', '-y',
+        '-f', 'concat', '-safe', '0', '-i', listed.path,
+        '-filter_complex', this.soundFilter(got.start - listed.origin, 0, got.seconds), '-map', '[pinesound]',
+        '-t', got.seconds.toFixed(6), '-vn', '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2', out], 600000);
+      return { ok: true, out, dir, bytes: fs.statSync(out).size, seconds: Math.round(got.seconds * 10) / 10,
+        asked: want.seconds, held: got.held, clamped: got.clamped, audio };
+    } catch (error) { clipMux.forget(dir); return { ok: false, detail: error.message, held: got.held }; }
+    finally { this.releasePieces(held); }
   }
 
   async cut(want, options) {
     const opts = options || {};
-    const got = this.window(want.seconds, want.back);
-    /* THE PICTURE DECIDES WHETHER THERE IS A CUT AT ALL. A sound ring with no
-     * picture behind it produces nothing - a black rectangle with a broadcast
-     * on it is not a screen recording, and nobody asked for one. */
+    const interval = Number.isFinite(want.end_at) && want.end_at > 0 ? { clock: want.end_at } : undefined;
+    let got = this.window(want.seconds, want.back, undefined, want.view, interval);
     if (!got.ok) return { ok: false, detail: got.detail, held: got.held };
-    /* And the sound is entirely optional: every road below this line still
-     * lands a silent recording if the second ring is empty, dead, or was
-     * never started. */
-    const heard = want.video_only ? null : this.window(want.seconds, want.back, 'sound');
-    const shift = (heard && heard.ok && heard.pieces.length && got.pieces.length)
-      ? (got.pieces[0].at - heard.pieces[0].at) : null;
+    // Snapshot and pin synchronously before any probe/transcode awaits.
+    const heard = want.video_only ? null : this.window(got.seconds, 0, 'sound', undefined, got);
+    const held = this.pinPieces(got.pieces).concat(heard?.ok ? this.pinPieces(heard.pieces) : []);
     const dir = clipMux.stash();
-    const audio = this.soundFor(got, want.video_only, heard, shift);
-    /* #1211: hold the bytes for as long as ffmpeg is reading them. This is
-     * the cure for the operator's "Impossible to open ... No such file or
-     * directory": the ring goes on recording throughout the encode, and
-     * without this the oldest piece in the list is unlinked mid-read. */
-    const held = this.pinPieces(got.pieces)
-      .concat(audio.present && heard ? this.pinPieces(heard.pieces) : []);
+    let audio;
     try {
-      const shown = this.listFile(dir, got.pieces);
-      const list = shown.path;
-      if (!shown.count) {
-        throw new Error('every piece of that window had already been swept');
+      const surviving = got.pieces.filter(p => fs.existsSync(p.file));
+      if (!surviving.length) throw new Error('Every picture piece of that window has already been swept.');
+      if (surviving.length !== got.pieces.length) {
+        got = { ...got, pieces: surviving, start: Math.max(got.start, surviving[0].at), clamped: true };
+        got.seconds = Math.max(0, (got.end - got.start) / 1000);
+        got.offset = (got.start - surviving[0].at) / 1000;
+        got.from = Math.round((got.clock - got.start) / 100) / 10;
       }
-      if (shown.missing) {
-        audio.pieces_missing = shown.missing;
-      }
-      const soundCut = (audio.present && heard)
-        ? this.listFile(dir, heard.pieces, 'sound.txt') : null;
-      const soundList = soundCut ? soundCut.path : '';
-      if (soundCut && !soundCut.count) {
-        audio.present = false;
-        audio.state = 'unavailable';
-        audio.detail = 'the sound for that window had already been swept';
+      const soundCut = heard?.ok ? this.listFile(dir, heard.pieces.filter(p => p.a), 'sound.txt', got.end) : null;
+      const availableSound = soundCut?.count ? { ...heard, pieces: soundCut.pieces } : null;
+      const shift = availableSound ? surviving[0].at - soundCut.origin : null;
+      audio = this.soundFor(got, want.video_only, availableSound, shift);
+      if (soundCut?.missing) audio.pieces_missing = soundCut.missing;
+      const video = this.videoInputs(dir, got);
+      if (process.platform === 'win32' && video.inputs.reduce((n, arg) => n + arg.length + 3, 0) > 24000) {
+        throw new Error('This window has too many resize or codec transitions for one Windows export. Choose a shorter window; the recording remains buffered.');
       }
       const out = want.out || path.join(dir, 'screen.mp4');
-      const build = (withSound) => ['-hide_banner', '-nostdin', '-y',
-        '-f', 'concat', '-safe', '0', '-i', list,
-        ...(withSound ? ['-f', 'concat', '-safe', '0', '-i', soundList] : []),
-        ...(withSound
-          ? ['-filter_complex', this.soundFilter(audio.align_shift_ms),
-             '-map', '0:v:0', '-map', '[pinesound]']
-          : []),
-        '-ss', got.offset.toFixed(3), '-t', got.seconds.toFixed(3),
-        ...(withSound
-          ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2']
-          : ['-an']),
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-        '-pix_fmt', 'yuv420p', '-r', '25',
-        '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
-        '-movflags', '+faststart', out];
-      const ffmpeg = clipMux.findFfmpeg(opts.ffmpeg).path;
-      try {
-        await clipMux.run(ffmpeg, build(audio.present), 300000);
-      } catch (error) {
-        if (!audio.present) throw error;
-        audio.present = false;
-        audio.complete = false;
-        audio.state = 'unavailable';
-        audio.coverage_ratio = 0;
-        audio.covered_seconds = 0;
-        audio.detail = 'the ring held sound but the encoder refused it: '
-          + error.message;
-        await clipMux.run(ffmpeg, build(false), 300000);
+      const filterGraph = video.filters.concat(audio.present
+        ? [this.soundFilter(got.start - soundCut.origin, video.count, got.seconds)] : []).join(';');
+      let graphArgs = ['-filter_complex', filterGraph];
+      if (filterGraph.length > 4000) {
+        const graphFile = path.join(dir, 'filters.txt');
+        fs.writeFileSync(graphFile, filterGraph, 'utf8');
+        graphArgs = ['-filter_complex_script', graphFile];
       }
+      const build = encoder => ['-hide_banner', '-nostdin', '-y', ...video.inputs,
+        ...(audio.present ? ['-f', 'concat', '-safe', '0', '-i', soundCut.path] : []),
+        ...graphArgs,
+        '-map', '[pinevideo]', ...(audio.present ? ['-map', '[pinesound]'] : []),
+        '-t', got.seconds.toFixed(6),
+        ...(audio.present ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2'] : ['-an']),
+        ...clipMux.encoderArgs(encoder), '-pix_fmt', 'yuv420p', '-r', String(got.fps),
+        '-fps_mode', 'cfr', '-movflags', '+faststart', out];
+      const total = Math.max(.1, Number(got.seconds) || 0);   /* [pip-export-bar] seconds written so far, as a share of this cut */
+      const encoding = await clipMux.encodeVideo(clipMux.findFfmpeg(opts.ffmpeg).path, build,
+        { ...opts, onProgress: typeof opts.onProgress === 'function' ? seconds => opts.onProgress(Math.min(1, Math.max(0, seconds) / total)) : undefined,
+          timeoutMs: opts.timeoutMs || Math.max(600000, Math.ceil(got.seconds * 6000 + 120000)) });
       const bytes = fs.statSync(out).size;
+      if (!bytes) throw new Error('The encoder finished without writing a playable recording.');
       return { ok: true, out, bytes, seconds: Math.round(got.seconds * 10) / 10,
         asked: Number(want.seconds) || 0, held: got.held, clamped: got.clamped,
-        from: got.from, to: got.to, dir, audio,
-        w: got.w, h: got.h };
+        from: got.from, to: got.to, dir, audio, w: video.width, h: video.height, fps: got.fps,
+        video: { fps: got.fps, width: video.width, height: video.height, ...encoding,
+          source: 'native-window-capture', pixel_scale: 1 } };
     } catch (error) {
       clipMux.forget(dir);
       return { ok: false, detail: error.message, held: got.held, audio };
-    } finally {
-      this.releasePieces(held);                                 /* #1211 */
-    }
+    } finally { this.releasePieces(held); }
   }
 
   /* Evenly spaced JPEGs out of the window, oldest first, for the scrub
@@ -946,7 +951,8 @@ class ScreenRing {
     const count = Math.max(2, Math.min(24, Math.round(Number(want.count) || 10)));
     const edge = Math.max(120, Math.min(1280, Math.round(Number(want.edge) || 320)));
     const back = Math.max(0, Number(want.back) || 0);
-    const got = this.window(seconds, back);
+    const interval = Number.isFinite(want.end_at) && want.end_at > 0 ? { clock: want.end_at } : undefined;
+    const got = this.window(seconds, back, undefined, want.view, interval);
     if (!got.ok) return { ok: false, held: got.held, detail: got.detail };
     const dir = clipMux.stash();
     /* #1214: EVERY READER OF THE RING PINS WHAT IT IS READING.
@@ -959,28 +965,16 @@ class ScreenRing {
      * one every two seconds underneath it. */
     const held = this.pinPieces(got.pieces);
     try {
-      const shown = this.listFile(dir, got.pieces);
-      const list = shown.path;
-      if (!shown.count) {
-        throw new Error('every piece of that window had already been swept');
-      }
+      const video = this.videoInputs(dir, got);
       const span = Math.max(0.2, got.seconds);
-      /* fps chosen so `count` frames land across the window. The half-frame
-       * offset puts the first sample inside the window rather than exactly
-       * on its opening edge, where a concat seam can leave a black field. */
       const fps = count / span;
-      const args = ['-hide_banner', '-nostdin', '-y',
-        '-f', 'concat', '-safe', '0', '-i', list,
-        '-ss', (got.offset + (0.5 / Math.max(fps, 0.01))).toFixed(3),
-        '-t', span.toFixed(3),
-        '-vf', 'fps=' + fps.toFixed(5) + ',scale=' + edge + ':-2:flags=bicubic',
-        /* #1205: said out loud so no decoder time is spent on a track that
-         * cannot reach a JPEG. #1207: the picture ring has no audio track at
-         * all now - the sound is a second ring and this never opens it - so
-         * this is belt and braces rather than the thing that strips it. */
-        '-an',
-        '-frames:v', String(count), '-q:v', '4',
-        path.join(dir, 'f%03d.jpg')];
+      const sample = 0.5 / Math.max(fps, 0.01);
+      const filters = video.filters.concat('[pinevideo]trim=start=' + sample.toFixed(6)
+        + ',setpts=PTS-STARTPTS,fps=' + fps.toFixed(5)
+        + ',scale=' + edge + ':-2:flags=bicubic[thumbs]');
+      const args = ['-hide_banner', '-nostdin', '-y', ...video.inputs,
+        '-filter_complex', filters.join(';'), '-map', '[thumbs]', '-t', span.toFixed(6),
+        '-an', '-frames:v', String(count), '-q:v', '4', path.join(dir, 'f%03d.jpg')];
       await clipMux.run(clipMux.findFfmpeg(opts.ffmpeg).path, args, 120000);
       const names = fs.readdirSync(dir).filter((n) => /^f\d+\.jpg$/.test(n)).sort();
       const frames = [];

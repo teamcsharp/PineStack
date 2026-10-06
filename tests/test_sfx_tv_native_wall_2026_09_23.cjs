@@ -167,7 +167,7 @@ test('Listen resolves native larder clips that have fallen off the short ring', 
   assert.match(source, /wallFollowTimer = setInterval\(wallFollow, WALL_FOLLOW_MS\)/);
   assert.doesNotMatch(source, /wallTimer = setInterval\(wallFollow/,
     'the native follower collided with the touch-hold timer');
-  assert.match(follow, /if \(wallFlight\) return wallFlight/);
+  assert.match(follow, /if \(wallFlight && now\(\) - \(Number\(wallFlight\.__pineAt\) \|\| 0\) < 4000\) return wallFlight/);
   assert.match(clip,
     /bridge\.get\('\/api\/sfx\/url\?id=' \+ encodeURIComponent\(id\)\)/);
   assert.match(clip, /ringRemember\(\[info\]\)/);
@@ -255,4 +255,10 @@ test('native fullscreen long press and replay reach the shared video menu', () =
   assert.match(kotlin, /fun replay\(\)/);
   assert.match(activity, /PineSfxTv\.holdPicture\(" \+ x\.toInt\(\)/);
   assert.match(bridge, /"replay" -> wall\.replay\(\)/);
+});
+
+test('Lens owns native picture visibility while open and returns it when closed',()=>{
+ let open=true;const document={getElementById:id=>id==='pinelens'?{classList:{contains:()=>open}}:null,body:{children:[]}};
+ const owns=new Function('document','readBox',fn('uiOverPicture')+';return uiOverPicture;')(document,()=>({left:0,top:0,width:500,height:300}));
+ assert.equal(owns(),true);open=false;assert.equal(owns(),false);
 });

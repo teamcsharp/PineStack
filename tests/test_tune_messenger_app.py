@@ -61,6 +61,7 @@ class Door(unittest.TestCase):
         allows = app._public_allows
         for path in ("/api/system3/public/messenger", "/tune-messenger/tune-messenger.js",
                      "/tune-messenger/system3.js", "/tune-messenger/system3.css",
+                     "/tune-messenger/system3-message-tile.js", "/tune-messenger/system3-message-tile.css",
                      "/api/system3/public/poster/1bd9a68416e24e85"):
             self.assertTrue(allows("GET", path), path)
             self.assertFalse(allows("POST", path), "GET only: " + path)
@@ -134,7 +135,7 @@ class Door(unittest.TestCase):
             got = self.door.get("/api/system3/public/poster/" + sid, params={"t": "a" * 32})
             self.assertEqual((got.status_code, got.content), (200, b"JPEG"))
 
-    def test_the_three_files(self):
+    def test_the_messenger_and_shared_tile_files(self):
         got = self.door.get("/tune-messenger/system3.js", headers={"Accept-Encoding": "gzip"})
         self.assertEqual(got.status_code, 200)
         self.assertEqual(got.headers.get("content-encoding"), "gzip")
@@ -144,6 +145,14 @@ class Door(unittest.TestCase):
         self.assertEqual(again.status_code, 304)
         self.assertEqual(self.door.get("/tune-messenger/tune-messenger.js").status_code, 200)
         self.assertEqual(self.door.get("/tune-messenger/system3.css").status_code, 200)
+        for name, marker in (("system3-message-tile.js", "createRenderer"),
+                             ("system3-message-tile.css", ".sp-rr-sub")):
+            route = "/tune-messenger/" + name
+            shared = self.door.get(route)
+            self.assertEqual(shared.status_code, 200, route)
+            self.assertIn(marker, shared.text)
+            cached = self.door.get(route, headers={"If-None-Match": shared.headers["etag"]})
+            self.assertEqual(cached.status_code, 304, route)
         self.assertEqual(self.house.get("/tune-messenger/app.py").status_code, 404)
         self.assertEqual(self.door.get("/tune-messenger/app.py").status_code, 404)
         self.assertIn('<script src="/tune-messenger/tune-messenger.js" defer></script>', app.RADIO_PAGE_HTML)

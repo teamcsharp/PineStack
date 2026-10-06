@@ -1546,6 +1546,9 @@
     /* [plquiet] the status row: the say line, then the two silence sliders */
     var sayRow = make('div', 'pl-sayrow');
     sayRow.appendChild(ui.sayLine);
+    ui.sessionButton = btn('pl-session-record', '● Record', null, 'Record a local album session');
+    ui.sessionButton.addEventListener('click', function (e) { e.stopPropagation(); openSession(); });
+    sayRow.appendChild(ui.sessionButton);
     sayRow.appendChild(buildQuiet());
     pop.appendChild(sayRow);
 
@@ -1614,7 +1617,8 @@
       if (!ui.visible) return null;
       /* [pldetect] BACK unwinds one layer at a time: lightbox, wizard, popup */
       return {node: pop, close: function () {
-        if (ui.chooser) closeChooser();   /* [pinestream-choose] the chooser first */
+        if (ui.sessionSheet) closeSession();
+        else if (ui.chooser) closeChooser();   /* [pinestream-choose] the chooser first */
         else if (ui.lightbox && !ui.lightbox.root.hidden) closeLightbox();
         else if (ui.detect && !ui.detect.root.hidden) closeDetect();
         else closePopup();
@@ -1844,6 +1848,7 @@
     paintBadge();
     if (!ui.built || !ui.visible) return;
     var st = model.state;
+    paintSession();
     setText(ui.phasePill, phaseWord(st));
     ui.phasePill.className = 'pl-phase pl-phase-' + (st ? (st.enabled === false ? 'off' : String(st.phase || 'idle')) : 'none');
     var ev = st && st.event;
@@ -2820,7 +2825,7 @@
 
   /* ------------------------------------------------------------ [pinestream] stream */
 
-  var STREAM_FPS = [[1, '1'], [2, '2'], [3, '3'], [5, '5']];
+  var STREAM_FPS = [[1, '1'], [2, '2'], [3, '3'], [5, '5'], [15, '15'], [24, '24'], [25, '25'], [30, '30'], [50, '50'], [60, '60']];
   var STREAM_WIDTH = [[480, '480'], [640, '640'], [800, '800']];
   var STREAM_QUALITY = [[45, 'Low'], [60, 'Medium'], [75, 'High']];
 
@@ -2864,7 +2869,7 @@
       b.appendChild(row);
       return seg;
     }
-    var fps = pickRow('Frames a second', 'Pictures of a screen, not video: two is plenty. Car and Funnel listeners get one every two seconds or slower.',
+    var fps = pickRow('Frames a second', 'Continuous live picture. Match the source frame rate; slow connections skip stale frames to stay current.',
       STREAM_FPS, 'stream_fps', 'PineStream frames a second');
     var width = pickRow('Width', 'Pixels across, as the screen sends them.', STREAM_WIDTH, 'stream_width', 'PineStream picture width');
     var quality = pickRow('Quality', 'JPEG quality: higher is sharper and heavier on a phone.', STREAM_QUALITY, 'stream_quality', 'PineStream picture quality');
@@ -2909,7 +2914,7 @@
     setText(p.parts.srcCap, src === 'pineapp'
       ? 'the Pine app\'s window on the desk (the app captures itself while it is open)'
       : 'the PineTab\'s screen (the tablet captures itself - no prompt)');
-    p.parts.fps.set(Number(s.stream_fps || ps.fps || 2));
+    p.parts.fps.set(Number(s.stream_fps || ps.fps || 30));
     p.parts.width.set(Number(s.stream_width || ps.width || 640));
     p.parts.quality.set(Number(s.stream_quality || ps.quality || 60));
     setHidden(p.parts.live, !on);
@@ -2931,7 +2936,7 @@
     if (!model.state && !model.settings) return '';
     if (!streamOn()) return 'off';
     var s = model.settings || {};
-    return (streamSource() === 'pineapp' ? 'Pine app' : 'PineTab') + ' · ' + (s.stream_fps || streamBlock().fps || 2) + ' fps · LIVE';
+    return (streamSource() === 'pineapp' ? 'Pine app' : 'PineTab') + ' · ' + (s.stream_fps || streamBlock().fps || 30) + ' fps · LIVE';
   }
 
   /* The preview is the JPEG the listeners get, asked for once a second
@@ -2966,6 +2971,153 @@
   }
 
   /* ------------------------------------------------------------ recording */
+
+  function closeSession() {
+    if (!ui.sessionSheet) return;
+    if (ui.sessionUnwatch) ui.sessionUnwatch();
+    ui.sessionSheet.remove();
+    ui.sessionSheet = null;
+    if (ui.sessionButton) ui.sessionButton.focus();
+  }
+
+  function paintSession() {
+    var s = model.state && model.state.session || {};
+    if (ui.sessionButton) {
+      ui.sessionButton.textContent = s.phase === 'recording' ? '● ' + fmtDur(s.seconds) + ' · Stop' : s.phase === 'exporting' ? 'Exporting…' : '● Record';
+      ui.sessionButton.classList.toggle('is-recording', s.phase === 'recording');
+    }
+    if (ui.sessionStatus) ui.sessionStatus.textContent = (s.say || 'Ready to record locally') + (s.folder ? ' · ' + s.folder : '');
+    if (ui.sessionStart) {
+      ui.sessionStart.disabled = ui.sessionBusy || s.phase === 'exporting';
+      ui.sessionStart.textContent = s.phase === 'recording' ? 'Stop and export' : s.phase === 'exporting' ? 'Exporting…' : 'Start recording';
+    }
+    if (ui.sessionFields) ui.sessionFields.disabled = s.phase === 'recording' || s.phase === 'exporting';
+    if (ui.sessionDownloads && ui.sessionDownloads.dataset.signature !== JSON.stringify(s.downloads || [])) {
+      ui.sessionDownloads.textContent = '';
+      ui.sessionDownloads.dataset.signature = JSON.stringify(s.downloads || []);
+      (s.downloads || []).forEach(function (item) {
+        var a = make('a', 'pl-session-download', item.name); a.href = stationUrl(item.url); a.target = '_blank'; a.rel = 'noopener'; ui.sessionDownloads.appendChild(a);
+      });
+    }
+  }
+
+  function openSession() {
+    if (ui.sessionSheet) return;
+    var backdrop = make('div', 'pl-tray-back pl-session-back');
+    var sheet = make('form', 'pl-tray-sheet pl-session-sheet');
+    sheet.setAttribute('role', 'dialog');
+    sheet.setAttribute('aria-modal', 'true');
+    sheet.setAttribute('aria-label', 'Record a local album session');
+    var head = make('div', 'pl-tray-head', 'Record a local session');
+    var close = btn('pl-mini', 'Close', null, 'Close recording setup');
+    close.type = 'button';
+    close.addEventListener('click', closeSession);
+    head.appendChild(close); sheet.appendChild(head);
+    sheet.appendChild(make('p', 'pl-muted', 'Save to an album folder without going on air. Stop the recording to export MP3 and MP4 files.'));
+    var fields = make('fieldset', 'pl-session-fields');
+    sheet.appendChild(fields); ui.sessionFields = fields;
+    function input(label, type) {
+      var wrap = make('label', 'pl-session-field', label);
+      var el = guard(make('input', 'pl-tray-input'));
+      el.type = type || 'text';
+      el.setAttribute('aria-label', label);
+      wrap.appendChild(el); fields.appendChild(wrap); return el;
+    }
+    var saved = {};
+    try { saved = JSON.parse(root.localStorage.getItem('pineLive.session.v1') || '{}'); } catch (e) { /* defaults */ }
+    var album = input('Album name'); album.required = true; album.maxLength = 200; album.value = saved.album || '';
+    var artist = input('Artist name'); artist.required = true; artist.maxLength = 200; artist.value = saved.artist || '';
+    fields.appendChild(make('b', '', 'Capture'));
+    var choices = {};
+    [['mix', 'Mix · music alone'], ['station', 'Station mix · DJs + music + SFX'], ['cam', 'Video · camera display + mix audio'], ['screen', 'Video · PineTab display + its broadcast levels']].forEach(function (item) {
+      var label = make('label', 'pl-tray-row');
+      var box = make('input'); box.type = 'checkbox'; box.checked = !saved.modes || saved.modes.indexOf(item[0]) >= 0;
+      label.appendChild(box); label.appendChild(make('span', '', item[1])); fields.appendChild(label); choices[item[0]] = box;
+    });
+    var all = btn('pl-mini', 'Select all', null, 'Capture all four outputs'); all.type = 'button';
+    all.addEventListener('click', function () { Object.keys(choices).forEach(function (key) { choices[key].checked = true; }); }); fields.appendChild(all);
+    fields.appendChild(make('p', 'pl-muted', 'Video uses the display feed at 960 × 540 and 2 fps. Keep the PineTab awake and camera available.'));
+    var artwork = input('Album art · image, video, animated image, or saved media / SFX clip', 'file');
+    artwork.accept = 'image/*,video/*'; artwork.required = false;
+    var search = input('Or search station media / SFX videos'); search.required = false;
+    var searchButton = btn('pl-mini', 'Find clips', null, 'Find station clips for animated album art'); searchButton.type = 'button'; fields.appendChild(searchButton);
+    var clipSelect = make('select', 'pl-tray-input'); clipSelect.setAttribute('aria-label', 'Station artwork clip');
+    var none = make('option', '', 'Use uploaded artwork / no artwork'); none.value = ''; clipSelect.appendChild(none); fields.appendChild(clipSelect);
+    searchButton.addEventListener('click', function () {
+      searchButton.disabled = true;
+      get('/api/video-editor/library?q=' + encodeURIComponent(search.value) + '&limit=40').then(function (ans) {
+        while (clipSelect.options.length > 1) clipSelect.remove(1);
+        (ans.clips || []).forEach(function (clip) { var o = make('option', '', clip.name + ' · ' + clip.seconds + ' s'); o.value = clip.clip_id; clipSelect.appendChild(o); });
+        status.textContent = ans.clips && ans.clips.length ? 'Choose a clip below the search button.' : 'No matching video clips.';
+      }).catch(function (err) { status.textContent = err.message || String(err); }).then(function () { searchButton.disabled = false; });
+    });
+    var crop = make('select', 'pl-tray-input'); crop.setAttribute('aria-label', 'Artwork framing');
+    [['crop', 'Fill square · center crop'], ['fit', 'Fit whole image · padded square']].forEach(function (item) { var o = make('option', '', item[1]); o.value = item[0]; crop.appendChild(o); }); fields.appendChild(crop);
+    var burnLabel = make('label', 'pl-tray-row'); var burn = make('input'); burn.type = 'checkbox';
+    burnLabel.appendChild(burn); burnLabel.appendChild(make('span', '', 'Export the music track with looping album art as MP4')); fields.appendChild(burnLabel);
+    fields.appendChild(make('p', 'pl-muted', 'Artwork is compressed to 600 × 600, up to 6 seconds at 12 fps. MP3 tags get a still cover. Choose a saved clip with a picture; audio-only SFX has no visual artwork.'));
+    var status = make('p', 'pl-session-status'); status.setAttribute('role', 'status'); sheet.appendChild(status); ui.sessionStatus = status;
+    ui.sessionDownloads = make('div', 'pl-session-downloads'); sheet.appendChild(ui.sessionDownloads);
+    var start = btn('pl-session-record', 'Start recording', null, 'Start or stop this recording session'); start.type = 'submit'; sheet.appendChild(start); ui.sessionStart = start;
+    var artKey = '', artSignature = '';
+    sheet.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var state = model.state && model.state.session || {};
+      if (ui.sessionBusy || state.phase === 'exporting') return;
+      ui.sessionBusy = true; paintSession();
+      var modes = Object.keys(choices).filter(function (key) { return choices[key].checked; });
+      var options = {album: album.value.trim(), artist: artist.value.trim(), modes: modes, burn: burn.checked};
+      var file = artwork.files && artwork.files[0];
+      var clipId = clipSelect.value;
+      var prep = Promise.resolve();
+      if (state.phase !== 'recording' && !modes.length) prep = Promise.reject(new Error('Choose at least one capture.'));
+      if (state.phase !== 'recording' && burn.checked && !file && !clipId) prep = Promise.reject(new Error('Choose artwork for the album art video.'));
+      if (state.phase !== 'recording' && clipId) {
+        var clipSignature = clipId + crop.value;
+        if (clipSignature !== artSignature) prep = prep.then(function () {
+          status.textContent = 'Preparing station clip artwork…';
+          return post('/api/pinelive/session/art', {clip_id: clipId, crop: crop.value});
+        }).then(function (ans) { if (!ans.ok) throw new Error(ans.say || 'Artwork failed'); artKey = ans.art; artSignature = clipSignature; });
+      } else if (state.phase !== 'recording' && file) {
+        var signature = file.name + file.size + file.lastModified + crop.value;
+        if (file.size > 16 * 1024 * 1024) prep = Promise.reject(new Error('Choose an artwork clip under 16 MB.'));
+        else if (signature !== artSignature) prep = prep.then(function () {
+          status.textContent = 'Preparing artwork…';
+          return new Promise(function (resolve, reject) {
+            var reader = new FileReader(); reader.onerror = function () { reject(new Error('Could not read artwork.')); };
+            reader.onload = function () { resolve(String(reader.result).split(',')[1]); }; reader.readAsDataURL(file);
+          }).then(function (data) {
+            var b = bridge();
+            var payload = {data: data, crop: crop.value, animated: /video|gif|webp/i.test(file.type)};
+            // Artwork encoding needs longer than the ordinary control timeout.
+            return b && b.post ? b.post('/api/pinelive/session/art', payload) : root.fetch(stationUrl('/api/pinelive/session/art'), {method: 'POST', headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + stationKey()}, body: JSON.stringify(payload)}).then(function (r) { return r.json().then(function (a) { if (!r.ok) throw new Error(a.detail || 'Artwork failed'); return a; }); });
+          }).then(function (ans) { if (!ans.ok) throw new Error(ans.say || 'Artwork failed'); artKey = ans.art; artSignature = signature; });
+        });
+      }
+      prep.then(function () {
+        options.art = file || clipId ? artKey : '';
+        return post('/api/pinelive/session/' + (state.phase === 'recording' ? 'stop' : 'start'), options);
+      }).then(function (ans) {
+        if (ans.session) { model.state = model.state || {}; model.state.session = ans.session; }
+        if (!ans.ok) throw new Error(ans.say || 'Recording failed');
+        try { root.localStorage.setItem('pineLive.session.v1', JSON.stringify(options)); } catch (err) { /* locked storage */ }
+        ui.sessionBusy = false; paintSession();
+      }).catch(function (err) { ui.sessionBusy = false; paintSession(); status.textContent = String(err.message || err); say(status.textContent, 'bad'); });
+    });
+    backdrop.appendChild(sheet); document.body.appendChild(backdrop); ui.sessionSheet = backdrop;
+    backdrop.addEventListener('click', function (e) { if (e.target === backdrop) closeSession(); });
+    sheet.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { e.preventDefault(); closeSession(); }
+      if (e.key === 'Tab') {
+        var focusable = Array.prototype.filter.call(sheet.querySelectorAll('input,button,select,a[href]'), function (el) { return !el.disabled && !el.closest('fieldset:disabled'); });
+        var first = focusable[0], last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    });
+    if (root.PineDismiss) ui.sessionUnwatch = root.PineDismiss.watch(backdrop, closeSession, [], function () { return !!ui.sessionSheet; });
+    paintSession(); album.focus();
+  }
 
   function buildRecording(p) {
     var b = p.body;

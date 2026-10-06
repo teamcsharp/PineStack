@@ -254,6 +254,17 @@ object RtspText {
         return b.array()
     }
 
+    /** RFC 3550 requires a CNAME SDES packet alongside every receiver report. */
+    fun receiverCompound(reporter: Int, source: Int, extHighestSeq: Int, lsr: Int, dlsr: Int): ByteArray {
+        val rr = receiverReport(reporter, source, extHighestSeq, lsr, dlsr)
+        val name = ("pinecam-" + Integer.toUnsignedString(reporter, 16)).toByteArray(Charsets.US_ASCII)
+        val size = (4 + 4 + 2 + name.size + 1 + 3) and -4
+        val sdes = java.nio.ByteBuffer.allocate(size)
+        sdes.put(0x81.toByte()).put(202.toByte()).putShort((size / 4 - 1).toShort())
+        sdes.putInt(reporter).put(1).put(name.size.toByte()).put(name).put(0)
+        return rr + sdes.array()
+    }
+
     /** RTCP packet type of the first packet in a compound, or -1. */
     fun rtcpType(p: ByteArray, len: Int = p.size): Int =
         if (len >= 2 && (p[0].toInt() and 0xC0) == 0x80) p[1].toInt() and 0xFF else -1

@@ -891,12 +891,12 @@
    "Relay through the PineTab" setting in the clips sheet */
 .pine-cam-path {
   position: absolute;
-  left: 6px;
+  right: 6px;
   bottom: 6px;
   z-index: 3;
   max-width: calc(100% - 12px);
-  padding: 1px 7px;
-  border-radius: 9px;
+  padding: 4px;
+  border-radius: 6px;
   background: rgba(5, 8, 10, .56);
   color: #cfe0e6;
   font: 10.5px/16px Inter, Segoe UI, system-ui, sans-serif;
@@ -905,6 +905,7 @@
   text-overflow: ellipsis;
   pointer-events: none;
 }
+.pine-cam-path svg { display: block; width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
 .pine-cam-path[hidden], .pine-cam-round .pine-cam-path { display: none !important; }
 .pcp-relay-h { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
 .pcp-relay-h svg { width: 14px; height: 14px; fill: currentColor; }

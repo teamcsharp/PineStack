@@ -44,8 +44,12 @@ _ROW_BEFORE_MARK = re.compile(r"(^|\n|[ \t]+)[ \t]*(\d{1,3})[.)]?[ \t]+(?=" + _M
 _TAIL_AFTER_SENTENCE = re.compile(r"(?<=[.!?…\"”'’)\]])\s+(\d{1,2})\s*$")
 # "in turn two", "from turn 4", "back in turn 3" - the running order's numbering said aloud.
 _TURN_REF = re.compile(r"\b(?:back\s+)?(?:in|from|at|since)\s+turn\s+(?:\d{1,2}|%s)\b" % _NUMWORD, re.I)
-# "Turn 1 is ..." - a turn numbered in digits is never how a person says it.
-_TURN_DIGIT = re.compile(r"\bturns?\s+\d{1,2}\b", re.I)
+# "Turn 1 is ..." - a turn numbered in digits, used as the NAME of a place in the running order.
+# [num-leak-verb] 2026-10-05: "call me back when he turn 18" aired as "when he earlier", and
+# "Yes, I turn 75 tomorrow" as "Yes, I earlier tomorrow". A person turns an age: that is a verb,
+# and the number is theirs. The name form opens a sentence or a clause, or follows a word that
+# takes a noun; after a subject or a helper verb it is left alone.
+_TURN_DIGIT = re.compile(r"(^|[.!?:;,(\[\"]\s*|\b(?:the|that|this|of|per|see|on)\s+)(turns?\s+\d{1,2})\b", re.I)
 # A library clip label with no words of its own: "26 clip-40" / "577 clip-2" anywhere,
 # "731 clip" only where the sentence stops ("a 30 clip magazine" is a magazine).
 _CLIP_LABEL = re.compile(r"(?:%s\s*)?\b\d{1,6}\s+clip(?:-\d{1,4}\b|(?=\s*(?:[.!?,;:\"”]|$)))\.?"
@@ -172,8 +176,8 @@ def spoken_gate(text: Any, board_labels: Iterable[Any] = ()) -> tuple[str, list[
             hits.append("turn number %r" % m.group(0))
         s = _TURN_REF.sub("earlier", s)
         for m in list(_TURN_DIGIT.finditer(s)):
-            hits.append("turn number %r" % m.group(0))
-        s = _TURN_DIGIT.sub("earlier", s)
+            hits.append("turn number %r" % m.group(2))
+        s = _TURN_DIGIT.sub(lambda m: m.group(1) + "earlier", s)      # [num-leak-verb] what stood before it stays
     if not hits:
         return before, []
     return _tidy(s), hits

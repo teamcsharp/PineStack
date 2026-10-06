@@ -2950,6 +2950,7 @@ class StationStream:
                         self.stats["last_error"] = f"live: {exc}"
                 # -- assemble ----------------------------------------------
                 made_sound = False
+                album_music = SILENCE
                 # #1473: what a split lane needs to re-mix this frame.
                 bed = None
                 voice_pcm = None
@@ -2988,6 +2989,7 @@ class StationStream:
                         raw, live = set_air.decoder.read_frame()
                         if live:
                             bed = _centered_pcm(raw)
+                            album_music = raw
                             frame = _mixed_program(bed, None, False)
                             made_sound = True
                             self.stats["pause_set_frames"] = int(
@@ -3035,6 +3037,7 @@ class StationStream:
                                 self.stats["underruns"] += 1
                             self.stats["padded_music"] = music.padded
                             bed = _centered_pcm(raw)
+                            album_music = raw
                     else:
                         bed = np.zeros(FRAME_SAMPLES * CHANNELS,
                                        dtype=np.int32)
@@ -3069,7 +3072,10 @@ class StationStream:
                 # off, with the input frame that went into it.
                 if self._taps:
                     _tap_info = {"on_air": on_air, "live_on": live_on,
-                                 "made_sound": made_sound, "t": now}
+                                 "made_sound": made_sound, "t": now,
+                                 "music": album_music, "bed": bed,
+                                 "voice": voice_pcm,
+                                 "sfx": bool(airing is not None and airing.sfx)}
                     for _tap in list(self._taps):
                         try:
                             _tap(frame, live_raw, _tap_info)

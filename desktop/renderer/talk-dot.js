@@ -1414,7 +1414,7 @@
     head.style.fontSize = '16px';
     var hint = document.createElement('div');
     hint.setAttribute('style', 'color:#9fb3c0;font-size:12px');
-    hint.textContent = 'Dictate it, fix it on the keyboard, then Send it to the inbox - or Cancel.';
+    hint.textContent = 'Dictate it, fix it on the keyboard, paste any images, then Send it to the inbox - or Cancel.';   /* [report-paste] */
     var area = document.createElement('textarea');
     area.setAttribute('style', 'width:100%;min-height:160px;resize:vertical;padding:10px;'
       + 'border:1px solid #2a3a44;border-radius:8px;background:#05080a;color:#dfe7ee;'
@@ -1479,7 +1479,7 @@
       if (!text) { note.textContent = 'there is nothing to send yet'; return; }
       b.disabled = true;
       note.textContent = 'sending...';
-      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked, images: padImage ? [padImage] : []}))
+      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked, images: (padImage ? [padImage] : []).concat(pasted)}))
         .then(function (got) {
           var id = got && got.submitted && got.submitted.id;
           var said = 'Filed as Pine report #' + id + '.';
@@ -1503,7 +1503,72 @@
       shot.setAttribute('style', 'width:100%;max-height:34vh;object-fit:contain;border:1px solid #2a3a44;border-radius:8px;background:#000');
       pad.appendChild(shot);
     }
+    /* [report-paste] #1575: "In the report window in the pop-up, allow me to
+       paste images in the report window." An image on the clipboard is
+       attached - up to six - shown as a thumbnail with its own remove, and
+       sent with the report beside the screenshot the pad may already carry.
+       Text still pastes into the box as it always did. */
+    var pasted = [];
+    var reading = 0;
+    var strip = document.createElement('div');
+    strip.id = 'pineReportPasted';
+    strip.setAttribute('style', 'display:flex;gap:8px;flex-wrap:wrap');
+    function paintPasted() {
+      strip.textContent = '';
+      pasted.forEach(function (src, i) {
+        var cell = document.createElement('div');
+        cell.setAttribute('style', 'position:relative;width:96px;height:70px;border:1px solid #2a3a44;'
+          + 'border-radius:6px;overflow:hidden;background:#000');
+        var im = document.createElement('img');
+        im.src = src;
+        im.alt = 'pasted image ' + (i + 1);
+        im.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
+        var gone = document.createElement('button');
+        gone.type = 'button';
+        gone.textContent = '✕';
+        gone.title = 'Remove this image';
+        gone.setAttribute('aria-label', 'Remove pasted image ' + (i + 1));
+        gone.setAttribute('style', 'position:absolute;top:2px;right:2px;width:22px;height:22px;padding:0;'
+          + 'border-radius:11px;border:1px solid #2a3a44;background:#0b1116;color:#dfe7ee;font-size:12px;line-height:1');
+        gone.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          pasted.splice(i, 1);
+          paintPasted();
+          note.textContent = pasted.length ? pasted.length + ' image(s) attached' : 'the image was removed';
+        });
+        cell.appendChild(im);
+        cell.appendChild(gone);
+        strip.appendChild(cell);
+      });
+    }
+    pad.addEventListener('paste', function (ev) {
+      var items = (ev.clipboardData && ev.clipboardData.items) || [];
+      var files = [];
+      Array.prototype.forEach.call(items, function (item) {
+        if (item && item.kind === 'file' && /^image\//.test(String(item.type || ''))) {
+          var file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      });
+      if (!files.length) return;                 /* text goes into the box as before */
+      ev.preventDefault();
+      files.forEach(function (file) {
+        if (pasted.length + reading >= 6) { note.textContent = 'six images is the most one report carries'; return; }
+        reading += 1;
+        var reader = new FileReader();
+        reader.onload = function () {
+          reading -= 1;
+          var src = String(reader.result || '');
+          if (/^data:image\//.test(src)) pasted.push(src);
+          paintPasted();
+          note.textContent = pasted.length + ' image(s) attached - paste more, or Send';
+        };
+        reader.onerror = function () { reading -= 1; note.textContent = 'that image could not be read'; };
+        reader.readAsDataURL(file);
+      });
+    });
     pad.appendChild(area);
+    pad.appendChild(strip);
     pad.appendChild(debugRow);
     pad.appendChild(row);
     pad.appendChild(note);

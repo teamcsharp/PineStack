@@ -1,0 +1,31 @@
+﻿.gm-dock{position:fixed;right:18px;bottom:14%;width:min(260px,38vw);z-index:2147483644;pointer-events:none;font-family:system-ui,sans-serif;}
+body.pine-pip>#pineGeneratedMediaDock{display:block!important;visibility:visible!important;pointer-events:none!important;}
+.gm-polaroid{box-sizing:border-box;width:100%;padding:9px 9px 12px;border:1px solid #d5d3c8;border-radius:2px;background:#f4f0e5;color:#16201c;box-shadow:0 7px 28px #0008;pointer-events:auto;cursor:pointer;-webkit-app-region:no-drag;transform-origin:center;}
+.gm-polaroid *{-webkit-app-region:no-drag;}
+.gm-polaroid-picture{display:grid;place-items:center;position:relative;aspect-ratio:4/3;overflow:hidden;background:#161b1c;}
+.gm-polaroid-picture img{display:block;max-width:100%;width:100%;height:100%;object-fit:contain;}
+.gm-polaroid-title,.gm-polaroid-kind{display:block;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:6px;font-size:12px;}
+.gm-polaroid-kind{font-size:10px;opacity:.7;margin-top:2px;}
+.gm-preview-note{color:#edf3ed;text-align:center;font-size:13px;padding:14px;}
+.gm-polaroid[data-phase=loading]{visibility:hidden;}
+.gm-polaroid[data-phase=develop]{transform:translateX(38%);}
+.gm-polaroid[data-phase=develop] .gm-polaroid-picture img{animation:gm-develop 600ms linear both;}
+.gm-polaroid[data-phase=enter]{animation:gm-enter 550ms ease-out both;}
+.gm-polaroid[data-phase=hold]{transform:none;animation:none;}
+.gm-polaroid[data-phase=exit]{animation:gm-exit 650ms ease-in both;--gm-exit-x:110vw;--gm-exit-y:0px;}
+.gm-polaroid[data-exit=left]{--gm-exit-x:-110vw;}.gm-polaroid[data-exit=up]{--gm-exit-x:0px;--gm-exit-y:-110vh;}.gm-polaroid[data-exit=down]{--gm-exit-x:0px;--gm-exit-y:110vh;}
+.gm-polaroid[data-motion=rotate]{--gm-exit-scale:.35;}.gm-polaroid[data-motion=mixed]{--gm-exit-scale:.8;}
+.gm-polaroid:focus-visible{outline:3px solid #49bccb;outline-offset:4px;}
+@keyframes gm-develop{from{filter:brightness(5) saturate(0) contrast(.2);opacity:.15;}to{filter:none;opacity:1;}}
+@keyframes gm-enter{from{transform:translateX(38%) rotate(5deg);}to{transform:none;}}
+@keyframes gm-exit{from{transform:none;opacity:1;}to{transform:translate(var(--gm-exit-x),var(--gm-exit-y)) rotate(var(--gm-exit-rotation,0deg)) scale(var(--gm-exit-scale,1));opacity:0;}}
+.gm-review-shade{position:fixed;inset:0;z-index:2147483646;background:#000a;display:grid;place-items:center;padding:14px;box-sizing:border-box;pointer-events:auto;-webkit-app-region:no-drag;}
+body.pine-pip>.gm-review-shade{display:grid!important;visibility:visible!important;pointer-events:auto!important;}
+.gm-review{box-sizing:border-box;width:min(1080px,100%);max-height:94vh;overflow:auto;background:#111d22;border:1px solid #396572;border-radius:12px;color:#e0edf1;font:13px/1.4 system-ui,sans-serif;box-shadow:0 12px 50px #0009;display:grid;grid-template-columns:minmax(0,1.25fr) minmax(260px,1fr);}
+.gm-review-header{grid-column:1/-1;display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid #29464e;}.gm-review-header h2{font-size:16px;flex:1;margin:0;overflow-wrap:anywhere;}.gm-review-header button{font-size:22px;padding:2px 10px;}
+.gm-review-viewer{display:grid;place-items:center;background:#080e11;min-height:180px;padding:10px;min-width:0;}.gm-review-media{max-width:100%;width:100%;max-height:72vh;object-fit:contain;}.gm-review-controls{padding:14px;display:flex;flex-direction:column;gap:8px;min-width:0;}.gm-review-prompt{width:100%;box-sizing:border-box;resize:vertical;min-height:130px;}
+.gm-review button,.gm-review select,.gm-review textarea{font:inherit;color:inherit;background:#1b333d;border:1px solid #41606b;border-radius:5px;padding:7px;}.gm-review button{cursor:pointer;}.gm-review button:disabled{opacity:.45;cursor:default;}.gm-review-history,.gm-review-actions{display:flex;flex-wrap:wrap;gap:6px;}.gm-review-history select{flex:1;min-width:140px;max-width:100%;}.gm-review-analysis,.gm-review-recipe pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 system-ui;max-height:220px;overflow:auto;}.gm-review-status{margin:0;color:#9dd7df;min-height:20px;}.gm-review-recipe{border-top:1px solid #29464e;padding-top:7px;}.gm-review-recipe summary{cursor:pointer;}
+@media(max-width:650px){.gm-dock{right:9px;width:min(210px,43vw);bottom:16%;}.gm-review{grid-template-columns:minmax(0,1fr);}.gm-review-viewer{max-height:38vh;}.gm-review-media{max-height:35vh;}.gm-review-controls{padding:10px;}}
+@media(prefers-reduced-motion:reduce){.gm-polaroid,.gm-polaroid img{animation:none!important;transform:none!important;filter:none!important;}.gm-polaroid[data-phase=exit]{opacity:0;}}
+
+body.pine-pip.pine-native-tools.pip-popups-open>.gm-review-shade.pip-popup-visible{display:grid!important;}

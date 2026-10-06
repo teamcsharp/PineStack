@@ -69,7 +69,7 @@
   }
 
   function check(adb) {
-    return Promise.resolve(api.pinetabCheck({adb: !!adb})).then(function (c) { paintButton(c); return c; },
+    return Promise.resolve(api.pinetabCheck({adb: !!adb})).then(function (c) { paintButton(c); if (c && c.wanted) station('/api/tablet/update-ask', {wanted: c.wanted}); return c; },
       function () { return null; });
   }
 
@@ -99,40 +99,74 @@
       var head = {'Content-Type': 'application/json'};
       if (cfg.apiKey) head.Authorization = 'Bearer ' + cfg.apiKey;
       var url = String(cfg.baseUrl || '').replace(/\/+$/, '') + route;
-      return fetch(url, body ? {method: 'POST', headers: head, body: JSON.stringify(body)} : {headers: head});
-    }).then(function (r) { return r.ok ? r.json() : null; }, function () { return null; });
+      var controller = new AbortController();
+      var timeout = root.setTimeout(function () { controller.abort(); }, 15000);
+      var options = body ? {method: 'POST', headers: head, body: JSON.stringify(body)} : {headers: head};
+      options.signal = controller.signal;
+      return fetch(url, options).then(function (r) { return r.ok ? r.json() : null; })
+        .finally(function () { root.clearTimeout(timeout); });
+    }).catch(function () { return null; });
   }
 
   /* The ask being served, so its progress goes back to the tablet. */
   var serving = null;
+  var reportQueue = Promise.resolve(), reportBusy = false, nextReport = null;
+  var servingPhase = "running";
+  var pendingLines = [], lineTimer = null;
+  function flushLines() {
+    if (lineTimer) root.clearTimeout(lineTimer);
+    lineTimer = null;
+    var lines = pendingLines.splice(0);
+    lines.forEach(function (line) { report(servingPhase, line); });
+  }
+  function reportLine(line) {
+    pendingLines.push(line);
+    pendingLines = pendingLines.slice(-2);
+    if (!lineTimer) lineTimer = root.setTimeout(flushLines, 500);
+  }
   function report(state, line) {
     if (!serving) return;
-    station('/api/tablet/update-ask', {ask_at: serving, state: state, line: String(line || '').slice(0, 240)});
+    nextReport = {ask_at: serving, state: state, line: String(line || '').slice(0, 240)};
+    sendReports();
+  }
+  function sendReports() {
+    if (reportBusy || !nextReport) return;
+    reportBusy = true;
+    reportQueue = reportQueue.catch(function () {}).then(async function () {
+      while (nextReport) {
+        var body = nextReport;
+        nextReport = null;
+        await station('/api/tablet/update-ask', body);
+      }
+    }).finally(function () { reportBusy = false; sendReports(); });
   }
 
   function update(mode, ask) {
     ui.running = true;
     serving = ask || null;
     paintButton();
-    logLine({state: 'step', line: (mode === 'resign' ? 're-sign and install' : 'build, sign and install the newest PineTab app')
+    logLine({state: 'step', line: (mode === 'prepare' ? 'build and sign the newest PineTab update' : mode === 'install' ? 'install the compiled PineTab update' : mode === 'resign' ? 're-sign and install' : 'build, sign and install the newest PineTab app')
       + (ask ? ' - the tablet asked for it' : '')});
-    report('running', 'the desk is building the newest PineTab app');
+    servingPhase = mode === 'install' ? 'installing' : 'running';
+    report(servingPhase, mode === 'install' ? 'installing the compiled update' : 'the desk is building the newest PineTab app');
     Promise.resolve(api.pinetabUpdate(mode)).then(function (r) {
       var ok = !!(r && r.ok);
-      var said = ok ? (r.skipped ? 'nothing to do - it was current' : 'done: the tablet runs ' + (r.after || '?'))
+      var said = ok && r.ready ? 'compiled and signed - tap again on the tablet to install' : ok ? (r.skipped ? 'nothing to do - it was current' : 'done: the tablet runs ' + (r.after || '?'))
         : 'not done: ' + ((r && r.why) || 'see above');
       logLine({state: ok ? 'ok' : 'fail', line: said});
       /* a desk whose main process predates the relaunch step: open the app here */
-      var opened = ok && !r.skipped && !r.relaunched
+      var opened = ok && !r.ready && !r.skipped && !r.relaunched
         ? Promise.resolve(api.pinetabAction('restart-app')).then(function () { logLine({state: 'ok', line: 'the PineBox app is open on the tablet again'}); })
         : Promise.resolve();
       return opened.then(function () {
-        report(ok ? 'done' : 'failed', said);
+        flushLines();
+        report(ok ? (r.ready ? 'ready' : 'done') : 'failed', said);
         serving = null;
         ui.running = false;
         return check(true);
       });
     }, function (e) {
+      flushLines();
       report('failed', String((e && e.message) || e));
       serving = null;
       ui.running = false;
@@ -145,16 +179,22 @@
    * once, runs the same update, and the tablet reads the progress back. */
   var ASK_MS = 5000;
   var takenAsk = 0;
+  var installedAsk = 0;
   function watchAsks() {
     if (ui.running) return;
     station('/api/tablet/update-ask').then(function (v) {
+      if (v && v.open && v.state === 'install-requested' && v.ask_at > installedAsk && !ui.running) {
+        installedAsk = v.ask_at;
+        update('install', v.ask_at);
+        return;
+      }
       if (!v || !v.open || v.state !== 'asked' || !(v.ask_at > takenAsk) || ui.running) return;
       takenAsk = v.ask_at;
       serving = v.ask_at;
       report('taken', 'the desk took it - building now');
       var p = ui.panel || build();
       p.hidden = false;
-      update('force', v.ask_at);
+      update('prepare', v.ask_at);
     });
   }
 
@@ -242,10 +282,9 @@
       update('force');
     });
   });
-  var SHOWN = {step: 1, ok: 1, fail: 1, warn: 1};
   if (typeof api.onPinetabProgress === 'function') api.onPinetabProgress(function (ev) {
     logLine(ev);
-    if (serving && ev && SHOWN[ev.state]) report('running', ev.line);
+    if (serving && ev) reportLine(ev.line);
   });
 
   check(false);

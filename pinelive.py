@@ -126,7 +126,7 @@ DEFAULTS: dict[str, Any] = {
     "tailscale_video": False,
     "stream_on": False,                                # [pinestream] off by default; the master
     "stream_source": "pinetab",                        # [pinestream] pinetab | pineapp
-    "stream_fps": 2,                                   # [pinestream] 1..5 a second
+    "stream_fps": 30,                                  # live display, up to 60 fps
     "stream_width": 640,                               # [pinestream] 320..960 px
     "stream_quality": 60,                              # [pinestream] JPEG 30..90
     "device": "",
@@ -154,7 +154,7 @@ _RANGES: dict[str, tuple[float, float]] = {
     "split_seconds": (5.0, 120.0),
     "return_seconds": (0.2, 30.0), "arm_timeout": (3.0, 300.0),
 }
-_RANGES.update({"stream_fps": (1, 5), "stream_width": (320, 960),   # [pinestream]
+_RANGES.update({"stream_fps": (1, 60), "stream_width": (320, 960),   # [pinestream]
                 "stream_quality": (30, 90)})
 
 
@@ -1362,6 +1362,9 @@ class PineLive:
                   "master": (not bool((self.event or {}).get("rehearse"))   # [plair]
                              and bool(s.get("record", True)))})   # [pltoggle] album off: no master
         c.update(extra)
+        session = getattr(self, 'session', None)
+        if session and session.phase == 'recording' and session.source and not self.armed():
+            c.update(armed=True, source='usb', master=False, event_id='local-album')
         self.control = c
         try:
             _atomic_write(self.control_path, json.dumps(c, indent=1))
@@ -2095,6 +2098,7 @@ class PineLive:
         stream = _app("STATION_STREAM")
         return {
             "v": CONTRACT_VERSION,
+            "session": self.session.state() if getattr(self, 'session', None) else None,
             "enabled": bool(s.get("enabled", True)),
             "phase": self.phase, "live": self.phase == "live", "armed": armed,
             "failover": self._failover(),                          # [plcount]
@@ -2644,6 +2648,8 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
     from fastapi.responses import HTMLResponse, StreamingResponse
 
     _G = app_globals                 # live: names defined later are found too
+    import live_session
+    live_session.install(app, PL, app_globals)
     data_dir = app_globals.get("DATA_DIR")
     if data_dir is not None:
         PL.data = Path(data_dir) / "pinelive"

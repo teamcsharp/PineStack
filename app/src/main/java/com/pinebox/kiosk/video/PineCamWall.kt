@@ -77,6 +77,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
      * sends the reading (bridge verb `battery`); this is its child so it
      * leaves with the picture. See CamBatteryBadge. */
     private val badge = CamBatteryBadge(context)
+    private val routeBadge = CamRouteBadge(context)
 
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
@@ -136,6 +137,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
     init {
         addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(badge, LayoutParams(1, 1, Gravity.TOP or Gravity.START))   // [cambattery]
+        addView(routeBadge, LayoutParams(1, 1, Gravity.BOTTOM or Gravity.END))
         /* The activity observes taps before dispatch. The wall itself must
          * never own input - see PineVideoWall for why. */
         isClickable = false
@@ -388,6 +390,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     /** [cambattery] {on, text, bars, tone, pulse, stale, charging} from the page. */
     fun battery(o: JSONObject) { onMain { badge.show(o) } }
+    fun route(o: JSONObject) { onMain { routeBadge.showRoute(o.optString("route")) } }
 
     private fun refreshVisibility() {
         visibility = if (running.get() && !hidden && !menuHidden) View.VISIBLE else View.GONE
@@ -692,8 +695,9 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     private fun build() {
         if (player != null) return
-        /* A LOAD CONTROL FOR A LIVE PICTURE: start on a quarter second,
-         * hold a second, never more than five. Anything held is latency. */
+        /* Keep one second for the H88's measured Wi-Fi bursts. Starting
+         * at 250 ms made recovered packets arrive after their display time,
+         * repeatedly skipping frames even while the relay stayed connected. */
         val control = DefaultLoadControl.Builder()
             .setBufferDurationsMs(LOAD_MIN_MS, LOAD_MAX_MS, LOAD_PLAY_MS, LOAD_REPLAY_MS)
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -743,15 +747,15 @@ class PineCamWall(context: Context) : FrameLayout(context) {
         private const val CONNECT_MS = 4_000
         private const val READ_MS = 8_000
         private const val LOAD_CHECK_BYTES = 64 * 1024
-        /* The load control: a live picture holds as little as it can. */
-        private const val LOAD_MIN_MS = 1_000
+        /* A small jitter reserve while retaining the five-second ceiling. */
+        private const val LOAD_MIN_MS = 1_500
         private const val LOAD_MAX_MS = 5_000
-        private const val LOAD_PLAY_MS = 250
-        private const val LOAD_REPLAY_MS = 500
+        private const val LOAD_PLAY_MS = 1_000
+        private const val LOAD_REPLAY_MS = 1_250
         /* The watchdog's tick and its bounds. */
         private const val WATCH_MS = 1_000L
-        private const val LAG_CATCHUP_MS = 1_500L
-        private const val LAG_SETTLED_MS = 600L
+        private const val LAG_CATCHUP_MS = 2_000L
+        private const val LAG_SETTLED_MS = 1_100L
         private const val LAG_RECONNECT_MS = 6_000L
         private const val CATCHUP_SPEED = 1.25f
         private const val BUFFER_STUCK_MS = 3_000L

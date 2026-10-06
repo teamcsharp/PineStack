@@ -24,7 +24,7 @@
 const DEADMAN_MS = 12000;
 const FAIL_LIMIT = 5;
 const POST_TIMEOUT_MS = 6000;
-const LIMITS = { fps: [1, 5, 2], width: [320, 960, 640], quality: [30, 90, 60] };
+const LIMITS = { fps: [1, 60, 30], width: [320, 960, 640], quality: [30, 90, 60] };
 
 function clampOpt(v, key) {
   const [lo, hi, dflt] = LIMITS[key];
@@ -39,7 +39,7 @@ class PineStreamPush {
     this.headers = headers || (() => ({}));
     this.fetch = fetchImpl || ((...a) => fetch(...a));
     this.now = now || (() => Date.now());
-    this.opts = { fps: 2, width: 640, quality: 60, private: false, why: '' };
+    this.opts = { fps: 30, width: 640, quality: 60, private: false, why: '' };
     this.running = false;
     this.timer = null;
     this.lastRun = 0;

@@ -1,0 +1,431 @@
+html.pine-pip, body.pine-pip { overflow: hidden !important; width: 100%; height: 100%; }
+html.pine-pip, html.pine-pip * { scrollbar-width: none !important; }
+html.pine-pip::-webkit-scrollbar, html.pine-pip *::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+body.pine-pip-camera-only #controlFrame, body.pine-pip-camera-only > #pine-pip-panel { visibility: hidden !important; }
+.pip-camera { position: absolute; box-sizing: border-box; z-index: 4; pointer-events: auto; touch-action: none; overflow: hidden; background: rgb(var(--pip-surface)); border: 1px solid var(--pip-accent); border-radius: 5px; -webkit-app-region: no-drag; }
+.pip-camera *, .pip-camera button { -webkit-app-region: no-drag; }
+.pip-camera[hidden] { display: none !important; }
+.pip-camera-image { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.pip-camera-status { position: absolute; inset: 0; display: grid; place-content: center; padding: 30px 12px 12px; text-align: center; }   /* [cam-words] the text starts below the title */
+.pip-camera-status[hidden], .pip-camera-image[hidden] { display: none; }
+.pip-camera-move { position: absolute; left: 6px; top: 6px; border: 0; border-radius: 3px; padding: 2px 6px; background: rgb(var(--pip-surface) / .7); color: var(--pip-text); cursor: move; }
+.pip-camera-resize { position: absolute; border: 0; padding: 0; background: transparent; }
+.pip-camera-resize.n, .pip-camera-resize.s { left: 10px; right: 10px; height: 7px; cursor: ns-resize; }
+.pip-camera-resize.e, .pip-camera-resize.w { top: 10px; bottom: 10px; width: 7px; cursor: ew-resize; }
+.pip-camera-resize.n, .pip-camera-resize.ne, .pip-camera-resize.nw { top: 0; }
+.pip-camera-resize.s, .pip-camera-resize.se, .pip-camera-resize.sw { bottom: 0; }
+.pip-camera-resize.e, .pip-camera-resize.ne, .pip-camera-resize.se { right: 0; }
+.pip-camera-resize.w, .pip-camera-resize.nw, .pip-camera-resize.sw { left: 0; }
+.pip-camera-resize.ne, .pip-camera-resize.se, .pip-camera-resize.sw, .pip-camera-resize.nw { width: 12px; height: 12px; }
+.pip-camera-resize.ne, .pip-camera-resize.sw { cursor: nesw-resize; }
+.pip-camera-resize.nw, .pip-camera-resize.se { cursor: nwse-resize; }
+.pip-camera-resize:focus-visible, .pip-camera-move:focus-visible { outline: 2px solid var(--pip-text); outline-offset: -2px; }
+.pip-camera.main { z-index: -1; border: 0; border-radius: 0; pointer-events: none; }
+.pip-camera.main button { display: none; }
+body.pine-pip-ui-hidden #pinePipWidgets > .pip-camera:not([hidden]) { display: block !important; }
+body.pine-pip > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(script):not(link):not(.plv-sheet):not(#pineExportBar):not(.pip-exportbar):not(#pinePipFavorites):not(#pinePipPopupDock):not(#pineGeneratedMediaDock):not(.gm-review-shade):not(.pip-popup-visible):not(.sp-rrp-back) { display: none !important; }
+body.pine-pip > main { display: block !important; position: fixed !important; inset: 0 !important; padding: 0 !important; margin: 0 !important; }
+body.pine-pip > main > :not(#control):not(.pip-popup-visible) { visibility: hidden !important; pointer-events: none !important; }
+body.pine-pip #control { display: block !important; position: fixed !important; inset: 0 !important; padding: 0 !important; }
+body.pine-pip #controlFrame { display: flex !important; position: fixed !important; inset: 0 !important; width: 100% !important; height: 100% !important; z-index: 20000 !important; }
+#pinePipWidgets { display: none; position: fixed; inset: 0; z-index: 21000; pointer-events: none; color: var(--pip-text, #e1f8ea); font: 12px/1.4 system-ui, sans-serif; }
+body.pine-pip #pinePipWidgets { display: block; }
+/* Dock positions use their own classes to avoid the desktop header divider. */
+.pip-dock { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; gap: 2px; padding: 4px; }
+.pip-dock.pip-dock-top { top: 0; } .pip-dock.pip-dock-bottom { bottom: 0; }
+.pip-widget { pointer-events: auto; display: flex; align-items: center; gap: 6px; padding: 4px 7px; background: rgb(var(--pip-surface) / .85); border: 1px solid color-mix(in srgb, var(--pip-accent) 17%, transparent); border-radius: 6px; min-width: 0;  }
+.pip-widget[hidden] { display: none !important; }
+.pip-grip { cursor: grab; touch-action: none; color: var(--pip-accent); flex: 0 0 12px; border: 0; background: none; padding: 0; font-size: 16px; }
+.pip-widget.dragging { opacity: .55; outline: 1px solid var(--pip-accent); }
+.pip-marquee { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; }
+.pip-track { display: inline-flex; min-width: 100%; animation: pip-scroll var(--pip-duration, 22s) linear infinite; }
+.pip-track span { padding-right: 48px; }
+.pip-marquee:hover .pip-track { animation-play-state: paused; }
+@keyframes pip-scroll { to { transform: translateX(-50%); } }
+.pip-dice { flex: 0 0 48px; width: 48px; height: 40px; position: relative; }
+.pip-dice canvas { position: absolute; inset: 0; width: 48px; height: 40px; }
+.pip-dice output { position: absolute; inset: 0; display: grid; place-items: center; font: bold 12px ui-monospace, monospace; text-shadow: 0 1px 3px rgb(var(--pip-surface)); pointer-events: none; }
+.pip-music-art { width: 34px; height: 34px; object-fit: cover; border-radius: 4px; }
+.pip-music-info { flex: 1; min-width: 0; overflow: hidden; }
+.pip-music-info b, .pip-music-info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pip-widget button:not(.pip-grip) { border: 1px solid color-mix(in srgb, var(--pip-accent) 25%, transparent); border-radius: 4px; background: var(--pip-button, #17382c); color: inherit; padding: 4px 6px; cursor: pointer; }
+.pip-chat { position: absolute; right: 4px; top: 18%; bottom: 26%; width: min(46%, 260px); display: flex; flex-direction: column; align-items: stretch; padding: 6px; }
+.pip-chat header { display: flex; gap: 6px; font-weight: 600; }
+.pip-sfx-slots { color: var(--pip-text); overflow-wrap: anywhere; }
+.pip-chat-list { overflow-y: auto; min-height: 0; font-size: 11px; scrollbar-width: thin; }
+.pip-chat-list article { border-bottom: 1px solid color-mix(in srgb, var(--pip-accent) 14%, transparent); padding: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pip-chat-list b { color: var(--pip-accent, #98e9ae); }
+.pip-chat-list article.roll { border-left: 2px solid var(--pip-accent); padding-left: 5px; }
+.pip-roll-window { height: 20px; overflow: hidden; background: color-mix(in srgb, var(--pip-accent) 20%, transparent); margin-top: 4px; border-radius: 3px; }
+.pip-roll-reel { animation: pip-land 1.4s cubic-bezier(.12,.7,.18,1) forwards; }
+.pip-roll-reel > div { height: 20px; line-height: 20px; padding: 0 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+@keyframes pip-land { to { transform: translateY(var(--pip-land)); } }
+.pip-chat[data-dock="top"] { top: 12%; bottom: 40%; }
+.pip-chat[data-dock="bottom"] { top: 35%; bottom: 18%; }
+.pip-note { position: absolute; top: 45%; left: 10%; right: 10%; text-align: center; background: rgb(var(--pip-surface) / .93); padding: 8px; border-radius: 6px; }
+@media (prefers-reduced-motion: reduce) { .pip-track, .pip-roll-reel { animation: none; } .pip-track > :nth-child(2) { display: none; } }
+
+/* Native movement avoids a renderer/main IPC round trip for each mouse move. */
+body.pine-frameless { --pine-window-bar-height: 30px; }
+body.pine-frameless:not(.pine-pip) { padding-top: var(--pine-window-bar-height); }
+/* Fixed view hosts bypass body padding; reserve the desktop title bar here too. */
+body.pine-frameless:not(.pine-pip) > .pine-view-host {
+  top: var(--pine-window-bar-height);
+  height: calc(100% - var(--pine-window-bar-height));
+}
+.pine-window-bar { position: fixed; inset: 0 0 auto; height: var(--pine-window-bar-height, 30px); display: flex; align-items: center; z-index: 2147483640; background: #151b22; color: #edf3f5; -webkit-app-region: drag; }
+.pine-window-bar span { flex: 1; padding-left: 12px; font: 12px system-ui; }
+.pine-window-bar button { -webkit-app-region: no-drag; width: 44px; height: 30px; border: 0; border-radius: 0; background: transparent; color: inherit; }
+.pine-window-bar button:last-child:hover { background: #a42d36; }
+.pip-drag-surface { position: absolute; inset: 5px; z-index: 0; pointer-events: auto; -webkit-app-region: drag; }
+/* Native drag hit testing needs explicit exclusions for every control. */
+.pip-widget, .pip-widget *, .pip-audio, .pip-audio *, .pip-appearance, .pip-appearance *, .plv-sheet, .plv-sheet *, .sp-rrp-back, .sp-rrp-back * { -webkit-app-region: no-drag; }
+.pip-dock, .pip-chat, .pip-voices { z-index: 1; }
+.pip-audio { z-index: 3; }
+.pip-audio { position: absolute; top: 5px; right: 5px; display: flex; pointer-events: auto; gap: 2px; }
+.pip-audio button { width: 30px; height: 30px; padding: 0; border: 1px solid color-mix(in srgb, var(--pip-accent) 25%, transparent); border-radius: 50%; background: rgb(var(--pip-surface) / .8); color: var(--pip-accent); cursor: pointer; }
+.pip-volume-panel { position: absolute; right: 0; top: 34px; width: min(220px, calc(100vw - 12px)); background: rgb(var(--pip-surface) / .96); border: 1px solid color-mix(in srgb, var(--pip-accent) 25%, transparent); border-radius: 6px; padding: 10px; }
+.pip-volume-panel[hidden], .pip-voices[hidden] { display: none; }
+.pip-volume-panel label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pip-volume-panel input { width: 140px; max-width: 75%; }
+.pip-volume-panel .pip-mixer-open { width: 100%; height: auto; border-radius: 4px; padding: 7px 9px; margin-top: 8px; }
+.pip-dock.pip-dock-top { padding-right: 70px; }
+body.pine-pip:has(.pip-voices:not([hidden])) .pip-dock.pip-dock-top { padding-left: 68px; padding-top: 60px; }
+body.pine-pip:has(.pip-voices:not([hidden])) .pip-dock.pip-dock-bottom { padding-left: 68px; padding-right: 68px; }
+.pip-voices { position: absolute; inset: 0; pointer-events: none; }
+.pip-voice { --voice-level: 0; --voice-peak: 0; position: absolute; width: 48px; height: 48px; display: grid; place-items: center; border: 2px solid var(--pip-accent); border-radius: 50%; background: rgb(var(--pip-surface) / .8); box-shadow: 0 0 calc(2px + var(--voice-level) * 18px) var(--pip-accent); transform: scale(calc(1 + var(--voice-level) * .2)); }
+.pip-voice.host { top: 8px; left: 8px; }
+.pip-voice.cohost { top: 45px; right: 8px; border-color: var(--pip-accent); }
+.pip-voice.sfx { bottom: 8px; left: 8px; border-color: var(--pip-accent); }
+.pip-voice.callers { bottom: 8px; right: 8px; border-color: var(--pip-accent); }
+.pip-voice img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: 50%; opacity: .65; }
+.pip-voice span { z-index: 1; max-width: 70px; font-size: 10px; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 1px 3px rgb(var(--pip-surface)); }
+.pip-peak { position: absolute; bottom: -4px; left: 0; width: calc(var(--voice-peak) * 100%); height: 3px; background: var(--pip-text); }
+.pip-cast img, .pip-cast-member i { display: inline-grid; place-items: center; width: 28px; height: 28px; object-fit: cover; border-radius: 50%; }
+.pip-cast-group, .pip-cast-member { display: inline-flex; align-items: center; gap: 6px; }
+.pip-cast-member { padding-right: 16px !important; }
+#pinePipWidgets button:focus-visible, #pinePipWidgets input:focus-visible, .pine-window-bar button:focus-visible { outline: 2px solid var(--pip-accent); outline-offset: 2px; }
+body.pine-pip > .plv-sheet { display: block !important; z-index: 2147483646 !important; right: 6px; bottom: 6px; box-sizing: border-box; max-height: calc(100vh - 12px); overflow-y: auto; max-width: calc(100vw - 12px); }
+@media (prefers-reduced-motion: reduce) { .pip-voice { transform: none; } }
+
+/* Small transparent waveforms follow each corner's edges. */
+.pip-voice { width: 96px; height: 46px; border: 0; border-radius: 0; background: transparent; box-shadow: none; transform: none; display: flex; flex-direction: column; justify-content: flex-end; }
+.pip-waveform { width: 88px; height: 32px; }
+.pip-voice span { font-size: 10px; max-width: 94px; color: var(--voice-colour, var(--pip-accent)); }
+.pip-voice .pip-peak { height: 1px; background: var(--voice-colour, var(--pip-accent)); bottom: 0; }
+.pip-voice.host, .pip-voice.sfx { left: 5px; align-items: flex-start; }
+.pip-voice.cohost, .pip-voice.callers { right: 5px; align-items: flex-end; }
+.pip-voice.host { top: 5px; }
+.pip-voice.cohost { top: 36px; }
+.pip-voice.sfx, .pip-voice.callers { bottom: 5px; }
+body.pine-pip:has(.pip-voices:not([hidden])) .pip-dock.pip-dock-top { padding-left: 105px; padding-top: 82px; }
+body.pine-pip:has(.pip-voices:not([hidden])) .pip-dock.pip-dock-bottom { padding-left: 105px; padding-right: 105px; }
+
+body.pine-pip-ui-hidden #pinePipWidgets > :not(.pip-drag-surface) { display: none !important; }
+body.pine-pip-ui-hidden .pip-drag-surface { inset: 5px; }
+
+@media (max-width: 300px), (max-height: 180px) {
+  .pip-voice { width: min(96px, calc((100vw - 12px) / 2)); height: clamp(22px, 25vh, 46px); }
+  .pip-waveform { max-width: 100%; height: calc(100% - 12px); }
+  .pip-voice span { max-width: 100%; }
+  body.pine-pip:has(.pip-voices:not([hidden])) .pip-dock.pip-dock-bottom { padding-left: min(105px, 24vw); padding-right: min(105px, 24vw); }
+}
+
+#pinePipWidgets { --pip-surface: 8 23 19; --pip-text: #e1f8ea; --pip-accent: #98e9ae; --pip-button: #17382c; --pip-opacity: .85; color: var(--pip-text); }
+.pip-widget, .pip-audio button, .pip-volume-panel, .pip-note { background: rgb(var(--pip-surface)); color: var(--pip-text); border-color: color-mix(in srgb, var(--pip-accent) 25%, transparent); }
+.pip-widget, .pip-audio, .pip-voices, .pip-note { opacity: var(--pip-opacity); }
+.pip-widget.dragging { opacity: .55; }
+.pip-widget button:not(.pip-grip) { background: var(--pip-button); }
+.pip-grip, .pip-chat-list b, .pip-sfx-slots { color: var(--pip-accent); }
+.pip-appearance { position: absolute; z-index: 4; right: 6px; top: 40px; width: min(280px, calc(100vw - 12px)); max-height: calc(100vh - 46px); overflow: auto; box-sizing: border-box; pointer-events: auto; background: rgb(var(--pip-surface) / .98); color: var(--pip-text); border: 1px solid var(--pip-accent); border-radius: 6px; padding: 12px; }
+.pip-appearance[hidden] { display: none; }
+.pip-appearance header { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
+.pip-appearance label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.pip-appearance select { width: 100%; }
+.pip-appearance input { flex: 1; min-width: 0; accent-color: var(--pip-accent); }
+.pip-appearance button, .pip-appearance select { background: var(--pip-button); color: var(--pip-text); border: 1px solid var(--pip-accent); border-radius: 4px; padding: 4px 6px; }
+/* Appearance remains reachable through the native menu when overlays are off. */
+body.pine-pip-ui-hidden #pinePipWidgets > .pip-appearance { display: block !important; }
+body.pine-pip-ui-hidden #pinePipWidgets > .pip-appearance[hidden] { display: none !important; }
+
+.pip-slate { position: absolute; z-index: 5; box-sizing: border-box; width: min(310px, calc(100vw - 8px)); max-height: calc(100vh - 8px); flex-direction: column; align-items: stretch; font: 11px/1.4 ui-monospace, monospace; overflow: hidden; }
+.pip-slate-move { cursor: move !important; touch-action: none; font-weight: bold; text-align: left; }
+.pip-slate-topic { overflow-wrap: anywhere; color: var(--pip-accent, #98e9ae); }
+.pip-slate-rolls { overflow-y: auto; max-height: 32vh; min-height: 0; }
+.pip-slate-roll { padding: 5px; margin-top: 4px; border-left: 2px solid var(--pip-accent, #98e9ae); background: color-mix(in srgb, var(--pip-accent) 4%, transparent); animation: pip-roll-pop .35s ease-out both; }
+.pip-slate-roll b, .pip-slate-roll span { display: block; overflow-wrap: anywhere; }
+.pip-slate-line { white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto; max-height: 22vh; }
+@keyframes pip-roll-pop { from { opacity: 0; transform: translateY(12px) scale(.95); } to { opacity: 1; transform: none; } }
+.pip-painting { position: absolute; z-index: 4; left: 8px; bottom: 8px; margin: 0; width: min(150px, 32vw); padding: 5px; box-sizing: border-box; background: rgb(var(--pip-surface, 8 23 19) / var(--pip-opacity, .85)); border: 1px solid color-mix(in srgb, var(--pip-accent) 33%, transparent); border-radius: 6px; transform: translateY(calc(100% + 16px)); opacity: 0; transition: transform .5s ease, opacity .5s ease; pointer-events: none; }
+.pip-painting.show { transform: translateY(0); opacity: 1; }
+.pip-painting img { display: block; width: 100%; height: min(110px, 25vh); object-fit: contain; }
+.pip-painting figcaption { font-size: 10px; overflow-wrap: anywhere; max-height: 3em; overflow: hidden; }
+@media (prefers-reduced-motion: reduce) { .pip-slate-roll { animation: none; } .pip-painting { transition: none; } }
+
+@media (prefers-reduced-motion: reduce) { .pip-slate .pip-roll-reel { transform: translateY(var(--pip-land)); } }
+
+/* The root palette also reaches floating sheets outside the overlay host. */
+body.pine-pip { background: rgb(var(--pip-surface)); color: var(--pip-text); }
+body.pine-pip .plv-sheet { background: rgb(var(--pip-surface)); color: var(--pip-text); border-color: var(--pip-accent); box-shadow: 0 16px 44px rgb(var(--pip-surface) / .75); }
+body.pine-pip .plv-title-t, body.pine-pip .plv-val, body.pine-pip .plv-x { color: var(--pip-accent); }
+body.pine-pip .plv-name, body.pine-pip .plv-hint, body.pine-pip .plv-foot { color: var(--pip-text); }
+body.pine-pip .plv-foot, body.pine-pip .plv-sec { border-color: color-mix(in srgb, var(--pip-accent) 25%, transparent); }
+body.pine-pip .plv-slide, #pinePipWidgets input { accent-color: var(--pip-accent); }
+#pinePipWidgets select { background: var(--pip-button); color: var(--pip-text); border-color: var(--pip-accent); }
+
+/* Tools remain reachable above the compact media without expanding the window. */
+body.pine-pip > #pinePipFavorites {display:flex!important;position:fixed;left:0;right:0;top:26px;z-index:2147483643;gap:4px;flex-wrap:wrap;overflow:hidden;box-sizing:border-box;padding:4px;background:rgb(var(--pip-surface,21 24 29) / .92);pointer-events:auto;-webkit-app-region:no-drag;}
+body.pine-pip:not(.pine-native-tools) > #pinePipFavorites { display: none !important; }
+body.pine-pip #pinePipFavorites[hidden],body.pine-pip #pinePipPopupDock[hidden]{display:none!important;}
+#pinePipFavorites button{flex:0 1 auto;max-width:100%;white-space:normal!important;overflow-wrap:anywhere;}
+#pinePipFavorites button,#pinePipPopupDock button{border:1px solid #59636a;border-radius:4px;background:#20282e;color:#edf2f5;padding:5px 7px;cursor:pointer;white-space:nowrap;-webkit-app-region:no-drag;}
+body.pine-pip > #pinePipPopupDock{display:flex!important;position:fixed;left:0;top:64px;bottom:4px;width:min(190px,40vw);box-sizing:border-box;z-index:2147483643;flex-direction:column;gap:6px;padding:8px;background:#171d23;color:#edf2f5;font:12px/1.4 system-ui;pointer-events:auto;-webkit-app-region:no-drag;}
+#pinePipPopupDock header{display:flex;gap:4px;align-items:center;}#pinePipPopupDock header b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#pinePipPopupDock input{min-width:0;width:100%;box-sizing:border-box;background:#10171d;color:#edf2f5;border:1px solid #59636a;padding:6px;}
+.pip-popup-list{display:flex;flex-direction:column;overflow-y:auto;min-height:0;gap:3px;flex:1;}.pip-popup-list button{text-align:left;white-space:normal!important;}.pip-popup-list small{display:block;color:#a5b4be;}.pip-popup-list .selected{outline:2px solid #89d4b0;}.pip-popup-status{font-size:11px;margin:0;color:#a5b4be;}
+body.pine-pip.pip-popups-open .pip-popup-visible{display:block!important;visibility:visible!important;pointer-events:auto!important;position:fixed!important;left:min(194px,41vw)!important;right:4px!important;top:66px!important;bottom:4px!important;width:auto!important;height:auto!important;max-width:calc(100vw - min(194px,41vw) - 4px)!important;max-height:calc(100vh - 70px)!important;min-width:0!important;min-height:0!important;margin:0!important;transform:none!important;overflow:auto!important;z-index:2147483641!important;-webkit-app-region:no-drag;}
+body.pine-pip.pip-popups-open .pip-popup-visible> :first-child{max-width:100%!important;max-height:100%!important;min-width:0!important;}
+@media(max-width:420px){body.pine-pip > #pinePipPopupDock{width:130px;}body.pine-pip.pip-popups-open .pip-popup-visible{left:134px!important;max-width:calc(100vw - 138px)!important;}}
+
+body.pine-pip.pip-popups-open #control.pip-popup-visible{left:min(194px,41vw)!important;right:4px!important;top:66px!important;bottom:4px!important;width:auto!important;height:auto!important;z-index:2147483641!important;}
+body.pine-pip.pip-popups-open #control.pip-popup-visible #controlFrame{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;z-index:auto!important;}
+@media(max-width:420px){body.pine-pip.pip-popups-open #control.pip-popup-visible{left:134px!important;}}
+
+body.pine-native-tools>#pinePipFavorites{top:0}body.pine-native-tools>#pinePipPopupDock{top:var(--pip-tools-top,38px)}body.pine-native-tools.pip-popups-open .pip-popup-visible,body.pine-native-tools.pip-popups-open #control.pip-popup-visible{top:calc(var(--pip-tools-top,38px) + 2px)!important;max-height:calc(100vh - var(--pip-tools-top,38px) - 6px)!important}
+
+/* The native System 3 pane uses its own module, with no broadcast guest. */
+body.pine-native-tools.pip-popups-open .s3-backdrop.pip-popup-visible{padding:0!important;}
+body.pine-native-tools .s3-backdrop.pip-popup-visible>.s3{width:100%;min-height:100%;max-height:none;border-radius:8px;}
+
+body.pine-native-tools{margin:0;padding:0}body.pine-native-tools>main{margin:0;padding:0;min-height:0}body.pine-native-tools .pip-popup-visible>.cw-dialog,body.pine-native-tools .pip-popup-visible>.sf-dialog{width:100%!important;height:100%!important;max-height:none!important;margin:0!important;}
+
+body.pine-native-tools>main>.view:not(.pip-popup-visible){display:none!important}
+
+body.pine-native-tools .pip-popup-visible>.cw-dialog{position:relative!important;}
+body.pine-native-tools .cw-dialog button{height:auto;}
+/* The feed item itself is the overlay; movement and resizing add no chrome. */
+.pip-messages{position:absolute;z-index:3;display:block;gap:0;padding:0;border:0;border-radius:0;background:transparent;min-width:0;min-height:0;overflow:visible;pointer-events:auto;touch-action:pan-y;-webkit-app-region:no-drag;--sp-text:#d8e5eb;--sp-on:#65c7da;--sp-muted:#8fa0ad;}
+.pip-messages[hidden],.pip-messages [hidden]{display:none!important;}
+.pip-messages.moving{cursor:move;user-select:none;}
+.pip-messages:focus-visible{outline:1px solid var(--pip-accent);outline-offset:2px;}
+.pip-messages-edge{position:absolute;display:block;z-index:4;background:transparent;touch-action:none;user-select:none;-webkit-app-region:no-drag;}
+.pip-messages-edge.n,.pip-messages-edge.s{left:12px;right:12px;height:8px;cursor:ns-resize;}
+.pip-messages-edge.e,.pip-messages-edge.w{top:12px;bottom:12px;width:8px;cursor:ew-resize;}
+.pip-messages-edge.n,.pip-messages-edge.ne,.pip-messages-edge.nw{top:0;}
+.pip-messages-edge.s,.pip-messages-edge.se,.pip-messages-edge.sw{bottom:0;}
+.pip-messages-edge.e,.pip-messages-edge.ne,.pip-messages-edge.se{right:0;}
+.pip-messages-edge.w,.pip-messages-edge.nw,.pip-messages-edge.sw{left:0;}
+.pip-messages-edge.ne,.pip-messages-edge.nw,.pip-messages-edge.se,.pip-messages-edge.sw{width:12px;height:12px;}
+.pip-messages-edge.ne,.pip-messages-edge.sw{cursor:nesw-resize;}
+.pip-messages-edge.nw,.pip-messages-edge.se{cursor:nwse-resize;}
+html.pine-pip .pip-messages .pip-system3-stage{scrollbar-width:none!important;overflow-anchor:none;touch-action:pan-y;}
+html.pine-pip .pip-messages .pip-system3-stage::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;}
+.pip-message-settings{position:absolute;z-index:6;right:6px;top:40px;width:min(310px,calc(100vw - 12px));max-height:calc(100vh - 46px);overflow:auto;box-sizing:border-box;pointer-events:auto;background:rgb(var(--pip-surface)/.98);color:var(--pip-text);border:1px solid var(--pip-accent);border-radius:6px;padding:12px;-webkit-app-region:no-drag;}
+.pip-message-settings *{-webkit-app-region:no-drag;}
+.pip-message-settings[hidden]{display:none!important;}
+.pip-message-settings header{display:flex;align-items:center;justify-content:space-between;font-weight:600;}
+.pip-message-settings label{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0;}
+.pip-message-settings select{width:100%;}
+.pip-message-settings input[type=range]{flex:1;min-width:0;accent-color:var(--pip-accent);}
+.pip-message-settings button,.pip-message-settings select{background:var(--pip-button);color:var(--pip-text);border:1px solid var(--pip-accent);border-radius:4px;padding:4px 6px;}
+.pip-message-settings input:disabled{opacity:.4;}
+.pip-message-settings output{min-width:36px;text-align:right;font-variant-numeric:tabular-nums;}
+.pip-message-settings .pip-message-playback{flex-wrap:nowrap;}
+.pip-message-settings small{display:block;color:var(--pip-text);opacity:.75;}
+body.pine-pip-ui-hidden #pinePipWidgets>.pip-message-settings:not([hidden]){display:block!important;}
+body.pine-native-tools .pa-back.pip-popup-visible,body.pine-native-tools .pine-voice-ad-popup.pip-popup-visible{padding:0!important;}
+body.pine-native-tools .pa-back.pip-popup-visible>.pa-box,body.pine-native-tools .pine-voice-ad-popup.pip-popup-visible>.pine-voice-ad-card{width:100%!important;max-width:100%!important;max-height:100%!important;margin:0!important;box-sizing:border-box;}
+
+body.pine-native-tools .pa-box [hidden]{display:none!important;}
+.pip-popup-message{box-sizing:border-box;padding:24px;background:#10171d;color:#edf2f5;font:14px/1.5 system-ui,sans-serif;}
+.pip-popup-message h2{margin:0 0 12px;font-size:18px;}
+.pip-popup-message button{margin:8px 8px 0 0;padding:8px 12px;border:1px solid #59636a;border-radius:5px;background:#20282e;color:#edf2f5;cursor:pointer;}
+
+body.pine-native-tools.pip-popups-open #pineCamBox.pip-popup-visible{display:flex!important;flex-direction:column;border-radius:8px;background:#10171d;}
+body.pine-native-tools #pineCamBox.pip-popup-visible .pine-cam-bar{flex:none;min-height:38px;}
+body.pine-native-tools #pineCamBox.pip-popup-visible #pineCamImg{flex:1;min-height:0;width:100%;height:100%;object-fit:contain;}
+body.pine-native-tools #pineCamBox [hidden]{display:none!important;}
+.pine-cam-offline{flex:1;display:grid;align-content:center;justify-items:center;gap:12px;padding:24px;color:#edf2f5;text-align:center;font:14px/1.5 system-ui,sans-serif;}
+.pine-cam-offline strong{font-size:20px;}.pine-cam-offline p{max-width:540px;margin:0;}
+.pine-cam-offline button{padding:8px 14px;border:1px solid #59636a;border-radius:5px;background:#20282e;color:#edf2f5;cursor:pointer;}
+
+.pine-cam-offline-details{white-space:pre-line;font-size:12px;color:#b6cbd2;}
+
+/* The floating tools own their file, chart and line panels. */
+body.pine-native-tools.pip-popups-open .fm-pop.pip-popup-visible{display:flex!important;overflow:hidden!important;}
+.pip-line-context{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px;border-bottom:1px solid #35414c;background:#10191f;flex:none;}
+.pip-line-context input,.pip-line-context select{box-sizing:border-box;min-height:32px;min-width:0;padding:4px 8px;background:#081013;border:1px solid #35505c;border-radius:5px;color:#dbe6f0;font:12px system-ui;}
+.pip-line-context input{flex:1 1 150px;}.pip-line-context select{flex:2 1 250px;max-width:100%;}.pip-line-context button{height:auto;min-height:32px;}.pip-line-note{font:11px system-ui;color:#8ea0ad;}
+.pip-line-empty{padding:16px;color:#dbe6f0;background:#10191f;}
+body.pine-native-tools.pip-popups-open #pinePipFlowChart.pip-popup-visible{display:flex!important;flex-direction:column;background:#0b1317;}
+#pinePipFlowChart>.fc-pane{flex:1;min-height:0;}
+#pinePipFlowChart>button{align-self:flex-end;flex:none;}
+body.pine-native-tools .la-sheet>.pip-line-context,body.pine-native-tools .ld-box>.pip-line-context,body.pine-native-tools .lr-sheet>.pip-line-context{order:-1;}
+body.pine-native-tools .la-sheet .la-shade{display:none;}
+#pinePipFlowChart .fc-bar{flex-wrap:wrap;}
+
+body.pine-native-tools.pip-popups-open .la-sheet.pip-popup-visible,body.pine-native-tools.pip-popups-open .ld-box.pip-popup-visible,body.pine-native-tools.pip-popups-open .lr-sheet.pip-popup-visible{display:flex!important;flex-direction:column;}
+
+/* Keep orchestra charts, its scrollable controls and command bar in the native pane. */
+body.pine-native-tools.pip-popups-open #pineOrchGlass.pip-popup-visible{display:flex!important;flex-direction:column;overflow:hidden!important;}
+body.pine-native-tools #pineOrchGlass .og-main{flex:1 1 auto;min-height:100px;overflow:auto;}
+body.pine-native-tools #pineOrchGlass .og-viz{flex:0 1 240px;min-height:90px;overflow:auto;}
+body.pine-native-tools #pineOrchGlass .og-s3{max-height:20%;overflow:auto;flex:0 0 auto;}
+
+/* Word Cloud occupies the full native tool content area. */
+body.pine-native-tools.pip-popups-open #pineWin-cloud.pip-popup-visible{display:flex!important;flex-direction:column;overflow:hidden!important;}
+body.pine-native-tools #pineWin-cloud>.pine-win-head{flex:none;display:flex;align-items:center;gap:10px;min-height:34px;padding:4px 10px;box-sizing:border-box;}
+body.pine-native-tools #pineWin-cloud>.pine-win-host{flex:1;min-height:0!important;height:auto!important;position:relative;width:100%;overflow:hidden;background:#04060b;}
+body.pine-native-tools #pineWin-cloud canvas{display:block;}
+.broadcast-cloud-status{flex:1;font:11px system-ui;color:#9cb5c2;text-align:right;}
+
+/* Message-tile-only PiP chrome: controls remain in the context menu. */
+body.pine-pip:not(.pine-native-tools) #pinePipFavorites,
+body.pine-pip:not(.pine-native-tools) #pineExportBar,
+body.pine-pip:not(.pine-native-tools) .pine-window-bar,
+body.pine-pip:not(.pine-native-tools) .pip-audio,
+body.pine-pip:not(.pine-native-tools) .pip-painting,
+body.pine-pip:not(.pine-native-tools) .pip-messages > header {
+  display: none !important;
+}
+
+/* Standard scene frames retain their flex body inside native tools. */
+body.pine-native-tools.pip-popups-open .pine-win.pip-popup-visible{display:flex!important;flex-direction:column;overflow:hidden!important;}
+body.pine-native-tools .pine-win.pip-popup-visible>.pine-win-head{flex:none;}
+body.pine-native-tools .pine-win.pip-popup-visible>.pine-win-host{flex:1;min-height:0!important;height:auto!important;position:relative;overflow:hidden;}
+
+/* Rhetoric Sphere fills its native scene body; density controls stay above it. */
+body.pine-native-tools.pip-popups-open #pineWin-sphere.pip-popup-visible{display:flex!important;flex-direction:column;overflow:hidden!important;}
+body.pine-native-tools #pineWin-sphere>.pine-win-head{flex:none;display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:6px 10px;box-sizing:border-box;}
+body.pine-native-tools #pineWin-sphere>.pine-win-host{flex:1;min-height:0!important;height:auto!important;width:100%;position:relative;overflow:hidden;background:#04060b;}
+body.pine-native-tools #pineWin-sphere canvas{display:block;width:100%;height:100%;}
+.rhetoric-word-control{display:flex;align-items:center;gap:6px;font:12px system-ui;}
+.rhetoric-word-control input{width:clamp(80px,14vw,160px);padding:0;accent-color:#5ec8ff;}
+.rhetoric-word-control output{min-width:3ch;font-variant-numeric:tabular-nums;}
+.rhetoric-word-status{flex:1;font:11px system-ui;color:#9cb5c2;text-align:right;}
+
+/* [pip-shift] One sheet over the whole window while the mode changes: the old
+   view fades out under it, the particles swirl on it, the new view fades in. */
+#pinePipShift { position: fixed; inset: 0; z-index: 2147483647; background: var(--pip-shift-surface, rgb(8 23 19)); opacity: 0; pointer-events: auto; -webkit-app-region: no-drag; transition: opacity var(--pip-shift-in, 240ms) ease-out; }
+#pinePipShift[hidden] { display: none !important; }
+#pinePipShift.on { opacity: 1; }
+#pinePipShift.instant { transition: none; }
+#pinePipShift.leaving { opacity: 0; pointer-events: none; transition: opacity var(--pip-shift-out, 420ms) ease-in; }
+#pinePipShift > canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#pinePipShift > .pip-shift-logo { position: absolute; left: 0; top: 0; width: 64px; height: 64px; opacity: 0; pointer-events: none; user-select: none; -webkit-user-drag: none; will-change: transform, opacity; filter: drop-shadow(0 0 22px color-mix(in srgb, var(--pip-accent, #98e9ae) 45%, transparent)); }
+#pinePipShift > .pip-shift-logo[hidden] { display: none; }
+
+/* [pip-music] The music player is a mini player placed freely: artwork,
+   transport, progress and time; it opens out to the artwork view. Every rule
+   is under .pip-music so a page still running the old strip is untouched. */
+.pip-music { position: absolute; z-index: 5; box-sizing: border-box; display: grid; grid-template-columns: auto auto minmax(0, 1fr); grid-template-areas: "side art keys" "side art seek" "pop pop pop"; align-items: center; column-gap: 8px; row-gap: 3px; width: min(336px, calc(100vw - 8px)); padding: 6px 10px 6px 5px; border-radius: 9px; cursor: grab; touch-action: none; user-select: none; box-shadow: 0 10px 28px rgb(0 0 0 / .45); }
+.pip-music.dragging { cursor: grabbing; opacity: var(--pip-opacity); outline: 1px solid var(--pip-accent); }
+.pip-music:focus-visible { outline: 1px solid var(--pip-accent); }
+.pip-music .pip-music-side { grid-area: side; display: flex; flex-direction: column; gap: 4px; align-self: start; padding-top: 2px; }
+.pip-music .pip-music-side button { width: 15px; height: 15px; padding: 0; border: 0; background: none; display: grid; place-items: center; opacity: .7; cursor: pointer; }
+.pip-music .pip-music-side button:hover, .pip-music .pip-music-side button:focus-visible { opacity: 1; color: var(--pip-accent); }
+.pip-music .pip-music-side svg { width: 13px; height: 13px; }
+.pip-music .pip-music-art, .pip-music .pip-music-blank { grid-area: art; width: 46px; height: 46px; border-radius: 4px; box-sizing: border-box; }
+.pip-music .pip-music-art { object-fit: cover; -webkit-user-drag: none; }
+.pip-music .pip-music-blank { display: grid; place-items: center; background: var(--pip-button, #17382c); color: var(--pip-accent); }
+.pip-music .pip-music-blank svg { width: 22px; height: 22px; }
+.pip-music .pip-music-art[hidden], .pip-music .pip-music-blank[hidden], .pip-music .pip-music-pop[hidden] { display: none; }
+.pip-music .pip-music-info { display: none; min-width: 0; overflow: hidden; }
+.pip-music .pip-music-keys { grid-area: keys; display: flex; align-items: center; justify-content: space-between; gap: 2px; min-width: 0; }
+.pip-music .pip-music-keys button { flex: 0 0 auto; width: 30px; height: 26px; padding: 0; border: 0; border-radius: 5px; background: none; display: grid; place-items: center; cursor: pointer; }
+.pip-music .pip-music-keys button:hover, .pip-music .pip-music-keys button:focus-visible { background: color-mix(in srgb, var(--pip-accent) 18%, transparent); }
+.pip-music .pip-music-keys svg { width: 19px; height: 19px; }
+.pip-music .pip-music-keys .pip-music-play svg { width: 26px; height: 26px; }
+.pip-music .pip-music-keys .pip-music-up, .pip-music .pip-music-keys .pip-music-down { display: none; }
+.pip-music .pip-music-seek { grid-area: seek; display: flex; align-items: center; gap: 8px; min-width: 0; font: 11px/1 system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+.pip-music .pip-music-bar { flex: 1; min-width: 0; height: 4px; border-radius: 2px; overflow: hidden; background: color-mix(in srgb, var(--pip-text, #e1f8ea) 22%, transparent); }
+.pip-music .pip-music-bar i { display: block; height: 100%; width: 0; border-radius: 2px; background: var(--pip-accent); transition: width .45s linear; }
+.pip-music .pip-music-at { order: 2; }
+.pip-music .pip-music-left { display: none; }
+.pip-music .pip-music-pop { grid-area: pop; position: relative; margin-top: 4px; padding: 6px 0 2px; border-top: 1px solid color-mix(in srgb, var(--pip-accent) 25%, transparent); cursor: default; min-width: 0; }
+.pip-music .pip-music-pop header { font-weight: 600; font-size: 11px; padding-right: 22px; margin-bottom: 4px; color: var(--pip-accent); }
+.pip-music .pip-music-pop .pip-music-pop-x { position: absolute; top: 4px; right: 0; width: 18px; height: 18px; padding: 0; border: 0; background: none; display: grid; place-items: center; cursor: pointer; }
+.pip-music .pip-music-pop .pip-music-pop-x svg { width: 14px; height: 14px; }
+.pip-music .pip-music-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pip-music .pip-music-row input { flex: 1; min-width: 0; }
+.pip-music .pip-music-row input[type=search] { background: rgb(0 0 0 / .25); color: inherit; border: 1px solid color-mix(in srgb, var(--pip-accent) 25%, transparent); border-radius: 4px; padding: 3px 6px; font: inherit; user-select: text; }
+.pip-music .pip-music-pop ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+.pip-music .pip-music-pop li { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.pip-music .pip-music-pop li b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.pip-music .pip-music-pop li span { flex: 0 1 auto; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .75; font-size: 11px; }
+.pip-music.expanded { grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "side info" "art art" "keys keys" "seek seek" "pop pop"; width: clamp(196px, calc(100vh - 150px), 250px); max-width: calc(100vw - 8px); padding: 6px 8px 8px; row-gap: 6px; }
+.pip-music.expanded .pip-music-info { grid-area: info; display: block; text-align: center; padding-right: 15px; }
+.pip-music.expanded .pip-music-info b, .pip-music.expanded .pip-music-info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pip-music.expanded .pip-music-info small { opacity: .75; font-size: 11px; }
+.pip-music.expanded .pip-music-art, .pip-music.expanded .pip-music-blank { width: 100%; height: auto; aspect-ratio: 1; max-height: calc(100vh - 150px); min-height: 60px; }
+.pip-music.expanded .pip-music-blank svg { width: 38%; height: 38%; }
+.pip-music.expanded .pip-music-keys { justify-content: space-around; }
+.pip-music.expanded .pip-music-keys .pip-music-up, .pip-music.expanded .pip-music-keys .pip-music-down { display: grid; }
+.pip-music.expanded .pip-music-keys .pip-music-queue, .pip-music.expanded .pip-music-keys .pip-music-find { display: none; }
+.pip-music.expanded .pip-music-at { order: 0; }
+.pip-music.expanded .pip-music-left { display: block; }
+
+/* [pip-free] placed widgets, their grips, the dock hints and the adjust popover */
+#pinePipWidgets .pip-widget.pip-free, #pinePipWidgets .pip-voices.pip-free { position: absolute; z-index: 3; margin: 0; max-width: none; }
+#pinePipWidgets .pip-chat.pip-free { right: auto; bottom: auto; }
+#pinePipWidgets .pip-voices.pip-free { inset: auto; }
+#pinePipWidgets .pip-widget.dragging, #pinePipWidgets .pip-widget.resizing { z-index: 7; transition: none; }
+#pinePipWidgets .pip-widget.pip-free .pip-marquee { flex: 1; min-width: 0; }
+#pinePipWidgets .pip-voices .pip-grip { position: absolute; left: 4px; top: 50%; transform: translateY(-50%); pointer-events: auto; opacity: 0; transition: opacity .2s; z-index: 2; }
+#pinePipWidgets .pip-voices .pip-grip:hover, #pinePipWidgets .pip-voices .pip-grip:focus-visible, #pinePipWidgets .pip-voices.pip-free .pip-grip { opacity: .9; }
+#pinePipWidgets .pip-free-edge { position: absolute; border: 0; padding: 0; margin: 0; background: transparent; z-index: 3; opacity: 0; -webkit-app-region: no-drag; }
+#pinePipWidgets .pip-free:hover > .pip-free-edge, #pinePipWidgets .pip-free.resizing > .pip-free-edge, #pinePipWidgets .pip-free-edge:focus-visible { opacity: 1; }
+#pinePipWidgets .pip-free-edge::after { content: ""; position: absolute; inset: 3px; border-radius: 2px; background: color-mix(in srgb, var(--pip-accent) 70%, transparent); }
+#pinePipWidgets .pip-free-edge.n, #pinePipWidgets .pip-free-edge.s { left: 14px; right: 14px; height: 10px; cursor: ns-resize; }
+#pinePipWidgets .pip-free-edge.e, #pinePipWidgets .pip-free-edge.w { top: 14px; bottom: 14px; width: 10px; cursor: ew-resize; }
+#pinePipWidgets .pip-free-edge.n { top: -5px; } #pinePipWidgets .pip-free-edge.s { bottom: -5px; } #pinePipWidgets .pip-free-edge.e { right: -5px; } #pinePipWidgets .pip-free-edge.w { left: -5px; }
+#pinePipWidgets .pip-free-edge.ne, #pinePipWidgets .pip-free-edge.nw, #pinePipWidgets .pip-free-edge.se, #pinePipWidgets .pip-free-edge.sw { width: 14px; height: 14px; }
+#pinePipWidgets .pip-free-edge.ne { top: -6px; right: -6px; cursor: nesw-resize; } #pinePipWidgets .pip-free-edge.sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+#pinePipWidgets .pip-free-edge.nw { top: -6px; left: -6px; cursor: nwse-resize; } #pinePipWidgets .pip-free-edge.se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+#pinePipWidgets .pip-free-edge.n::after, #pinePipWidgets .pip-free-edge.s::after, #pinePipWidgets .pip-free-edge.e::after, #pinePipWidgets .pip-free-edge.w::after { inset: 4px; }
+#pinePipWidgets.pip-dock-hint-top .pip-dock-top, #pinePipWidgets.pip-dock-hint-bottom .pip-dock-bottom { outline: 2px dashed color-mix(in srgb, var(--pip-accent) 70%, transparent); outline-offset: -3px; min-height: 28px; background: color-mix(in srgb, var(--pip-accent) 10%, transparent); }
+#pinePipWidgets .pip-adjust { position: absolute; z-index: 9; pointer-events: auto; width: 232px; padding: 8px 10px 10px; background: rgb(var(--pip-surface) / .96); color: var(--pip-text); border: 1px solid color-mix(in srgb, var(--pip-accent) 35%, transparent); border-radius: 8px; box-shadow: 0 8px 28px rgb(0 0 0 / .45); font: 12px/1.35 system-ui, sans-serif; -webkit-app-region: no-drag; }
+#pinePipWidgets .pip-adjust header { position: relative; font-weight: 600; font-size: 12px; color: var(--pip-accent); padding-right: 24px; margin-bottom: 6px; }
+#pinePipWidgets .pip-adjust .pip-adjust-x { position: absolute; top: -2px; right: 0; width: 20px; height: 20px; padding: 0; border: 0; background: none; color: inherit; display: grid; place-items: center; cursor: pointer; }
+#pinePipWidgets .pip-adjust .pip-adjust-x svg { width: 14px; height: 14px; }
+#pinePipWidgets .pip-adjust .pip-adjust-row, #pinePipWidgets .pip-adjust .pip-adjust-trim { display: grid; grid-template-columns: 52px 1fr 38px; align-items: center; gap: 6px; margin: 3px 0; }
+#pinePipWidgets .pip-adjust .pip-adjust-trim { grid-template-columns: 44px 1fr 34px; font-size: 11px; }
+#pinePipWidgets .pip-adjust input[type=range] { width: 100%; min-width: 0; margin: 0; }
+#pinePipWidgets .pip-adjust output { text-align: right; font-variant-numeric: tabular-nums; font-size: 11px; opacity: .85; }
+#pinePipWidgets .pip-adjust .pip-adjust-trims { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, var(--pip-accent) 20%, transparent); }
+#pinePipWidgets .pip-adjust .pip-adjust-trims > b { display: block; font-size: 11px; margin-bottom: 2px; }
+#pinePipWidgets .pip-adjust .pip-adjust-keys { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+#pinePipWidgets .pip-adjust .pip-adjust-keys button { flex: 1 1 calc(50% - 4px); padding: 4px 6px; border-radius: 5px; border: 1px solid color-mix(in srgb, var(--pip-accent) 30%, transparent); background: var(--pip-button); color: var(--pip-text); font: inherit; font-size: 11px; cursor: pointer; }
+#pinePipWidgets .pip-adjust .pip-adjust-keys button:hover { border-color: var(--pip-accent); }
+/* [pip-art] the player reduced to its artwork alone */
+.pip-music.art-only { grid-template-columns: auto; grid-template-areas: "art"; width: auto; min-width: 0; padding: 0; background: transparent; border-color: transparent; gap: 0; }
+.pip-music.art-only .pip-music-side, .pip-music.art-only .pip-music-info, .pip-music.art-only .pip-music-keys, .pip-music.art-only .pip-music-seek, .pip-music.art-only .pip-music-pop { display: none; }
+.pip-music.art-only .pip-music-art, .pip-music.art-only .pip-music-blank { grid-area: art; width: 96px; height: 96px; border-radius: 8px; box-shadow: 0 4px 16px rgb(0 0 0 / .45); cursor: pointer; }
+.pip-music.art-only.expanded .pip-music-art, .pip-music.art-only.expanded .pip-music-blank { width: clamp(120px, calc(100vh - 150px), 250px); height: auto; aspect-ratio: 1; }
+/* [pip-levels] every level of the mixer in the player's volume popover */
+.pip-music .pip-music-levels { display: grid; gap: 4px; }
+.pip-music .pip-music-level { display: grid; grid-template-columns: 64px minmax(0, 1fr) 40px; align-items: center; gap: 6px; }
+.pip-music .pip-music-level .pip-music-level-name { font-size: 11px; opacity: .85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pip-music .pip-music-level output { text-align: right; font-size: 11px; font-variant-numeric: tabular-nums; }
+.pip-music .pip-music-level-music .pip-music-level-name { font-weight: 700; opacity: 1; color: var(--pip-accent); }
+.pip-music .pip-music-note { display: block; font-size: 11px; opacity: .75; margin-bottom: 4px; }
+/* [pip-find] the nearest records, as the words are typed */
+.pip-music .pip-music-hints { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; max-height: min(220px, 40vh); overflow: auto; }
+.pip-music .pip-music-hints[hidden] { display: none; }
+.pip-music .pip-music-hints li button { display: grid; width: 100%; text-align: left; padding: 4px 6px; border-radius: 4px; border: 1px solid transparent; background: rgb(0 0 0 / .18); color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.pip-music .pip-music-hints li button:hover, .pip-music .pip-music-hints li.chosen button { border-color: var(--pip-accent); background: color-mix(in srgb, var(--pip-accent) 14%, transparent); }
+.pip-music .pip-music-hints li b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pip-music .pip-music-hints li span { font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* [pip-playbar] 3 px along the foot: green to blue to white across the display; the unlit part is what is left */
+#pinePipWidgets .pip-playbar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; z-index: 6; pointer-events: none; background: linear-gradient(90deg, #22c55e 0%, #3b82f6 55%, #ffffff 100%); clip-path: inset(0 calc(100% - var(--pip-played, 0%)) 0 0); transition: clip-path .25s linear, opacity .3s; }
+#pinePipWidgets .pip-playbar.paused { opacity: .55; }
+#pinePipWidgets .pip-playbar[hidden] { display: none; }
+/* [pip-export-bar] the same bar with the words over it, while an export runs; in PiP and in the full app */
+.pip-exportbar { position: fixed; left: 0; right: 0; bottom: 0; height: 3px; z-index: 2147483000; pointer-events: none; font: 11px/1 system-ui, sans-serif; }
+.pip-exportbar[hidden] { display: none; }
+.pip-exportbar i { position: absolute; inset: 0; background: linear-gradient(90deg, #22c55e 0%, #3b82f6 55%, #ffffff 100%); clip-path: inset(0 calc(100% - var(--pip-done, 0%)) 0 0); transition: clip-path .3s ease-out; }
+.pip-exportbar.busy i { clip-path: none; background: linear-gradient(90deg, transparent 0%, #22c55e 30%, #3b82f6 55%, #ffffff 70%, transparent 100%); background-size: 40% 100%; background-repeat: no-repeat; animation: pip-exportbar-sweep 1.4s linear infinite; }
+.pip-exportbar.failed i { background: #e05252; clip-path: none; }
+.pip-exportbar span { position: absolute; left: 50%; bottom: 7px; transform: translateX(-50%); padding: 4px 10px; border-radius: 10px; background: rgb(0 0 0 / .62); color: #e1f8ea; white-space: nowrap; max-width: 92vw; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+@keyframes pip-exportbar-sweep { from { background-position: -40% 0; } to { background-position: 140% 0; } }
+@media (prefers-reduced-motion: reduce) { .pip-exportbar.busy i { animation: none; background: #3b82f6; } #pinePipWidgets .pip-playbar { transition: none; } }

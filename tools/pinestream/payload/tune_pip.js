@@ -29,7 +29,8 @@
   var box = null, bar = null, shot = null, veil = null, chip = null, what = null;
   var on = false;                 /* the station's word, for this viewer */
   var hidden = false;             /* this viewer's own choice */
-  var state = "off", fps = 2, frameUrl = "", sourceName = "the PineTab", why = "";
+  var state = "off", fps = 30, frameUrl = "", streamUrl = "", sourceName = "the PineTab", why = "";
+  var streamConnected = false, streamRetry = 0;
   var lastFlips = null, newsAt = 0, pending = false, paceMs = 500, drawn = 0;
   try { hidden = localStorage.getItem(HIDE_KEY) === "1"; } catch (e) { hidden = false; }
 
@@ -44,8 +45,7 @@
     return car || road === "funnel";
   }
   function paceFloor() {
-    var every = Math.round(1000 / Math.max(1, Math.min(5, fps || 2)));
-    return onRoad() ? Math.max(2000, every) : every;
+    return Math.round(1000 / Math.max(1, Math.min(60, fps || 30)));
   }
   function stamp(url) {
     return url + (url.indexOf("?") >= 0 ? "&" : "?") + "_=" + Date.now();
@@ -174,6 +174,7 @@
   }
   function hide() {
     hidden = true;
+    stopStream();
     try { localStorage.setItem(HIDE_KEY, "1"); } catch (e) {}
     vcr(false, 0);
     paint();
@@ -185,7 +186,25 @@
     paint();
   }
 
+  function stopStream() {
+    if (!streamConnected) return;
+    streamConnected = false;
+    if (shot) shot.removeAttribute('src');
+  }
   function draw() {
+    if (streamUrl) {
+      if (!on || hidden || document.hidden || !shot || (state !== 'live' && state !== 'waiting')) { stopStream(); return; }
+      if (streamConnected || Date.now() < streamRetry) return;
+      streamConnected = true;
+      shot.onload = function () {
+        if (!streamConnected || !on || hidden || document.hidden) return;
+        drawn += 1;
+        if (state === 'waiting') { state = 'live'; paint(); }
+      };
+      shot.onerror = function () { stopStream(); streamRetry = Date.now() + 300; };
+      shot.src = stamp(streamUrl);
+      return;
+    }
     if (!on || hidden || !frameUrl || state !== "live" || !shot) return;
     if (document.hidden || pending) return;
     pending = true;
@@ -195,7 +214,7 @@
       pending = false;
       var took = Date.now() - t0;
       paceMs = Math.max(paceFloor(), Math.min(6000, Math.round(paceMs * 0.5 + took * 0.8)));
-      if (shot && on && !hidden) { shot.src = img.src; drawn += 1; }
+      if (shot && on && !hidden && !document.hidden && !streamUrl) { shot.src = img.src; drawn += 1; }
     };
     img.onerror = function () {
       pending = false;
@@ -205,7 +224,7 @@
   }
   function drawLoop() {
     try { draw(); } catch (e) { pending = false; }
-    setTimeout(drawLoop, Math.max(paceFloor(), paceMs));
+    setTimeout(drawLoop, streamUrl ? 250 : Math.max(paceFloor(), paceMs));
   }
 
   /* One answer from the station: the pinestream block of /api/pinelink/mine,
@@ -215,8 +234,11 @@
     if (!got || typeof got !== "object") return;
     var want = !!got.show;
     state = String(got.state || (want ? "waiting" : "off"));
-    fps = Number(got.fps) || 2;
+    fps = Number(got.fps) || 30;
     frameUrl = String(got.frame || "");
+    var nextStream = String(got.stream || "");
+    if (nextStream !== streamUrl) { stopStream(); streamRetry = 0; }
+    streamUrl = nextStream;
     sourceName = String(got.source_name || "the PineTab");
     why = String(got.why || "");
     var sw = got.switch || null;
@@ -229,7 +251,7 @@
     }
     if (on) build();
     paint();
-    if (on && !hidden && state === "live") draw();
+    draw();
   }
   async function fallback() {
     if (Date.now() - newsAt < 12000) return;
@@ -237,7 +259,7 @@
       news(await api("/api/pinestream/mine"));
     } catch (e) {
       newsAt = Date.now();
-      if (on) { on = false; vcr(false, 0); paint(); }
+      if (on) { on = false; stopStream(); vcr(false, 0); paint(); }
     }
   }
   function fallbackLoop() {
@@ -245,12 +267,12 @@
     setTimeout(fallbackLoop, document.hidden ? 30000 : 6000);
   }
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) { try { draw(); } catch (e) {} }
+    try { draw(); } catch (e) {}
   });
   window.PineStreamTune = {
     news: news, show: show, hide: hide,
     state: function () {
-      return {on: on, hidden: hidden, picture: state, fps: fps, drawn: drawn, paceMs: paceMs,
+      return {on: on, hidden: hidden, picture: state, fps: fps, drawn: drawn, paceMs: paceMs, transport: streamUrl ? 'live' : 'snapshots', connected: streamConnected,
               vcr: (box && window.PineVcr) ? window.PineVcr.state(box) : (box ? "none" : "unbuilt"),
               chip: !!(chip && !chip.hidden)};
     }

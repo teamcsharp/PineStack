@@ -960,6 +960,7 @@ class Glass {
      * broadcast ring alongside would add megabytes and seconds to a window
      * that cannot play a sound. */
     const silent = !!(options && options.silent);
+    const videoOnly = silent || !!(options && options.video_only === true);
     /* EVERYTHING, UNLESS A NUMBER WAS NAMED.
      *
      * clampSeconds caps at CLIP_MAX, which is the ceiling for RECORDING
@@ -1015,9 +1016,9 @@ class Glass {
        * from here at all. */
       const write = async (many) => page.askJson(`(async function () {
         try {
-          var saved = await window.pineDesktop.replaySave({seconds: ${many.toFixed(2)}});
+          var saved = await window.pineDesktop.replaySave({seconds: ${many.toFixed(2)}, video_only: ${videoOnly}});
           if (!saved || !saved.ok) return JSON.stringify({ok:false, why:(saved && saved.detail) || 'it would not write'});
-          return JSON.stringify({ok:true, bytes:saved.bytes, seconds:saved.seconds});
+          return JSON.stringify({ok:true, bytes:saved.bytes, seconds:saved.seconds, audio:saved.audio});
         } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
       })()`, 60000);
 
@@ -1049,6 +1050,10 @@ class Glass {
         return { ok: false, why: (saved && saved.why) || 'the replay would not be written' };
       }
 
+      if (!videoOnly && (!saved.audio?.present || !saved.audio?.complete)) {
+        return { ok: false, why: saved.audio?.detail || 'The tablet recording does not contain the complete audio mix heard during this video.', audioMeta: saved.audio };
+      }
+
       let heap = await gather(saved);
       if (heap.bad) return { ok: false, why: heap.bad };
 
@@ -1078,6 +1083,9 @@ class Glass {
         if (!saved || !saved.ok) {
           return { ok: false, why: 'stopped, and the shorter clip would not be written' };
         }
+        if (!videoOnly && (!saved.audio?.present || !saved.audio?.complete)) {
+          return { ok: false, why: saved.audio?.detail || 'The shorter tablet recording does not contain the complete captured audio mix.', audioMeta: saved.audio };
+        }
         heap = await gather(saved);
         if (heap.bad) return { ok: false, why: 'stopped, and ' + heap.bad };
       }
@@ -1091,35 +1099,18 @@ class Glass {
           + 's of what had come across');
       }
 
-      /* The same window of the broadcast, out of PineAir's ring. The video
-       * ends NOW, so the audio wanted is the same span ending now. */
+      /* replaySave already muxed timestamped device playback into this MP4.
+       * Keep those samples and their stereo mix. Asking another audio ring
+       * after the download would capture a later window and replace what
+       * the tablet actually played. */
       const audio = { broadcast: null, mic: null };
-      if (silent) {
-        if (isFinite(want) && ran + 0.5 < want) {
-          notes.push('only ' + ran.toFixed(1) + 's had been recorded');
-        }
-        return { ok: true, mp4, bytes: mp4.length, seconds: ran,
-          at: this.now(), audio, notes };
-      }
-      try {
-        const heard = await page.askJson(
-          broadcastQuestion(ran.toFixed(3), '0'), 30000);
-        if (heard && heard.ok) {
-          audio.broadcast = { wav: fromB64(heard.b64), offset: 0 };
-        } else {
-          notes.push('no broadcast audio: ' + ((heard && heard.why) || 'the ring did not answer'));
-        }
-      } catch (error) {
-        notes.push('no broadcast audio: ' + error.message);
-      }
-      /* The microphone is not recorded continuously, so there is no past of
-       * it to fetch. Said once rather than left as a puzzle. */
-      notes.push('no microphone - it is not recorded continuously');
+      const audioMeta = saved.audio || { present: false, complete: false, state: 'unavailable' };
+      if (audioMeta.present) notes.push('captured tablet playback mix, with the recorded levels');
       if (isFinite(want) && ran + 0.5 < want) {
         notes.push('only ' + ran.toFixed(1) + 's had been recorded');
       }
       return { ok: true, mp4, bytes: mp4.length, seconds: ran, at: this.now(),
-        audio, notes };
+        audio, audioMeta, embeddedAudio: !!audioMeta.present, notes };
     } finally {
       await page.close();
     }

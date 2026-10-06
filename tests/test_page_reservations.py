@@ -16,6 +16,11 @@ class PageReservationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.radio = {"on": True, "voice_to": "here", "voice_clips": [], "chat": []}
+        # A previous test's real-time recovery must not contaminate this
+        # test's clock through the independently booked conversation seam.
+        if app._reply_gap is not None:
+            self.stack.enter_context(mock.patch.object(app._reply_gap, "_BOOKED", {"until": 0, "tail": 0}))
+            self.stack.enter_context(mock.patch.object(app._reply_gap, "_LAST_DOOR", {"rows": None, "start": 0}))
         for name, value in {
             "PAGE_RECOVERY_PATH": self.root / "recovery.json", "VOICE_MEDIA_DIR": self.root,
             "_PAGE_RESERVATION_UPDATES": {}, "_PAGE_DELIVERIES": {},
@@ -98,6 +103,7 @@ class PageReservationTests(unittest.IsolatedAsyncioTestCase):
         with (mock.patch.object(app.time, "time", return_value=1000),
               mock.patch.object(app, "require_read_auth"), mock.patch.object(app, "low_note_rate")):
             feed = await app.dj_voice_api(since=999999999)
+        feed = json.loads(feed.body)
         self.assertEqual(feed["clips"], [])
         self.assertEqual(feed["reservation_updates"], [{"delivery_id": "waiting", "broadcast_ms": 1008000}])
         self.assertEqual(clip["broadcast_ms"], 1008000)

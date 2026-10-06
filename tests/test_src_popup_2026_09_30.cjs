@@ -8,9 +8,10 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
-const src = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const rawSrc = fs.readFileSync(path.join(root, 'desktop/renderer/script-page.js'), 'utf8');
+const src = rawSrc.replace(/\r\n/g, '\n');
 const kiosk = path.join(root, 'app/src/main/assets/pine-views/script-page.js');
-if (fs.existsSync(kiosk)) assert.strictEqual(fs.readFileSync(kiosk, 'utf8'), src, 'the kiosk copy is the renderer, byte for byte');
+if (fs.existsSync(kiosk)) assert.strictEqual(fs.readFileSync(kiosk, 'utf8'), rawSrc, 'the kiosk copy is the renderer, byte for byte');
 
 const grab = name => {
   const m = src.match(new RegExp('\\n  function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n  \\}\\n'));
