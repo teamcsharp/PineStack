@@ -1,4 +1,7 @@
 const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
+/* [desk-debug-port] a DevTools port for the live desk, bound to this machine, only while
+   <userData>/debug-port.txt names one - delete the file and relaunch to close it. */
+try { const fs0 = require("node:fs"), path0 = require("node:path"); const port0 = String(fs0.readFileSync(path0.join(app.getPath("userData"), "debug-port.txt"), "utf8")).trim(); if (port0.length >= 4 && port0.length <= 5 && Number.isInteger(Number(port0))) { app.commandLine.appendSwitch("remote-debugging-port", port0); app.commandLine.appendSwitch("remote-allow-origins", "*"); } } catch (_) { /* no flag, no port */ }
 const { spawn, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");

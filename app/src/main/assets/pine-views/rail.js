@@ -178,7 +178,10 @@
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '.pine-view-host.open{display:block}',
     /* Covered panel canvases and meters otherwise keep forcing layout behind the view. */
-    'body:not(.p3-on):has(> .pine-view-host.open) > ',
+    /* [rail-pip] never while the desk is in Pine PiP: the view is hidden there anyway, and hiding <main> with it
+       hides the station webview, which Chromium then starves to one frame a second - the living background,
+       the clips and every panel in it went dark behind a Book View left open (measured 2026-10-06 04:5x) */
+    'body:not(.p3-on):not(.pine-pip):has(> .pine-view-host.open) > ',
     ':is(main,header,#djBar,#activity,#techfeed,#perfHud,#mpxProc,#glyphy){display:none!important}',
     /* The rail must stay reachable over an open view. */
     '.pine-view-host{padding-right:34px}',
