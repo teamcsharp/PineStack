@@ -1,0 +1,13 @@
+{
+  "id": "pineex",
+  "name": "pineEX",
+  "kind": "",
+  "goal": "A ten-second music video for Pine Box FM, cut like a banger. The hook is the first frame: {protagonist} singing straight down the lens to {music}. Not every shot is sung - an insert, one narrative beat, an environment shot, one abstract burst - but the singing is what the video is. The world is branded: {brand} and {brand2} stand in the scene, every surface carrying Pine Box FM. What is sold tonight is {offer}: it is a real object in the star's hands or on the set, pitched by the singing, never by a caption. The moment bleeds in from {gazette} and {research} - a recognisable reference the listener will catch, not a lecture. Tactile, papery, printed textures over a fast, confident camera; one coherent visual identity, never generic AI slop; internet brutalism welcome. The set, the backup dancers and the props are built around {topic}. Accelerate: every shot moves faster than the one before it, and the last frame is the Pine Box FM mark.",
+  "speech": "{speakerbox} Pine Box FM.",
+  "clip": "Create a ten-second Pine Box FM music video from the reference performance. The person on screen is the star: they SING to camera, with K-pop attention direction - cuts on the beat, composition that steers the eye, inserts of the branded world between the sung shots. {goal} Expressive natural motion and clean synchronized singing. No captions; no logos except the Pine Box FM mark on the branded surfaces.",
+  "gallery": "Create a ten-second Pine Box FM music video from the supplied image: the figure or the place in it is the star and the set, singing to camera with K-pop attention direction - cuts on the beat, composition that steers the eye, inserts of the branded world between the sung shots. {goal} Natural motion and synchronized singing. No captions; no logos except the Pine Box FM mark on the branded surfaces.",
+  "host": "The Pine Box host fronts a ten-second Pine Box FM music video at the station - singing, not presenting, with K-pop attention direction and inserts of the branded world. {goal}",
+  "style": "tactile papery print textures, kinetic camera, K-pop attention direction, internet brutalism",
+  "constraints": "Ten seconds. The hook in the first second. No on-screen text except the brand on the surfaces. The product is a real object in frame. One coherent visual identity per video, never generic.",
+  "audio_direction": "They sing the line to the rolled record: the record is the bed, the sung line sits on top, no spoken narration, no sound effects over the singing."
+}
