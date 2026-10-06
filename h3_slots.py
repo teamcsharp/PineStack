@@ -65,9 +65,31 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
     ("releaselog", "The release-log entry of the rolled {feature}: its commits, when they landed, their size and "
                    "what the first one changed - the nuances to pitch. {releaselog2} goes with {feature2}.",
      'the release log of [tablet-update-ask] (1 commit, +46/-12 lines): 60e37c0 "One press builds..." - ...'),
+    # [pineex] wave C: the library, the station's own shop window, the branded
+    # world, the hour's star and what the web says (the operator, 2026-10-06).
+    ("music", "A record rolled from the whole music library - not the one on air ({record} is that): "
+              "title and artist. {music2} rolls a second record.", 'the record "Moonlight Drive" by The Doors'),
+    ("product", "An item sold on Pine Box FM, rolled from the station's own list (data/h3_products.json, grown "
+                "through /api/h3/products) merged with the DJ setting's products to place.",
+     'the product "The Pine Box Gazette" - the station\'s own newspaper, a fresh edition every day'),
+    ("offer", "A roll between a feature and a product: the rolled {feature} together with its release log, or a "
+              "rolled product. {offer2} rolls again.",
+     'the Pine Box feature "One press builds the PineTab" [tablet-update-ask] - the release log of [tablet-update-ask] ...'),
+    ("brand", "A branded surface rolled from the pool (billboards, posters, book covers, propaganda, police cars, "
+              "spaceships, blimps...) carrying the hour's Speakerbox sentence in Pine Box FM livery. {brand2} is a "
+              "second surface with the same words.",
+     'a giant roadside billboard carrying the words "We never sleep" in Pine Box FM livery'),
+    ("protagonist", "Who the piece is about: a roll between the gallery renders and the SFX clips, then a roll "
+                    "between folders, then a roll between the items - and the hourly door makes the video FROM "
+                    "that render or clip. Hourly door only.",
+     'the protagonist is whoever appears in the clip "dog skate", which shows a dog on a skateboard'),
+    ("research", "What the web says about the hour's rolled {topic} (or a Gazette headline): one result rolled "
+                 "from the station's own research road under your per-site preferences. Hourly door only.",
+     'what the web says about "cats on the radio": "Cats take over a local station" - a station in Ohio ...'),
     ("a|b|c", "One of the options you write between the bars, rolled.", "{funny|grim|tender}"),
 )
-NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena", "feature", "releaselog", "book", "booktopic", "bookchapter", "booksegment", "booksentence", "booksentences")
+NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena", "feature", "releaselog", "book", "booktopic", "bookchapter", "booksegment", "booksentence", "booksentences",
+         "music", "product", "offer", "brand", "protagonist", "research")       # [pineex] wave C
 SLOT = re.compile(r"\{((%s)(\d?))\}" % "|".join(NAMED))
 
 SCREENS = (
@@ -237,6 +259,102 @@ def releaselog(f: dict[str, Any], most_commits: int = 3) -> str:
     said = _first_sentence(commits[0].get("body")) if commits else ""
     if said:
         out += " - " + quote(said, 180)
+    return out
+
+
+# --- [pineex] WAVE C: THE LIBRARY, THE SHOP WINDOW, THE BRANDED WORLD, THE STAR, THE WEB --------------
+#
+# The surfaces {brand} rolls over. app.py offers them through System 3's tabled pool
+# (h3.slot_brand), so the desk can retire one; the words on them are the hour's
+# {speakerbox} sentence.
+BRANDED = (
+    "a giant roadside billboard",
+    "a wall of posters pasted down a city street",
+    "the cover of a hardback book",
+    "a propaganda banner hung across a public square",
+    "a police car in station livery",
+    "the hull of a spaceship",
+    "a blimp over the stadium",
+    "a neon sign over a diner",
+    "a cereal box on a breakfast table",
+    "a team's match jerseys",
+    "a vending machine",
+    "a subway car's ad panels",
+    "skywriting over the beach",
+    "a water tower",
+    "a delivery van",
+    "a bus shelter",
+)
+# {protagonist}: the first roll (where the star comes from), then the gallery's two "folders"
+PROTAGONIST_KINDS = ("renders", "clips")
+RENDER_FOLDERS = ("pictures", "videos")
+
+
+def music(row: dict[str, Any]) -> str:
+    """{music}: a record of the library, title by artist."""
+    stem = str(row.get("path") or row.get("name") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    title = quote(row.get("title") or tidy(stem), 80)
+    artist = quote(row.get("artist"), 60)
+    return 'the record "%s"%s' % (title, (" by %s" % artist) if artist else "")
+
+
+def product(row: dict[str, Any]) -> str:
+    """{product}: an item sold on Pine Box FM, with its one-line pitch."""
+    name = quote(row.get("name"), 80)
+    pitch = quote(row.get("pitch"), 160).rstrip(".")
+    return 'the product "%s"%s' % (name, (" - %s" % pitch) if pitch else "")
+
+
+def offer(kind: str, row: dict[str, Any]) -> str:
+    """{offer}: the rolled feature with its release log, or a product."""
+    if kind == "feature":
+        return feature(row) + " - " + releaselog(row)
+    return product(row)
+
+
+def brand(surface: str, sentence: str) -> str:
+    """{brand}: one branded surface carrying the Speakerbox words."""
+    out = str(surface or "a billboard")
+    if sentence:
+        out += ' carrying the words "%s"' % quote(sentence, 120)
+    return out + " in Pine Box FM livery"
+
+
+def clip_words(row: dict[str, Any]) -> str:
+    """What a clip shows (its vision line) or, failing that, what is said in it."""
+    seen = quote(row.get("seen_desc"), 160)
+    said = quote(row.get("said"), 100)
+    if seen:
+        return ", which shows %s" % seen.rstrip(".")
+    if said:
+        return ', in which someone says "%s"' % said
+    return ""
+
+
+def clip_label(row: dict[str, Any]) -> str:
+    """A clip as a line on the rolodex: its name and what it shows or says."""
+    seen = quote(row.get("seen_desc") or row.get("said"), 90)
+    return (tidy(row.get("name")) + ((": " + seen) if seen else ""))[:120]
+
+
+def protagonist(pick: dict[str, Any]) -> str:
+    """{protagonist}: who the star is, in words - the clip and what it shows, or the render."""
+    name = quote(tidy(pick.get("name") or pick.get("file")))
+    if pick.get("kind") == "clips":
+        return 'the protagonist is whoever appears in the clip "%s"%s' % (name, clip_words(pick))
+    what = "video" if pick.get("folder") == "videos" else "picture"
+    return 'the protagonist is the figure in the Pine Box gallery %s "%s"' % (what, name)
+
+
+def research(topic: str, row: dict[str, Any]) -> str:
+    """{research}: one judged web result about the hour's topic."""
+    title = quote(row.get("title"), 120)
+    snippet = quote(row.get("snippet"), 220).rstrip(".")
+    out = 'what the web says about "%s"' % quote(topic, 90)
+    if title:
+        out += ': "%s"' % title
+    if snippet and snippet != title:
+        out += " - " + snippet
     return out
 
 

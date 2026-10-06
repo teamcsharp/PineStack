@@ -101380,6 +101380,14 @@ def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
                      and not (kind == "track_talk"
                               and talk_is_incessant(dj)))):
         return kind, ""
+    # [book-nodes-5] A DYNAMIC SEGMENT'S WINDOW IS STOCK ALREADY. Book Time's parts and the supercut are
+    # written and recorded ahead by their own writers; this policy knew only its own list of prepared
+    # kinds, so on 10-06 at 16:15 CST it swapped the sheet's book_time for a banked call and the segment's
+    # door was never asked. While the window holds a part of its own, the kind stands.
+    if kind in ("book_time", "sfx_supercut"):
+        _owned = globals().get("dynamic_segment_window_owned")
+        if callable(_owned) and _owned():
+            return kind, ""
     runway_left = max(0.0, float(_RADIO.get("resume_runway_until") or 0) - now)
     want, why = "", ""
     try:
@@ -192718,6 +192726,11 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             queued = _parody_stinger_queue().add(payload)
             _parody_stinger_wake.set()
             return ("queued a host stinger (the cast LoRA, %s)" % comfy_workshop.CAST.get("lora"), queued, "host")
+    # [pineex] the hour's {protagonist}, when its preset rolled one: the stinger
+    # is made FROM that clip or render, in place of the gallery-or-clip roll
+    _h3_star = await h3_hourly_protagonist(goal) if globals().get("h3_hourly_protagonist") else None
+    if _h3_star:
+        return _h3_star
     _h3_gallery = False
     if share:
         # [s3-visuals] which source road this hour takes is System 3's pick
@@ -193102,7 +193115,7 @@ def h3_speak_normalize(text: Any) -> str:
 
 
 # [h3-slot-roll] {speakerbox} and {a|b|c} in an hourly prompt are ROLLS
-H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena|feature|releaselog)\d?"   # [h3-slots] = h3_slots.NAMED
+H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena|feature|releaselog|music|product|offer|brand|protagonist|research)\d?"   # [h3-slots] = h3_slots.NAMED less the book slots (book_prompt_runtime fills those) [pineex]
 H3_SLOT_RX = re.compile(r"\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
 H3_SLOT_KEEP_S = 1800.0
 H3_SLOT_OPTS = 40
@@ -193226,6 +193239,16 @@ H3_SLOT_LABELS = {
     # [h3-feature] both ride ONE roll - h3.overview_feature, the technical overview's own die
     "feature": "which tagged release-log feature an hourly H3 prompt's {feature} (and the overview pitch) presents",
     "releaselog": "the release-log entry of the feature {feature} rolled - the same roll",
+    # [pineex] wave C
+    "music": "where in the music library an hourly H3 prompt's {music} lands (0 = first record, 1 = last)",
+    "product": "which item sold on Pine Box FM an hourly H3 prompt's {product} pitches",
+    "offer": "whether an hourly H3 prompt's {offer} is a feature with its release log or a product",
+    "brand": "which branded surface an hourly H3 prompt's {brand} puts the Speakerbox words on",
+    "protagonist_kind": "whether an hourly H3 prompt's {protagonist} comes from the gallery renders or the SFX clips",
+    "protagonist_folder": "which folder (of the clip book, or pictures / videos of the gallery) the {protagonist} is drawn from",
+    "protagonist_clip": "which clip or render of the rolled folder is the hour's {protagonist} - the hourly door renders from it",
+    "research": "which web result about the hour's topic an hourly H3 prompt's {research} quotes",
+    "research_topic": "which Gazette headline the {research} searches for when the hour has no {topic}",
 }
 H3_SLOT_SCREEN_LABEL = "what screen in the scene shows an hourly H3 prompt's {videos} or {sfxclip}"
 
@@ -193273,6 +193296,10 @@ def h3_slot_shelf(name: str) -> Any:
         con = sfx_db_reader()
         with _SFX_DB_LOCK:
             return int(con.execute("SELECT COUNT(*) FROM clips WHERE playable=1").fetchone()[0] or 0)
+    if name == "music":                      # [pineex] the library's size: one float rolls over it, like the clip book
+        return len(music_index())
+    if name == "product":                    # [pineex] the station's list and the DJ setting's products to place
+        return h3_products_shelf()
     return []
 
 
@@ -193357,6 +193384,8 @@ def h3_slot_pick(tok: str, shelf: Any) -> str:
         return str(gazette_prompt.draw(shelf, s3_weighted, _h3_slot_note, tok).get("prompt") or "")
     if name == "gazette":
         labels = [str(e.get("headline") or "")[:120] for e in shelf]
+    elif name == "product":                                              # [pineex]
+        labels = [str(e.get("name") or "")[:120] for e in shelf]
     else:
         labels = [str(x) for x in shelf]
     k = s3_weighted(key, labels, [1.0] * len(labels), H3_SLOT_LABELS[name])
@@ -193373,6 +193402,8 @@ def h3_slot_pick(tok: str, shelf: Any) -> str:
         return h3_slots.arena(got)
     if name == "gazette":
         return h3_slots.gazette(got)
+    if name == "product":                                                # [pineex]
+        return h3_slots.product(got)
     return ""
 
 
@@ -193417,6 +193448,463 @@ async def h3_slot_convograph(tok: str) -> str:
     return h3_slots.convograph(flow)
 
 
+# --- [pineex] WAVE C: {music} {product} {offer} {brand} {protagonist} {research} --------------------
+#
+# "a roll over the music library"; "a rolling roulette of items being sold on
+# the pine box radio chosen at random from a dynamic list we are expanding";
+# "roll between the {releaselog} and {feature} or {product}"; "have the world
+# branded with {speakerbox} billboards ... chosen via roulette"; "it can be
+# anyone selected from comfy UI renders or an SFX clip depending on roulette
+# roll. Roll between using Renders or clips then roll between folders then roll
+# between clips for who is used as the protagonist"; "Use the online research
+# rolls as well in the roulettes" (the operator, 2026-10-06). Every roll is
+# System 3's and lands on the hour's rolodex through _h3_slot_note; the shelves
+# are read off the loop; a slot with nothing to say is taken out and logged.
+#
+# THE PRODUCTS: data/h3_products.json {"products": [{id, name, pitch, added_at}]},
+# seeded on first read with the station's own offerings, grown through
+# /api/h3/products, and merged at roll time with the DJ setting's products to
+# place (dj.sponsors, one per line) so the list the operator already keeps counts.
+H3_PRODUCTS_FILE = "h3_products.json"
+H3_PRODUCTS_MOST = 400
+_H3_PRODUCTS_LOCK = RLock()
+_H3_PRODUCT_ID = re.compile(r"[A-Za-z0-9_-]{1,40}")
+H3_PRODUCTS_SEED: tuple[tuple[str, str, str], ...] = (
+    ("station", "Pine Box FM", "the station itself - two hosts, a studio guest and a music library that never sleeps"),
+    ("pinelive", "PineLive recordings", "every hour of the show kept as a recording you can take home"),
+    ("gazette", "The Pine Box Gazette", "the station's own newspaper, a fresh edition of real and invented news every day"),
+    ("pinetab", "The PineTab kiosk", "a tablet on the wall that listens, watches and plays the station back to you"),
+    ("pinecam", "Pine Cam", "the camera on the desk, filming the hosts and the room as the show goes out"),
+    ("supercut", "The hourly Supercut", "an hourly video advert cut from the footage of the day"),
+    ("mxtape", "MX mixtapes", "mixtapes by Ehm Eckx, the music the station's concerts and dances play to"),
+    ("booktime", "Book Time", "a real book read aloud and argued over on air, chapter by chapter"),
+    ("sfxlib", "The SFX clip library", "thousands of clips, seen and heard, each one findable four ways"),
+    ("speakerbox", "The Speakerbox", "hundreds of hours of people talking, rolled one sentence at a time"),
+    ("gallery", "Pine Box Gallery renders", "pictures and films the station paints itself and hangs on its own wall"),
+)
+H3_OFFER_KINDS = ("a feature", "a product")
+H3_SLOT_RESEARCH_WAIT_S = 20.0
+
+
+def h3_products_path() -> Path:
+    return data_path(H3_PRODUCTS_FILE)
+
+
+def _h3_product_row(raw: Any, pid: str = "") -> dict[str, Any] | None:
+    """One product, clean: an id, a name (required), a one-line pitch, when added."""
+    got = raw if isinstance(raw, dict) else {}
+    name = " ".join(str(got.get("name") or "").split())[:120]
+    if not name:
+        return None
+    want = str(pid or got.get("id") or "")
+    try:
+        added = round(float(got.get("added_at") or time.time()), 3)
+    except (TypeError, ValueError):
+        added = round(time.time(), 3)
+    return {"id": want if _H3_PRODUCT_ID.fullmatch(want) else "pr-" + uuid.uuid4().hex[:10],
+            "name": name, "pitch": " ".join(str(got.get("pitch") or "").split())[:300], "added_at": added}
+
+
+def h3_products_seed() -> dict[str, Any]:
+    now = round(time.time(), 3)
+    return {"version": 1, "products": [{"id": i, "name": n, "pitch": p, "added_at": now} for i, n, p in H3_PRODUCTS_SEED]}
+
+
+def _h3_products_write(store: dict[str, Any]) -> None:
+    path = h3_products_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def h3_products_read() -> dict[str, Any]:
+    """[pineex] The products file, seeded with the station's own offerings on
+    first read (and written, so the operator can see and edit it). An
+    unreadable file is left alone and the seed serves. A worker thread's."""
+    path = h3_products_path()
+    with _H3_PRODUCTS_LOCK:
+        try:
+            got = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            got = None
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 products: %s could not be read (%s) - the seed list serves this hour"
+                         % (path.name, type(exc).__name__))
+            return h3_products_seed()
+        if not isinstance(got, dict) or not isinstance(got.get("products"), list):
+            store = h3_products_seed()
+            _h3_products_write(store)
+            pipeline_log("ads", "hourly H3 products: %s seeded with %d of the station's own offerings [pineex]"
+                         % (path.name, len(store["products"])))
+            return store
+        rows: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        for raw in got["products"][:H3_PRODUCTS_MOST]:
+            row = _h3_product_row(raw)
+            if row and row["id"] not in ids:
+                ids.add(row["id"])
+                rows.append(row)
+        return {"version": 1, "products": rows}
+
+
+def h3_products_shelf(store: Any = None, sponsors: Any = None) -> list[dict[str, Any]]:
+    """[pineex] What {product} rolls over: the file's products, then the DJ
+    setting's products to place (dj.sponsors) not already named. A worker thread's."""
+    store = store if isinstance(store, dict) else h3_products_read()
+    rows = [dict(r) for r in store.get("products") or [] if isinstance(r, dict) and r.get("name")]
+    names = {str(r["name"]).lower() for r in rows}
+    lines = sponsors if isinstance(sponsors, list) else (dj_settings().get("sponsors") or [])
+    for n, line in enumerate(lines):
+        name = " ".join(str(line or "").split())[:120]
+        if name and name.lower() not in names:
+            names.add(name.lower())
+            rows.append({"id": "dj-%d" % (n + 1), "name": name, "pitch": "", "added_at": 0.0, "from": "dj.sponsors"})
+    return rows[:H3_PRODUCTS_MOST]
+
+
+def h3_products_view(store: Any = None) -> dict[str, Any]:
+    store = store if isinstance(store, dict) else h3_products_read()
+    shelf = h3_products_shelf(store)
+    return {"ok": True, "file": H3_PRODUCTS_FILE, "products": list(store.get("products") or []),
+            "sponsors": [r for r in shelf if r.get("from") == "dj.sponsors"], "count": len(shelf)}
+
+
+def h3_products_add(name: str, pitch: str = "") -> dict[str, Any]:
+    """[pineex] One more item on the list (a name, a one-line pitch); never a twin by name."""
+    row = _h3_product_row({"name": name, "pitch": pitch})
+    if not row:
+        raise HTTPException(status_code=400, detail="A product needs a name")
+    with _H3_PRODUCTS_LOCK:
+        store = h3_products_read()
+        if any(str(r.get("name") or "").lower() == row["name"].lower() for r in store["products"]):
+            raise HTTPException(status_code=409, detail="That product is on the list already")
+        if len(store["products"]) >= H3_PRODUCTS_MOST:
+            raise HTTPException(status_code=409, detail="The list holds %d products already" % H3_PRODUCTS_MOST)
+        store["products"].append(row)
+        _h3_products_write(store)
+    pipeline_log("ads", 'hourly H3 products: "%s" added (%d on the list) [pineex]' % (row["name"], len(store["products"])))
+    return h3_products_view(store)
+
+
+def h3_products_delete(pid: str) -> dict[str, Any]:
+    """[pineex] Take an item off the list (a dj.sponsors line is the DJ settings' to edit)."""
+    with _H3_PRODUCTS_LOCK:
+        store = h3_products_read()
+        keep = [r for r in store["products"] if str(r.get("id")) != str(pid)]
+        if len(keep) == len(store["products"]):
+            raise HTTPException(status_code=404, detail="No such product")
+        store["products"] = keep
+        _h3_products_write(store)
+    pipeline_log("ads", "hourly H3 products: %s removed (%d on the list) [pineex]" % (pid, len(keep)))
+    return h3_products_view(store)
+
+
+def h3_slot_topic() -> str:
+    """[pineex] The hour's {topic}: rolled as h3_speak_fill always rolled it
+    (h3.plot_topic over the topic bank), once, and kept on the slot memo so the
+    hour's text and its {research} agree."""
+    vals = _H3_SLOT_MEMO["vals"]
+    if isinstance(vals.get("topic"), str):
+        return vals["topic"]
+    choices = [str(t.get("text") or t.get("topic") or "") if isinstance(t, dict) else str(t) for t in read_bombshells()]
+    choices = [x for x in choices if x.strip()]
+    got = str(s3_choice("h3.plot_topic", choices, "which topic an H3 prompt uses") or "") if choices else ""
+    if got:
+        _h3_slot_note("slot_topic", "h3.plot_topic", choices, got)
+    vals["topic"] = got
+    return got
+
+
+# {music}: the clip book's pattern - one float over the whole library (36,000
+# records are no pool for the rolodex), the record at that point.
+def h3_slot_music_row(u: float, total: int) -> dict[str, Any]:
+    """The record at `u` of the library. A worker thread's (the index is cached)."""
+    rows = music_index()
+    if not rows:
+        return {}
+    at = max(0, min(len(rows) - 1, int(float(u) * len(rows))))
+    r = rows[at] if isinstance(rows[at], dict) else {}
+    return {"id": str(r.get("id") or ""), "title": str(r.get("title") or ""),
+            "artist": str(r.get("artist") or ""), "path": str(r.get("path") or "")}
+
+
+def _h3_slot_music_roll(tok: str, total: int) -> float | None:
+    if not total:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - the music library is empty, taken out" % tok)
+        return None
+    u = s3_roll("h3.slot_music", H3_SLOT_LABELS["music"])
+    h3_hourly_roll_note("slot_" + tok, "h3.slot_music")
+    return float(u)
+
+
+def _h3_slot_music_said(tok: str, row: dict[str, Any]) -> str:
+    if not row:
+        return ""
+    got = _H3_HOURLY_ROLLS.get("slot_" + tok)
+    if isinstance(got, dict):
+        got["picked"] = ("%s - %s" % (row.get("title") or "", row.get("artist") or ""))[:300]
+    return h3_slots.music(row)
+
+
+async def h3_slot_music(tok: str) -> str:
+    total = int(await asyncio.to_thread(h3_slot_shelf, "music") or 0)
+    u = _h3_slot_music_roll(tok, total)
+    if u is None:
+        return ""
+    return _h3_slot_music_said(tok, await asyncio.to_thread(h3_slot_music_row, u, total))
+
+
+def h3_slot_music_sync(tok: str) -> str:
+    total = int(h3_slot_shelf("music") or 0)
+    u = _h3_slot_music_roll(tok, total)
+    if u is None:
+        return ""
+    return _h3_slot_music_said(tok, h3_slot_music_row(u, total))
+
+
+# {offer}: a feature (with its release log - h3_feature_take, so {feature} and
+# {releaselog} elsewhere in the hour agree) or a product.
+def _h3_slot_offer_kind(tok: str) -> str:
+    kinds = list(H3_OFFER_KINDS)
+    got = s3_choice("h3.slot_offer", kinds, H3_SLOT_LABELS["offer"])
+    got = got if got in kinds else kinds[0]
+    _h3_slot_note("slot_" + tok, "h3.slot_offer", kinds, got)
+    return got
+
+
+def _h3_slot_offer_said(tok: str, kind: str, feats: Any, products: Any) -> str:
+    digit = tok[len("offer"):]
+    if kind == "a feature":
+        f = h3_feature_take(feats, digit)
+        if f:
+            return h3_slots.offer("feature", f)
+        pipeline_log("ads", "hourly H3 prompts: {%s} rolled a feature but the release log has none - a product instead" % tok)
+    shelf = [p for p in (products if isinstance(products, list) else h3_products_shelf()) if isinstance(p, dict)]
+    if not shelf:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - nothing to offer, taken out" % tok)
+        return ""
+    labels = [str(e.get("name") or "")[:120] for e in shelf]
+    k = s3_weighted("h3.slot_product", labels, [1.0] * len(labels), H3_SLOT_LABELS["product"])
+    k = k if isinstance(k, int) and 0 <= k < len(labels) else 0
+    _h3_slot_note("slot_" + tok + "_product", "h3.slot_product", labels, labels[k])
+    return h3_slots.offer("product", shelf[k])
+
+
+async def h3_slot_offer(tok: str) -> str:
+    kind = _h3_slot_offer_kind(tok)
+    feats: Any = None
+    products: Any = None
+    if kind == "a feature":
+        feats = h3_feature_pool()
+        if not feats:
+            try:
+                feats = h3_feature_pool(await asyncio.wait_for(asyncio.to_thread(_CHANGELOG.page, 300), timeout=5.0))
+            except Exception:  # noqa: BLE001 - no release log: a product is offered instead
+                feats = {}
+    if kind != "a feature" or not feats:
+        products = await asyncio.to_thread(h3_products_shelf)
+    return _h3_slot_offer_said(tok, kind, feats, products)
+
+
+def h3_slot_offer_sync(tok: str) -> str:
+    kind = _h3_slot_offer_kind(tok)
+    return _h3_slot_offer_said(tok, kind, None, h3_products_shelf() if kind != "a feature" else None)
+
+
+# {brand}: a surface from the tabled pool (the desk can retire one), carrying
+# the hour's {speakerbox} sentence - one roll of the sentence, shared with the
+# text's own {speakerbox} through the memo; each digit is its own surface.
+def h3_slot_brand(tok: str) -> str:
+    pool = [s for s in (s3_pool("h3.slot_brand", h3_slots.BRANDED, H3_SLOT_LABELS["brand"]) or [])
+            if s in h3_slots.BRANDED] or list(h3_slots.BRANDED)
+    surface = s3_choice("h3.slot_brand", pool, H3_SLOT_LABELS["brand"], tabled=False)
+    surface = surface if surface in pool else pool[0]
+    _h3_slot_note("slot_" + tok, "h3.slot_brand", pool, surface)
+    vals = _H3_SLOT_MEMO["vals"]
+    if not isinstance(vals.get("speakerbox"), str):
+        vals["speakerbox"] = _h3_slot_speakerbox()
+    return h3_slots.brand(surface, vals["speakerbox"])
+
+
+# {protagonist}: renders or clips, then a folder, then the one - three rolls,
+# each on the rolodex; the pick is kept on the memo for the hourly door, which
+# renders the hour FROM it (h3_hourly_protagonist). The door's only: the pick
+# routes the hour's source.
+def h3_slot_clip_folders() -> list[str]:
+    """The clip book's folders holding a playable video clip, fullest first. A worker thread's."""
+    con = sfx_db_reader()
+    with _SFX_DB_LOCK:
+        rows = con.execute("SELECT folder, COUNT(*) AS n FROM clips WHERE playable=1 AND video=1 "
+                           "GROUP BY folder ORDER BY n DESC").fetchall()
+    return [str(r[0]) for r in rows if r[0]][:H3_SLOT_SHELF_MOST]
+
+
+def h3_slot_clip_rows(folder: str) -> list[dict[str, Any]]:
+    """One folder's playable video clips, the newest indexed first: sid, name,
+    seconds and what each shows or says. A worker thread's."""
+    con = sfx_db_reader()
+    with _SFX_DB_LOCK:
+        try:
+            rows = con.execute("SELECT sid, name, seconds, COALESCE(seen_desc,''), COALESCE(said,'') FROM clips "
+                               "WHERE playable=1 AND video=1 AND folder=? ORDER BY seen_at DESC, name LIMIT ?",
+                               (folder, H3_SLOT_SHELF_MOST)).fetchall()
+        except Exception:  # noqa: BLE001 - a book without the vision and speech columns
+            rows = con.execute("SELECT sid, name, seconds, '', '' FROM clips WHERE playable=1 AND video=1 AND folder=? "
+                               "ORDER BY seen_at DESC, name LIMIT ?", (folder, H3_SLOT_SHELF_MOST)).fetchall()
+    return [{"sid": str(r[0] or ""), "name": str(r[1] or ""), "seconds": round(float(r[2] or 0), 2),
+             "seen_desc": str(r[3] or ""), "said": str(r[4] or "")} for r in rows if r[0]]
+
+
+def _h3_slot_protagonist_roll(tok: str, stage: str, labels: list[str]) -> int:
+    key = "h3.slot_protagonist_" + stage
+    k = s3_weighted(key, [str(x)[:120] for x in labels], [1.0] * len(labels), H3_SLOT_LABELS["protagonist_" + stage])
+    k = k if isinstance(k, int) and 0 <= k < len(labels) else 0
+    _h3_slot_note("slot_" + tok + "_" + stage, key, [str(x) for x in labels], str(labels[k]))
+    return k
+
+
+async def h3_slot_protagonist(tok: str) -> str:
+    kinds = list(h3_slots.PROTAGONIST_KINDS)
+    kind = kinds[_h3_slot_protagonist_roll(tok, "kind", kinds)]
+    pick: dict[str, Any] = {}
+    if kind == "clips":
+        folders = await asyncio.to_thread(h3_slot_clip_folders)
+        if folders:
+            folder = folders[_h3_slot_protagonist_roll(tok, "folder", folders)]
+            rows = await asyncio.to_thread(h3_slot_clip_rows, folder)
+            if rows:
+                row = rows[_h3_slot_protagonist_roll(tok, "clip", [h3_slots.clip_label(r) for r in rows])]
+                pick = {"kind": "clips", "folder": folder, "sid": row["sid"], "name": row["name"],
+                        "seconds": row["seconds"], "seen_desc": row["seen_desc"], "said": row["said"]}
+        if not pick:
+            pipeline_log("ads", "hourly H3 prompts: {%s} rolled the clips but the book has no playable video clip - "
+                                "the renders instead" % tok)
+            kind = "renders"
+    if kind == "renders":
+        folders = list(h3_slots.RENDER_FOLDERS)
+        folder = folders[_h3_slot_protagonist_roll(tok, "folder", folders)]
+        items = list(await asyncio.to_thread(h3_slot_shelf, "arena" if folder == "pictures" else "videos") or [])
+        if not items:
+            other = "videos" if folder == "pictures" else "pictures"
+            items = list(await asyncio.to_thread(h3_slot_shelf, "arena" if other == "pictures" else "videos") or [])
+            if items:
+                pipeline_log("ads", "hourly H3 prompts: {%s} rolled the gallery %s but there are none - the %s instead"
+                             % (tok, folder, other))
+                folder = other
+        if items:
+            file = items[_h3_slot_protagonist_roll(tok, "clip", [h3_slots.tidy(x) for x in items])]
+            pick = {"kind": "renders", "folder": folder, "file": str(file), "name": str(file)}
+    if not pick:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - no clip and no render to star, taken out" % tok)
+        _H3_SLOT_MEMO.pop("protagonist", None)
+        return ""
+    pick["words"] = h3_slots.protagonist(pick)
+    _H3_SLOT_MEMO["protagonist"] = pick
+    _H3_SLOT_MEMO["protagonist_at"] = _H3_SLOT_MEMO["at"]
+    return pick["words"]
+
+
+async def h3_hourly_protagonist(goal: str) -> tuple[str, Any, str] | None:
+    """[pineex] The hour's source when its preset rolled a {protagonist}: the
+    stinger is made FROM the rolled clip or render. A clip rides the clip road
+    (voice_ad_render, the clip its reference); a gallery picture the gallery
+    road; a gallery video the Workshop's own "generation" reference road
+    (workshop_source_path resolves a COMFY_OUTPUT video to a video reference;
+    voice_ad_render takes only clip-book sids). The pick is written on the hour
+    as its "source" roll. None when the hour has no protagonist: the source
+    rolls as it always has."""
+    star = _H3_SLOT_MEMO.get("protagonist")
+    if not isinstance(star, dict) or not star or _H3_SLOT_MEMO.get("protagonist_at") != _H3_SLOT_MEMO["at"]:
+        return None
+    words = str(star.get("words") or "")[:200]
+    rec = dict(_h3_slot_last("h3.slot_protagonist_kind"), key="h3.slot_protagonist_kind", picked=words)
+    if star.get("kind") == "clips" and star.get("sid"):
+        clip = {"id": str(star["sid"]), "name": str(star.get("name") or "clip")[:120],
+                "seconds": round(float(star.get("seconds") or 0), 2), "video": True,
+                "match": "the hour's protagonist, from the clip book folder %s" % str(star.get("folder") or "")[:80]}
+        trims: dict[str, Any] = {}
+        if clip["seconds"] > 0:
+            trim_in, trim_out = h3_hourly_window(clip)
+            h3_hourly_roll_note("marker", "h3.hourly_marker")
+            trims = {"trim_in_s": trim_in, "trim_out_s": trim_out}
+        h3_hourly_roll_note("source", "h3.slot_protagonist_kind", rec=rec)
+        h3_hourly_rolls_bind(goal)
+        message, job = await voice_ad_render(goal, reference_clip=clip, hourly=True, **trims)
+        pipeline_log("ads", "hourly H3: the protagonist is the clip %s (%s) [pineex]" % (clip["name"], clip["id"]))
+        return ("%s - the protagonist is the clip %s" % (message, clip["name"]), job, "clip")
+    file = str(star.get("file") or "")
+    if star.get("kind") == "renders" and file:
+        video = file.lower().endswith((".mp4", ".webm"))
+        h3_hourly_roll_note("source", "h3.slot_protagonist_kind", rec=rec)
+        h3_hourly_rolls_bind(goal)
+        payload = {"mode": "reference", "purpose": "parody_stinger", "source": file,
+                   "source_type": "generation" if video else "gallery", "speech": voice_ad_spoken_copy(goal),
+                   "prompt": ("Create a Pine Box FM stinger using the supplied %s; the figure in it is the "
+                              "protagonist. Natural motion and synchronized spoken dialogue. No captions or logos. "
+                              % ("video" if video else "image")) + goal,
+                   "duration_mode": "at_least", "steps": 4, "air_it": False, "hourly": True}
+        if video:
+            payload["at_share"] = s3_roll("ad.voice_at_share",
+                                          "where in its source clip a voice ad's performance is taken (a share of the clip)")
+        queued = _parody_stinger_queue().add(payload)
+        _parody_stinger_wake.set()
+        pipeline_log("ads", "hourly H3: the protagonist is the gallery %s %s [pineex]" % ("video" if video else "picture", file))
+        return ("queued a protagonist stinger from the gallery %s %s" % ("video" if video else "picture", file),
+                queued, "gallery video" if video else "gallery image")
+    return None
+
+
+# {research}: the hour's {topic} (one roll, shared) or a rolled Gazette headline,
+# through the station's own research road - one search, kept an hour, judged
+# under the operator's per-site word - waited for at most
+# H3_SLOT_RESEARCH_WAIT_S; one judged result rolled. The door's only: it awaits the web.
+async def h3_slot_research(tok: str) -> str:
+    topic = h3_slot_topic()
+    if not topic:
+        rows = await asyncio.to_thread(h3_slot_shelf, "gazette")
+        heads = [str(r.get("headline") or "")[:120] for r in (rows or []) if isinstance(r, dict) and r.get("headline")]
+        if heads:
+            k = s3_weighted("h3.slot_research_topic", heads, [1.0] * len(heads), H3_SLOT_LABELS["research_topic"])
+            k = k if isinstance(k, int) and 0 <= k < len(heads) else 0
+            _h3_slot_note("slot_" + tok + "_topic", "h3.slot_research_topic", heads, heads[k])
+            topic = heads[k]
+    if not topic:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - no topic and no Gazette headline to search, taken out" % tok)
+        return ""
+    if not settings_web_search():
+        pipeline_log("ads", "hourly H3 prompts: {%s} - the web search is off in settings, taken out" % tok)
+        return ""
+    key = _s3_research_key(topic)
+    _s3_research_load()
+    held = _S3_RESEARCH.get(key) or {}
+    if not held or time.time() - float(held.get("at") or 0) > S3_RESEARCH_KEEP_S:
+        if key not in _S3_RESEARCH_BUSY:
+            _S3_RESEARCH_BUSY.add(key)
+            try:
+                await asyncio.wait_for(_s3_research_fetch(key, clean_search_query(topic)[:200]),
+                                       timeout=H3_SLOT_RESEARCH_WAIT_S)
+            except Exception as exc:  # noqa: BLE001 - a slow web is a slot taken out, never a lost hour
+                pipeline_log("ads", "hourly H3 prompts: {%s} - the search did not answer in %.0f s (%s)"
+                             % (tok, H3_SLOT_RESEARCH_WAIT_S, type(exc).__name__))
+        else:
+            waited = 0.0
+            while key in _S3_RESEARCH_BUSY and waited < H3_SLOT_RESEARCH_WAIT_S:
+                await asyncio.sleep(0.5)
+                waited += 0.5
+        held = _S3_RESEARCH.get(key) or {}
+    rows = [r for r in (held.get("results") or []) if isinstance(r, dict)
+            and r.get("verdict") in ("used", "spare") and (r.get("snippet") or r.get("title"))]
+    if not rows:
+        pipeline_log("ads", 'hourly H3 prompts: {%s} - the web had nothing usable on "%s", taken out' % (tok, topic[:60]))
+        return ""
+    labels = [str(r.get("title") or r.get("snippet") or "")[:120] for r in rows]
+    k = s3_weighted("h3.slot_research", labels, [1.0] * len(labels), H3_SLOT_LABELS["research"])
+    k = k if isinstance(k, int) and 0 <= k < len(labels) else 0
+    _h3_slot_note("slot_" + tok, "h3.slot_research", labels, labels[k])
+    return h3_slots.research(topic, rows[k])
+
+
 async def h3_slots_preroll(*texts: Any) -> dict[str, str]:
     """[h3-slots] Every named slot in the texts, rolled before the hour is
     resolved, into the memo h3_slots_roll fills from. A slot that faults is
@@ -193441,6 +193929,16 @@ async def h3_slots_preroll(*texts: Any) -> dict[str, str]:
                 got = await h3_slot_sfxclip(tok)
             elif name == "convograph":
                 got = await h3_slot_convograph(tok)
+            elif name == "music":                                          # [pineex] wave C
+                got = await h3_slot_music(tok)
+            elif name == "offer":
+                got = await h3_slot_offer(tok)
+            elif name == "brand":
+                got = h3_slot_brand(tok)
+            elif name == "protagonist":
+                got = await h3_slot_protagonist(tok)
+            elif name == "research":
+                got = await h3_slot_research(tok)
             else:
                 got = h3_slot_pick(tok, await asyncio.to_thread(h3_slot_shelf, name))
         except Exception as exc:  # noqa: BLE001
@@ -193456,11 +193954,17 @@ def h3_slot_named_sync(tok: str) -> str:
     """[h3-slots] A named slot the door did not pre-roll, rolled where it is
     filled (blocking reads; small). {convograph} needs the door."""
     name = h3_slots.base(tok)
-    if name == "convograph":
+    if name in ("convograph", "protagonist", "research"):                  # [pineex] System 3's store, the source route, the web
         pipeline_log("ads", "hourly H3 prompts: {%s} is rolled by the hourly door only - taken out here" % tok)
         return ""
     if name in ("feature", "releaselog"):                                 # [h3-feature]
         return h3_slot_feature(tok)
+    if name == "music":                                                  # [pineex] wave C
+        return h3_slot_music_sync(tok)
+    if name == "offer":
+        return h3_slot_offer_sync(tok)
+    if name == "brand":
+        return h3_slot_brand(tok)
     if name == "sfxclip":
         total = int(h3_slot_shelf("sfxclip") or 0)
         if not total:
@@ -193479,9 +193983,7 @@ def h3_speak_fill(template: Any, quiet: bool = False, **values: Any) -> str:
     if "{activeplot}" in str(template):
         values.setdefault("activeplot", h3_plotline.describe(h3_plot_active()))
     if "{topic}" in str(template):
-        choices = [str(t.get("text") or t.get("topic") or "") if isinstance(t, dict) else str(t) for t in read_bombshells()]
-        choices = [x for x in choices if x.strip()]
-        values.setdefault("topic", s3_choice("h3.plot_topic", choices, "which topic an H3 prompt uses") if choices else "")
+        values.setdefault("topic", h3_slot_topic())            # [pineex] one roll per hour, shared with {research}
     values.setdefault("station", h3_speak_station())
     values.setdefault("hour", time.strftime("%H:%M"))
     out, left = h3_speak.clean_placeholders(h3_prompts_fill(template, **values))
@@ -194873,6 +195375,30 @@ async def h3_prompts_delete_api(pid: str, authorization: str | None = Header(def
     """[h3-prompts] Delete a preset (never the last)."""
     require_auth(authorization)
     return await asyncio.to_thread(h3_prompts_delete, pid[:40])
+
+
+# --- [pineex] THE PRODUCTS API: the list {product} rolls over, grown from the desk -----------------
+@app.get("/api/h3/products")
+async def h3_products_get(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[pineex] What {product} rolls over: the station's own list (data/h3_products.json,
+    seeded with its offerings) and the DJ setting's products to place."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(h3_products_view)
+
+
+@app.post("/api/h3/products")
+async def h3_products_add_api(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[pineex] {name, pitch}: one more item on the list."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_products_add, str(body.get("name") or ""), str(body.get("pitch") or ""))
+
+
+@app.post("/api/h3/products/{pid}/delete")
+async def h3_products_delete_api(pid: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[pineex] Take an item off the list (a dj.sponsors line is the DJ settings' to edit)."""
+    require_auth(authorization)
+    return await asyncio.to_thread(h3_products_delete, pid[:40])
 
 
 # [h3-base] THE BASE PRESETS. Each joins the saved presets ONCE (its id is
