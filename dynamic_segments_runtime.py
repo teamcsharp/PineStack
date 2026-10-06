@@ -1001,7 +1001,7 @@ class DynamicSegments:
     # dictate how they respond" (operator, 2026-10-06). Written and banked when the
     # supercut is prepared (road supercut_react, legs + REACT1 stances), aired
     # straight after it from the shelf; live when the shelf holds none.
-    BOOK_REMAKE_SECONDS = 45.0          # [book-nodes-3] the door's wait for a part's missing takes to be re-made
+    BOOK_REMAKE_SECONDS = 90.0          # [book-nodes-3] the door's wait for a part's missing takes to be re-made ([book-nodes-6] 45 -> 90)
     REACT_ROAD = 'supercut_react'
     REACT_LINES = 4
 
@@ -1132,6 +1132,13 @@ class DynamicSegments:
                 'preparation': copy.deepcopy(dict(list(self.last.items())[-20:])),
                 'templates': {kind: dynamic_segments.template(kind) for kind in dynamic_segments.TEMPLATES}}
 
+    def unvoiced_parts(self, due):
+        """[book-nodes-6] The occurrence's parts that are not ready to air, by the station's own readiness rule -
+        the ones prepare_book's pending road voices next (the opening first)."""
+        ready = self.original.get('dialogue_row_ready') or (lambda kind, row: True)
+        rows = [row for row in self.book_rows(self.occurrence(due)) if not row.get('dynamic_handed_off')]
+        return sorted([row for row in rows if not ready('banter', row)], key=self.book_order)
+
     async def worker(self):
         while True:
             try:
@@ -1151,7 +1158,14 @@ class DynamicSegments:
                             and due.get('kind') == 'book_time'
                             and float(due.get('starts_in', due.get('in_seconds', 0)) or 0) <= 1200):
                         rows = self.book_rows(self.occurrence(due))
-                        if rows and all(self.original['dialogue_row_ready']('banter', row) for row in rows) and not self.book_coverage(due, rows)['ready']:
+                        # [book-nodes-6] THE PART WITH A TAKE MISSING IS THE ONE THAT NEEDS THE PASS. This asked for
+                        # every part to be ready before it would send the pass whose pending road voices the one
+                        # that is not - so the 16:45 opening on 10-06 stood at 3 of 10 takes for an hour. A voicing
+                        # pass is not a writing pass: the larder writer's flag does not hold it.
+                        if rows and self.unvoiced_parts(due):
+                            await self.prepare_book(due)
+                            break
+                        if rows and not self.book_coverage(due, rows)['ready']:
                             if not self.g.get('_LARDER_WRITING', [False])[0]:
                                 await self.prepare_book(due)
                                 break
