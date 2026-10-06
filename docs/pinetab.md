@@ -675,6 +675,8 @@ z-index bands: views 2147483000, rail 2147483001, trace console ...004, SC pop-u
 
 ## 0.6 Putting your own app on the tablet
 
+> 2026-10-06: the current build-and-push loop for a third-party app, the toolchain it reuses, platform signing when needed, and how an app reaches the screen ring, the camera and the second Wi-Fi link are gathered in §0.13.
+
 ### 0.6.1 Install
 
 ```sh
@@ -1247,6 +1249,163 @@ cd /c/_tools/pinebox-android/PineBoxKiosk && ./deploy.sh && $ADB $D shell "am st
 - `desktop/android-build.cjs` cannot deploy the kiosk correctly (debug key); `deploy.sh` is the only road.
 - `app.py` registers `/api/dj/video` twice; the first (`dj_video_api`, `{clips}`) is live and, being `require_read_auth`, is open on the public door without a token.
 - Two `adb.exe` copies at `C:\_tools\platform-tools` and `C:\_tools\android-sdk\platform-tools`; same version, either works.
+
+---
+
+## 0.13 Third-party builds, pushing to the tablet, and the services (2026-10-06)
+
+This section is the current answer to "I have my own app and I want it on
+the PineTab, built with Gradle on my own machine, talking to the station and
+using what the tablet already does - the screen recorder, the camera, the
+second Wi-Fi link." It supersedes nothing above; it gathers it and adds what
+changed since 2026-09-14. Everything here was read from the kiosk's
+`deploy.sh`, `desktop/android-build.cjs`, `C:\_tools\pinebox-toolchain.json`
+and the station's routes on 2026-10-06; where a thing was measured on the
+live tablet it says so.
+
+### 0.13.1 Two deployment roads, and which one you are on
+
+| you are shipping | road | signature | what it touches |
+|---|---|---|---|
+| **the kiosk** (`com.pinebox.kiosk`) | `C:\_tools\pinebox-android\PineBoxKiosk\deploy.sh` (or the desk's one-press tablet button, §0.13.5) | **platform key** (`keys/platform.pk8`), verified against the framework's `b4addb29` before install | syncs the shared views from `desktop/renderer/` into `app/src/main/assets/pine-views/`, builds, zipaligns, signs, verifies, installs, re-grants `RECORD_AUDIO` and `CAMERA`, leaves the app stopped |
+| **your own app** | your Gradle project + `adb install -r` (§0.13.3) | any key (debug is fine) | nothing of the kiosk's; coexists per §0.6.2 |
+| your own app that needs **signature-level** powers (the jack, `DUMP`, screen capture without a projection dialog) | your Gradle project, then `apksigner` with the platform key exactly as `deploy.sh` does | platform key | makes it a system-trusted app; see §0.6.1's warning about what that implies |
+
+The one rule that has cost the most: **never** `gradle assembleDebug` +
+`adb install -r` for the kiosk itself. The debug key replaces the platform
+key, the jack stops following the cable and nothing on screen says why.
+`deploy.sh` refuses to install a mismatched signer for exactly that reason.
+
+### 0.13.2 The local toolchain (what a third-party project reuses)
+
+```
+C:\_tools\jdk17                      Temurin 17  (JAVA_HOME; gradle and apksigner must agree on one JDK)
+C:\_tools\android-sdk                platforms/android-34, build-tools/34.0.0, ndk/26.1.10909125, cmake/3.22.1, platform-tools 37.0.1
+C:\_tools\gradle\bin\gradle.bat      gradle 8.14.5  (no wrapper JAR is checked into the kiosk; pin your own if you like)
+C:\_tools\_gradlehome                GRADLE_USER_HOME - set it or AGP re-downloads and the build "hangs"
+C:\_tools\pinebox-toolchain.json     the manifest desktop/android-build.cjs reads (it arrives with a UTF-8 BOM; strip it before JSON.parse)
+```
+
+A third-party project that wants to build here sets the same three
+variables and runs from a **local** working directory - a UNC path
+(`\\10.89.1.246\...`) is refused by the Windows batch launchers and Gradle
+then "defaults to the Windows directory" and builds nothing useful:
+
+```sh
+export JAVA_HOME=/c/_tools/jdk17 ANDROID_HOME=/c/_tools/android-sdk GRADLE_USER_HOME=/c/_tools/_gradlehome
+cd /c/your/local/checkout                    # LOCAL, never the share
+/c/_tools/gradle/bin/gradle.bat --console=plain assembleDebug
+```
+
+Project settings that match the tablet (measured: arm64-v8a, Android 14,
+SDK 34, userdebug, no Play services):
+
+```kotlin
+android {
+    compileSdk = 34
+    defaultConfig { minSdk = 29; targetSdk = 34; ndk { abiFilters += listOf("arm64-v8a") } }
+}
+```
+
+and, because every road to the station is plain `http://`, either
+`android:usesCleartextTraffic="true"` on the application or a
+`network_security_config.xml` naming `10.89.1.246`, `100.74.95.59`,
+`lilspark.tail1fec29.ts.net`, `127.0.0.1` - the kiosk's own policy is
+quoted in §0.4; it is the kiosk's, not the device's.
+
+Nothing may depend on `play-services-*` or Firebase (there are none; the
+failure is at first use, not install), and there is no `RecognitionService`
+(speech goes to the station's whisper, §0.9.5).
+
+### 0.13.3 The push loop for your own app
+
+```sh
+ADB=/c/_tools/platform-tools/adb.exe; D="-s 10.89.1.154:5555"
+$ADB connect 10.89.1.154:5555                        # "already connected" is fine; wireless adb persists across reboots
+$ADB $D install -r app/build/outputs/apk/debug/app-debug.apk
+$ADB $D shell pm grant your.package android.permission.RECORD_AUDIO      # runtime grants without a prompt
+$ADB $D shell am start -n your.package/.MainActivity
+$ADB $D logcat -s YourTag:V AndroidRuntime:E | head -200
+```
+
+Verify an install by `pm path your.package` plus the APK's size and
+timestamp against your own build - a second session installs to this tablet
+too. If `adb` reports the device offline, reconnect with the SDK's own
+binary; there is no `adb` on `PATH` in the tool shells.
+
+To drive your own app's WebView, or the kiosk's, from the PC, forward the
+WebView's DevTools socket (§0.2.4): the socket name carries the pid and
+changes on every launch, so re-read `/proc/net/unix` after each install.
+
+### 0.13.4 Signing with the platform key (only if you need it)
+
+```sh
+TOOLS=/c/_tools/android-sdk/build-tools/34.0.0
+$TOOLS/zipalign -p -f 4 app-debug.apk app-aligned.apk
+$TOOLS/apksigner sign --key /c/_tools/pinebox-android/PineBoxKiosk/keys/platform.pk8 \
+    --cert /c/_tools/pinebox-android/PineBoxKiosk/keys/platform.x509.pem --out app-platform.apk app-aligned.apk
+$TOOLS/apksigner verify --print-certs app-platform.apk      # SHA-256 must be the framework's c8a2e9bc...92ab8
+```
+
+The share's checkout has **no** `keys/` (gitignored; the repo is public);
+the keys live only in the local kiosk project. A platform-signed app can
+hold `CAPTURE_VIDEO_OUTPUT`, `MODIFY_AUDIO_ROUTING` and `DUMP` as
+signature|privileged grants, which is how the kiosk records the screen
+without a consent dialog (§0.5.9) and hands audio to the jack.
+
+### 0.13.5 The desk's one-press update, and the asset sync
+
+Since 2026-10-01 the desk's tablet button (`#pinetabBtn`) and the tablet's
+own Reinitialise card (its download icon posts `/api/tablet/update-ask`,
+which the desk polls every 5 s) run the whole kiosk loop - build, sign,
+install, relaunch - and log to `%TEMP%\pinetab-update.log`. The menu item
+"Update and rebuild Pine (N newer files)" on the desk is the same road from
+the Pine PiP window.
+
+`deploy.sh` syncs every file already present in `pine-views/` from the
+canonical `desktop/renderer/` on the share before building, and skips
+`talk-dot.js` on purpose (Android owns the field microphone's focus there).
+Two consequences for anyone contributing views:
+
+- edit `desktop/renderer/` on the share and keep the repo's
+  `app/src/main/assets/pine-views/` mirror identical (the station's
+  `edit_s3_origin_views` refuses when they differ); an edit made only to the
+  kiosk project's copy is overwritten at the next install;
+- a **new** file still needs a hand copy into `pine-views/` and a
+  `ViewAssets.kt` `SCRIPTS`/`STYLES` entry (§0.8.3); the sync only refreshes
+  files that are already there.
+
+### 0.13.6 The services, from a third-party app
+
+| service | where it is | how a third party reaches it |
+|---|---|---|
+| **the station** | `http://10.89.1.246:8096` on the LAN, `100.74.95.59:8096` on the tailnet; the public door `:8097` with `?t=<share token>` | plain HTTP, poll-only; reads need no key on the LAN, writes need `Authorization: Bearer <SPARK_AGENT_API_KEY>` (§0.9). New in 2026-10: `GET /api/blocked` (every blocked case, one shape), `GET /api/sfx/video/mode` now carries `unseen` (the uncategorised video pool and what the set has studied), `GET /api/flow-ledger`, `GET /api/pantry/lifecycle` |
+| **your place on the roster** | `GET /api/radio/listeners` | report as the kiosk does (§0.7.1) so the station knows who plays out loud; never claim the air you cannot play (§0.7.2) |
+| **the screen ring** (ScreenReplay, `PineAppRecorder`) | inside the kiosk, foreground service 4301 | from the kiosk's WebView: `pineDesktop.replayState()`, `replayExport()`, `replayChunk()`. From another app there is no binder; either ask the kiosk's WebView over the DevTools socket, or, if platform-signed, mirror the display yourself the same way (`VirtualDisplay` with `AUTO_MIRROR`, `CAPTURE_VIDEO_OUTPUT`) - two mirrors of one display have been measured to be fine; two encoders at once are not (§22, the VENC panics) |
+| **the camera** (`PineCameraService`) | abstract unix socket `pine_camera`, foreground service 4302 | connect, read `[u32be length][JPEG]` frames; the lens is on while you are connected and the last disconnect closes it. From the PC: `adb forward tcp:9999 localabstract:pine_camera`. The desk republishes the same frames at `http://127.0.0.1:8791/camera.mjpg` when its camera window is open |
+| **the Pine Cam over the second Wi-Fi** (dual Wi-Fi, §24) | the helper in `tools/pinetab-dual-wifi/install.sh` enables `config_wifiMultiStaLocalOnlyConcurrencyEnabled` through a root-created overlay; the kiosk's `CamLink`/`CamRelayController` joins the camera's own access point (`192.168.1.254`) on a second STA while TacoNet stays primary, and relays `rtsp://10.89.1.154:8554/live` to the Spark | your app needs `CHANGE_NETWORK_STATE` (and the Wi-Fi/settings permissions) to `ConnectivityManager.requestNetwork` a local-only Wi-Fi spec; bind the camera sockets to that `Network`. Reboot once after first enabling the feature; the join request is 30 s and the supervisor's handoff grace is 60 s. Only one relay may hold the camera: the supervisor's `relay` preference (`auto` / `always` / `never`) decides between the tablet and the DGX's dongle |
+| **the native sampler** (oboe) and the native video wall | inside the kiosk | not shared; a second app drawing its own `<video>` surfaces over the kiosk is what the receipts call "two surfaces", and both will sound. Hush yours when the kiosk owns the air (`owns_air` on the roster) |
+| **the jack and audio routing** | `MODIFY_AUDIO_ROUTING`, platform-signed only | §0.5.7; a debug-signed app cannot route, and must not fight the kiosk for audio focus (§0.6.2) |
+
+### 0.13.7 What changed on the station side on 2026-10-06 (for anyone reading the tablet's feed)
+
+- **The kitchen.** Switching the station OFF no longer stops the preparation
+  rooms: the writer, the recording room, the pen, the tint repair, the ad
+  studio and the SFX Guy's listener keep banking behind a stopped show
+  (`/api/dj` -> `workers.kitchen`). Nothing airs; the tablet's voice and
+  video feeds answer `off_air`.
+- **The blocked book.** `GET /api/blocked` lists every blocked case the
+  ledgers hold - system, why, rule, section, node, the gate's file:line and
+  function, and the System 3 roll - and The Works on the desk shows it as a
+  second tab (`desktop/renderer/blocked-book.js`, portable to the tablet).
+- **The supercut's answer.** After the hourly supercut the booth reacts on
+  the `supercut_react` road, each host's stance a REACT1 roll.
+- **Unseen video.** The endless set prefers clips the SFX Guy has never
+  categorised and studies each one as it plays (transcript, frames, level);
+  `/api/sfx/video/mode.unseen` says how deep the pool is.
+- **The pause panel** of the production feed now sits inside whichever
+  pane is showing (`[feed-panel-home]`), so it no longer draws over the
+  Message view's bubbles on the tablet.
 
 ---
 
