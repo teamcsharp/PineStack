@@ -95,6 +95,7 @@ import gazette_prompt
 import gazette_editorial
 import gazette_media
 import gazette_review_runtime
+import blocked_book                                          # [blocked-book]
 import h3_slots                          # [h3-slots] {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena}
 import h3_speak                          # [h3-speak] the hourly video's dialogue: whole sentences, rolled
 from parody_stinger_queue import ParodyQueue
@@ -282477,6 +282478,7 @@ dynamic_segments_runtime.install(app, globals())
 import dynamic_segments_system2
 dynamic_segments_system2.install(app, globals())
 gazette_review_runtime.install(app, globals())
+blocked_book.install(app, globals())                         # [blocked-book] GET /api/blocked
 
 # One-click station diagnosis, dialogue recovery, and saved repair reports.
 import station_troubleshoot_runtime

@@ -1,0 +1,40 @@
+/* [blocked-book] the blocked book inside The Works (and anywhere else it is mounted) */
+.bb-host { display: flex; flex-direction: column; gap: 6px; min-height: 0; font-size: 11px; color: var(--fg, #d7dde6); }
+.bb-bar { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.bb-label { font-size: 9.5px; opacity: .6; margin-right: 2px; }
+.bb-sort, .bb-flag { font-size: 9.5px; padding: 2px 7px; border-radius: 6px; border: 1px solid #27384a; background: #0a1118; color: inherit; cursor: pointer; }
+.bb-sort.on, .bb-flag.on { border-color: #4b8bd1; background: #0f2236; color: #cfe6ff; }
+.bb-flag { margin-left: 2px; }
+.bb-search { flex: 1 1 140px; min-width: 120px; font-size: 10.5px; padding: 2px 6px; border-radius: 6px; border: 1px solid #27384a; background: #060b11; color: inherit; }
+.bb-status { font-size: 9.5px; opacity: .7; flex-basis: 100%; }
+.bb-counts { display: flex; flex-wrap: wrap; gap: 4px; }
+.bb-chip { font-size: 9.5px; padding: 1px 7px; border-radius: 10px; background: #111c27; border: 1px solid #22323f; cursor: pointer; }
+.bb-list { overflow: auto; max-height: min(60vh, 520px); display: flex; flex-direction: column; gap: 3px; padding-right: 2px; }
+.bb-row { border: 1px solid #1d2a37; border-radius: 7px; background: #070c12; }
+.bb-row[open] { border-color: #345372; }
+.bb-sum { display: grid; grid-template-columns: 62px 86px 150px 92px 1fr auto; gap: 6px; align-items: center; padding: 4px 8px; cursor: pointer; list-style: none; }
+.bb-sum::-webkit-details-marker { display: none; }
+.bb-sum::before { content: '\25B8'; position: absolute; margin-left: -8px; opacity: .55; font-size: 9px; }
+.bb-row[open] > .bb-sum::before { content: '\25BE'; }
+.bb-when { font-size: 9.5px; opacity: .65; white-space: nowrap; }
+.bb-sys { font-size: 9.5px; padding: 1px 6px; border-radius: 8px; background: #16222e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bb-rule { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e6c27a; }
+.bb-seg { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #9fd3ff; }
+.bb-why { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .9; }
+.bb-standing { font-size: 9px; padding: 1px 5px; border-radius: 8px; background: #2d2416; color: #e8c37a; }
+.bb-body { display: grid; grid-template-columns: 170px 1fr; gap: 3px 10px; margin: 0; padding: 4px 10px 8px 22px; border-top: 1px dashed #1d2a37; }
+.bb-body dt { opacity: .6; font-size: 10px; }
+.bb-body dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.bb-gate { font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; color: #b9e8c9; }
+.bb-roll { color: #d9b8ff; }
+.bb-text { opacity: .8; font-style: italic; }
+.bb-open { font-size: 9.5px; padding: 1px 7px; border-radius: 6px; border: 1px solid #345372; background: #0f2236; color: #cfe6ff; cursor: pointer; }
+.bb-empty { opacity: .6; padding: 12px; text-align: center; }
+.bb-flow .bb-sys { background: #1a2a1f; } .bb-no-repeat .bb-sys { background: #2a1f1a; } .bb-cupboard .bb-sys { background: #1f1f2d; }
+.bb-system-3 .bb-sys { background: #2a1a2a; } .bb-handover .bb-sys { background: #2a2416; } .bb-dynamic-segments .bb-sys { background: #162a2a; }
+/* The Works' own tab strip */
+.wk-tabs { display: flex; gap: 4px; margin: 2px 0 6px; }
+.wk-tab { font-size: 10px; padding: 2px 9px; border-radius: 6px 6px 0 0; border: 1px solid #27384a; border-bottom: 0; background: #0a1118; color: inherit; cursor: pointer; }
+.wk-tab.on { background: #0f2236; border-color: #4b8bd1; color: #cfe6ff; }
+.wk-tab .wk-badge { margin-left: 5px; font-size: 9px; padding: 0 5px; border-radius: 8px; background: #2d2416; color: #e8c37a; }
+@media (max-width: 700px) { .bb-sum { grid-template-columns: 58px 1fr; } .bb-rule, .bb-seg, .bb-why { grid-column: span 2; } .bb-body { grid-template-columns: 1fr; } }

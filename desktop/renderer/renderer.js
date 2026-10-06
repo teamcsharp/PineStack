@@ -5772,10 +5772,22 @@ function initWorksPopup() {
     x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:pop = mk("div", "w:x:Close]
     x.onclick = () => {
       try { if (pop.wkBriefPoll) clearInterval(pop.wkBriefPoll); } catch (e) {}
+      try { if (pop.wkBadgePoll) clearInterval(pop.wkBadgePoll); if (pop.wkBook) pop.wkBook.close(); } catch (e) { /* [blocked-book] */ }
       close();
     };
     head.appendChild(x);
     pop.appendChild(head);
+    /* [blocked-book] THE SECOND TAB. "At the top of The Works put a 2nd tab that
+     * shows each and every blocked listing" - the rooms as they were, and the
+     * blocked book (blocked-book.js over GET /api/blocked) beside them. */
+    const tabs = mk("div", "wk-tabs");
+    const tabRooms = mk("button", "wk-tab on", "the rooms");
+    const tabBlocked = mk("button", "wk-tab", "blocked");
+    const wkBadge = mk("span", "wk-badge", "");
+    tabBlocked.appendChild(wkBadge);
+    tabs.appendChild(tabRooms);
+    tabs.appendChild(tabBlocked);
+    pop.appendChild(tabs);
     pop.appendChild(mk("div", "wk-sub",
       "Every round is written, banked, recorded and stacked before it "
       + "goes out. This is where each one is right now."));
@@ -5814,6 +5826,35 @@ function initWorksPopup() {
     pop.wkBriefPoll = briefPoll;
     const body = mk("div", "wk-flow-wrap");
     pop.appendChild(body);
+    /* [blocked-book] the second pane, mounted on first look and kept */
+    const bookHost = mk("div", "wk-flow-wrap wk-book");
+    bookHost.style.display = "none";
+    pop.appendChild(bookHost);
+    const showTab = (which) => {
+      const rooms = which !== "blocked";
+      tabRooms.classList.toggle("on", rooms);
+      tabBlocked.classList.toggle("on", !rooms);
+      body.style.display = rooms ? "" : "none";
+      bookHost.style.display = rooms ? "none" : "";
+      if (!rooms && !pop.wkBook && window.PineBlockedBook) {
+        pop.wkBook = window.PineBlockedBook.mount(bookHost, {
+          get: (p) => api.get(p), always: true,
+          openRound: () => { try { if (typeof window.pineShow3JS === "function") window.pineShow3JS("sys3"); } catch (e) { /* no window here */ } },
+        });
+      }
+      try { localStorage.setItem("wkTab", rooms ? "rooms" : "blocked"); } catch (e) { /* no storage */ }
+    };
+    tabRooms.onclick = () => showTab("rooms");
+    tabBlocked.onclick = () => showTab("blocked");
+    const wkBadgeTick = () => api.get("/api/blocked?limit=1&standing=1&history=1").then((b) => {
+      const sys = (b && b.counts && b.counts.system) || {};
+      const n = Object.keys(sys).reduce((a, k) => a + (Number(sys[k]) || 0), 0);
+      wkBadge.textContent = n ? String(n) : "";
+      tabBlocked.title = b && b.say ? b.say : "every blocked case the ledgers hold";
+    }).catch(() => {});
+    wkBadgeTick();
+    pop.wkBadgePoll = setInterval(wkBadgeTick, 15000);
+    try { if (localStorage.getItem("wkTab") === "blocked") showTab("blocked"); } catch (e) { /* no storage */ }
     document.body.appendChild(pop);
     try { wkDraggable(pop); } catch (e) { /* #914 */ }
     load(body);
