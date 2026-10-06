@@ -66,7 +66,11 @@
      * by RAIL_CSS being concatenated after the views' CSS - source order,
      * which is not something a stylesheet should depend on. */
     {id: 'slideshow', cls: 'sl-host', label: 'SLIDES',
-      mount: ['PineSlideshow']}
+      mount: ['PineSlideshow']},
+    /* [tools-view] the portable tools - The Works, the LLM command table, the
+     * hour flow, the blocked book - behind one tab; the rail scrolls past
+     * eight (#1345), so a ninth is no longer a tab nobody can reach. */
+    {id: 'tools', cls: 'ptv-view', label: 'TOOLS', mount: ['PineToolsView']}
   ];
 
   var RAIL_CSS = [

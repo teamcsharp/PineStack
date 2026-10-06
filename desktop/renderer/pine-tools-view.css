@@ -1,0 +1,22 @@
+/* [tools-view] the TOOLS view (tablet) and popup: the portable tools, one door */
+.ptv-view { overflow: auto; background: #070c12; color: #d7dde6; padding: 12px 56px 12px 12px; font: 12px/1.4 Inter, "Segoe UI", system-ui, sans-serif; }
+.ptv-wrap { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.ptv-head { display: flex; gap: 10px; align-items: baseline; }
+.ptv-head b { font-size: 16px; color: #cfe6ff; }
+.ptv-sub { font-size: 11px; opacity: .7; }
+.ptv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.ptv-card { display: flex; flex-direction: column; gap: 5px; text-align: left; padding: 12px 14px; min-height: 76px; border: 1px solid #27384a; border-radius: 9px; background: linear-gradient(180deg, #0f1a24, #0a1118); color: inherit; font: inherit; cursor: pointer; }
+.ptv-card:hover, .ptv-card:focus-visible { border-color: #4b8bd1; outline: none; }
+.ptv-card b { font-size: 13px; color: #9fd3ff; }
+.ptv-card span { font-size: 11px; opacity: .78; }
+.ptv-bar { display: flex; gap: 10px; align-items: center; }
+.ptv-bar b { font-size: 14px; color: #cfe6ff; }
+.ptv-back { font: inherit; font-size: 11px; padding: 5px 12px; border-radius: 7px; border: 1px solid #27384a; background: #101a24; color: #cfe6ff; cursor: pointer; }
+.ptv-back:hover { border-color: #4b8bd1; }
+.ptv-body { min-height: 0; }
+.ptv-empty { margin: 0; font-size: 11px; opacity: .65; }
+.ptv-pop { position: fixed; inset: 0; z-index: 2147483100; background: rgba(2, 6, 12, .62); display: flex; align-items: flex-start; justify-content: center; padding: 24px 12px; overflow: auto; }
+.ptv-box { position: relative; width: min(820px, 100%); max-height: calc(100vh - 48px); overflow: auto; background: #0b1219; border: 1px solid #27384a; border-radius: 10px; padding: 12px 14px 14px; box-shadow: 0 14px 44px rgba(0, 0, 0, .55); }
+.ptv-x { position: absolute; top: 8px; right: 8px; font: 600 12px/1 Inter, "Segoe UI", system-ui, sans-serif; width: 26px; height: 26px; border-radius: 7px; border: 1px solid #27384a; background: #101a24; color: #cfe6ff; cursor: pointer; }
+.ptv-x:hover { border-color: #4b8bd1; }
+@media (max-width: 560px) { .ptv-view { padding: 10px 46px 10px 8px; } .ptv-grid { grid-template-columns: 1fr; } .ptv-pop { padding: 10px 6px; } }
