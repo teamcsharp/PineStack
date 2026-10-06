@@ -2,6 +2,8 @@
 .pf-panel { display: flex; flex-direction: column; gap: 8px; margin: 0 0 10px; padding: 10px; border: 1px solid #2c404b;
   border-radius: 8px; background: #0b1317; color: #dbe6f0; font-size: 12.5px; max-height: 62vh; min-height: 0; }
 .pf-panel[hidden] { display: none; }
+/* [feed-panel-home] inside the Message view pane: a block of its own, never an overlay */
+.sp-mv > .pf-panel { position: relative; z-index: 2; flex: none; margin: 8px 8px 0; max-height: 44%; overflow: auto; }
 .pf-head { display: flex; flex-direction: column; gap: 6px; }
 .pf-headline { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .pf-headline b { color: #8de1ed; letter-spacing: .08em; font-size: 12px; }

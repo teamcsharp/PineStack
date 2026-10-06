@@ -248,6 +248,9 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
             finally:
                 STATE["running"] = False
 
+    namespace["sfx_vision_look"] = look                 # [unseen-video] the set studies what it rings
+    namespace["sfx_vision_write"] = write
+
     holder: dict[str, Any] = {}
 
     @app.on_event("startup")

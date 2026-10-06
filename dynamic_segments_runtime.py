@@ -830,6 +830,7 @@ class DynamicSegments:
             self.g.setdefault('_SHELF', {}).setdefault('sfx_supercut', []).append(row)
             self.call('_shelf_save')
             self.last[occurrence] = {'state': 'ready', 'coverage': coverage}
+            self.bank_reaction_later(occurrence, row)                     # [supercut-react] the booth's answer, banked with it
             return row
         except Exception as exc:
             self.last[occurrence] = {'state': 'pending' if type(exc).__name__ == 'SourceAnalysisPending' else 'blocked', 'why': str(exc)[:300]}   # [supercut-pending]
@@ -872,8 +873,118 @@ class DynamicSegments:
             def accepted():
                 self.call('_schedule_action_complete', kind, occurrence)
                 row['dynamic_handed_off'] = True
-            return bool(await self.g['_air_produced_ad'](row, on_handoff=accepted))
+            aired = bool(await self.g['_air_produced_ad'](row, on_handoff=accepted))
+            if aired:
+                await self.react(key, row, track)                      # [supercut-react] the booth answers it
+            return aired
         return False
+
+    # --- [supercut-react] THE BOOTH ANSWERS THE SUPERCUT ----------------------------
+    # "have the DJs respond to the supercut that is played ... rolling a roulette to
+    # dictate how they respond" (operator, 2026-10-06). Written and banked when the
+    # supercut is prepared (road supercut_react, legs + REACT1 stances), aired
+    # straight after it from the shelf; live when the shelf holds none.
+    REACT_ROAD = 'supercut_react'
+    REACT_LINES = 4
+
+    def react_angle(self, row):
+        """What the supercut showed and said, as the subject the booth answers."""
+        plan = row.get('source_plan') if isinstance(row.get('source_plan'), dict) else row
+        clips = [c for c in (plan.get('clips') or []) if isinstance(c, dict)]
+        bits = []
+        for c in clips[:10]:
+            said = str(c.get('said') or '').strip()
+            name = str(c.get('name') or c.get('path') or '').rsplit('/', 1)[-1]
+            role = str(c.get('role') or '').strip()
+            piece = ("%s: '%s'" % (role, said) if said else "%s: %s" % (role, name)) if role else (said or name)
+            if piece:
+                bits.append(piece)
+        product = str(row.get('product') or 'Pine Box FM')
+        seconds = float(row.get('seconds') or 0)
+        return ("THE SUPERCUT THAT JUST PLAYED - the SFX Guy's %d-second montage selling %s, cut from %d clip(s): %s. "
+                "React to THAT - what it showed and what it said - not to the idea of a supercut." % (
+                    int(round(seconds)), product, len(clips), '; '.join(bits)[:1400] or 'the clips are not named'))
+
+    def react_rows(self, key):
+        shelf = self.g.get('_SHELF') or {}
+        out = []
+        for r in list(shelf.get(self.REACT_ROAD) or []):
+            e = r.get('entry') if isinstance(r.get('entry'), dict) else r
+            if str(r.get('supercut_occurrence') or e.get('supercut_occurrence') or '') == str(key):
+                out.append(r)
+        return out
+
+    def bank_reaction_later(self, occurrence, row):
+        go = self.g.get('fire_and_forget')
+        try:
+            if callable(go):
+                go(self.bank_reaction(occurrence, row))
+        except Exception as exc:
+            self.log('The supercut reaction could not be queued', exc)
+
+    async def bank_reaction(self, occurrence, row):
+        """Write the booth's reaction now, while the supercut is fresh, onto its own shelf."""
+        if self.react_rows(occurrence):
+            return False
+        banter = self.g.get('dj_banter')
+        shelve = self.g.get('shelf_put')
+        if not callable(banter) or not callable(shelve):
+            return False
+        pile = []
+        try:
+            await banter(None, road=self.REACT_ROAD, bank=True, bank_to=pile, lines=self.REACT_LINES,
+                         own_material=True, angle=self.react_angle(row))
+        except Exception as exc:
+            self.log('The supercut reaction could not be written', exc)
+            return False
+        put = 0
+        for entry in pile:
+            if not isinstance(entry, dict):
+                continue
+            entry['supercut_occurrence'] = str(occurrence)
+            entry['prep_kind'] = self.REACT_ROAD
+            try:
+                shelve(self.REACT_ROAD, {'entry': entry, 'seconds': float(entry.get('seconds') or 0),
+                                         'supercut_occurrence': str(occurrence)})
+                put += 1
+            except Exception as exc:
+                self.log('The supercut reaction could not be shelved', exc)
+        if put:
+            self.call('_shelf_save')
+            rec = self.last.setdefault(occurrence, {})
+            rec['reaction'] = 'banked'
+        return bool(put)
+
+    async def react(self, key, row, track=None):
+        """Straight after the supercut: the banked reaction from the shelf, else written live."""
+        rows = self.react_rows(key)
+        ready = self.g.get('dialogue_row_ready')
+        air = self.g.get('_ready_shelf_air')
+        for r in rows:
+            try:
+                if callable(ready) and not ready(self.REACT_ROAD, r):
+                    continue
+                if not callable(air):
+                    break
+                def handed(r=r):
+                    r['supercut_handed_off'] = True
+                said = await air(self.REACT_ROAD, track, rescue=True, pick=r, on_handoff=handed)
+                if said:
+                    self.last.setdefault(key, {})['reaction'] = 'aired from the shelf'
+                    return True
+            except Exception as exc:
+                self.log('The banked supercut reaction would not air', exc)
+        banter = self.g.get('dj_banter')
+        if not callable(banter):
+            return False
+        try:
+            said = await banter(track, road=self.REACT_ROAD, lines=self.REACT_LINES, own_material=True,
+                                angle=self.react_angle(row))
+            self.last.setdefault(key, {})['reaction'] = 'written live' if said else 'the writer gave nothing'
+            return bool(said)
+        except Exception as exc:
+            self.log('The live supercut reaction failed', exc)
+            return False
 
     def status(self):
         upcoming = self.call('coord_upcoming', 7200, measure=False, default=[]) or []

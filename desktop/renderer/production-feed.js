@@ -272,6 +272,19 @@
     feed.parentNode.insertBefore(ui.box, feed);
     return ui.box;
   }
+  /* [feed-panel-home] the panel sits inside whichever pane is showing: first child of the
+     Message view pane (a flex column, so the bubbles move down), else before the feed */
+  function home() {
+    if (!ui.box) return;
+    var feed = document.getElementById('spFeed');
+    var pane = document.getElementById('spMsgView');
+    var paneUp = !!(pane && pane.style.display !== 'none' && pane.offsetParent !== null);
+    if (paneUp) {
+      if (ui.box.parentNode !== pane || pane.firstChild !== ui.box) pane.insertBefore(ui.box, pane.firstChild);
+    } else if (feed && feed.parentNode && (ui.box.parentNode !== feed.parentNode || ui.box.nextSibling !== feed)) {
+      feed.parentNode.insertBefore(ui.box, feed);
+    }
+  }
   function add(items) {
     if (!items || !items.length) return;
     var frag = document.createDocumentFragment();
@@ -287,6 +300,7 @@
   function tick() {
     if (!ui.on || ui.busy) return;
     if (!build()) return;
+    try { home(); } catch (e) { /* [feed-panel-home] a pane mid-rebuild */ }
     ui.busy = true;
     var c = ui.cursor;
     get('/api/production/feed?s3=' + (c.s3 || 0) + '&n=' + (c.n || 0) + '&t=' + (c.t || 0))

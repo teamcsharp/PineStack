@@ -735,6 +735,10 @@ Object.assign(FAMILY_WHAT, {
   WRAP: ['Wrap call (WRAP1)',
     "Who on the station ends the call, and how - in answer to the caller's last word. Two dice: the way (a polite goodbye, cutting them off mid-sentence, hold forever, the dial tone ... - some only after a resolution, like enjoying the ashes after a painting was set on fire; a call a happening cut short draws from the dead-line wheel) and who says it (the desk's weights by seat). The station's checker takes this node as the sign-off whatever its words. Edited in Tables > WRAP1."],
 });
+Object.assign(FAMILY_WHAT, {   /* [supercut-react] the booth's stance on the supercut */
+  REACT: ['Supercut stance (REACT1)',
+    'How a host takes the supercut that just played, rolled once per turn on the supercut_react road: loves it, hates it, split, wants it as the jingle, baffled, moved, suspicious, reviews it - each item a direction the host performs and never names. The wheel decides whether they love it or not.'],
+});
 Object.assign(FAMILY_WHAT, {   /* [s3-split] */
   SPLIT: ['Split (a long read shared out)',
     'Whether a long read on a node whose split box is ticked is shared out among the studio. The rule decides it with no dice: the read\'s characters over the voice\'s pace, against the threshold in Config > split (45 s), cut at sentence ends into the fewest parts that fit - up to the node\'s 1 to 3 splits, never inside a sentence. Then one roll per part after the first picks who carries it on: the studio as it is now, never the one reading, never the same voice twice in a row, at the split section\'s weights.'],
@@ -6801,7 +6805,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
   const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL',
-    'MGRTOPIC', 'MGRSUB'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages */
+    'MGRTOPIC', 'MGRSUB', 'REACT'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 */
   TABLE_FAMILIES.push('CALLOPEN', 'CALLANGLE', 'CALLSTAKES', 'CALLPROBE', 'CALLSOURCE', 'RW');
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */

@@ -1636,6 +1636,39 @@ IL1 = {
 }
 DEFAULT_TABLES.append(IL1)                                                   # [s3-split]
 
+# [supercut-react] HOW THE BOOTH TAKES THE SUPERCUT. Rolled per host turn on the
+# supercut_react road: "they either love it or they do not, depending on where
+# the roulette wheel rolls" (operator, 2026-10-06). Shades of both, every one a
+# direction the host performs and never names.
+REACT1 = {
+    "id": "REACT1", "family": "REACT", "label": "Supercut stance (how the booth takes the supercut)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "The stance a host takes on the supercut that just played, rolled once per turn on the "
+                   "supercut_react road. Love it or not - the wheel decides, with its shades.",
+    "categories": [
+        {"id": "stance", "label": "Stance", "weight": 1.0,
+         "items": _items([
+             {"id": "loves_it", "label": "Loves it", "weight": 1.0,
+              "text": "LOVES IT - out loud and specific: names the exact moment that got them and wants it played again"},
+             {"id": "hates_it", "label": "Hates it", "weight": 1.0,
+              "text": "HATES IT - flatly, with one reason: the cut, the timing, or the clips the SFX Guy chose"},
+             {"id": "split", "label": "Split", "weight": 0.7,
+              "text": "cannot decide - half of it worked and they say exactly which half, and why the rest did not"},
+             {"id": "jingle", "label": "Wants it as the jingle", "weight": 0.5,
+              "text": "wants it as the new station jingle, effective immediately, and says so over any objection"},
+             {"id": "baffled", "label": "Baffled", "weight": 0.6,
+              "text": "is baffled by it - asks what on earth it was selling and whether anyone else saw what they saw"},
+             {"id": "moved", "label": "Moved", "weight": 0.5,
+              "text": "is unexpectedly moved by it and tries, badly, to cover that up"},
+             {"id": "suspicious", "label": "Suspicious", "weight": 0.5,
+              "text": "suspects the SFX Guy of something - a hidden message, a private joke at the booth's expense"},
+             {"id": "critic", "label": "Reviews it", "weight": 0.6,
+              "text": "reviews it like a film critic - the edit, the pacing, the ending - and gives it a score out of ten"},
+         ])},
+    ],
+}
+DEFAULT_TABLES.append(REACT1)                                                # [supercut-react]
+
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
 # Initial Statement [CTS1] -> Response A [ES1, RS1] -> Response B [ES1, RS1]
@@ -1819,6 +1852,11 @@ ROAD_REGISTER = [
      "writer": "dj_speak(aside): a remark between things",
      "hook": "system3_direct_line (one leg, ES rolled)",
      "what": "one voice, one remark between two things, in the feeling rolled"},
+    # [supercut-react] the booth answers the supercut: each host's stance a REACT roll
+    {"id": "supercut_react", "label": "Supercut reaction", "shape": "legs",
+     "writer": "dynamic_segments_runtime.bank_reaction / react -> dj_banter", "hook": "system3_direct_banter",
+     "what": "the booth reacts to the supercut that just played: the first word, the other's stance, the landing - "
+             "each host's stance rolled on REACT1 (they love it, or they do not)"},
     {"id": "ad_spot", "label": "Produced advert", "shape": "line",
      "writer": "dj_ad_break: ad_pick", "hook": "system3_direct_line (LINE draw over the book)",
      "what": "a stored or produced spot: the ad book's rows are the Rolodex, the pick is a recorded draw"},
@@ -1990,6 +2028,17 @@ DEFAULT_ROAD_STRUCTURES = {
     # [s3-roads] THE SINGLE-VOICE ROADS: one seat, one leg, the feeling rolled.
     # Where the road hands System 3 a list (the stock lines, the ad book), the
     # LINE draw over that list is the Rolodex where random.choice() was.
+    "supercut_react": _legs_structure("supercut_react", "Supercut reaction", 3, 5, [   # [supercut-react]
+        _leg("first", "First word on the supercut", "open", "A",
+             "FIRST WORD ON THE SUPERCUT that just played: names one thing it showed or said, and takes the stance "
+             "rolled - plainly, in one breath, to the other host.", "ES", "REACT"),
+        _leg("answer", "The other's stance", "middle", "alternate",
+             "answers with their own rolled stance on the same supercut - agrees, or does not - and names a "
+             "different moment out of it than the one just named.", "ES", "RS", "REACT"),
+        _leg("land", "Lands it", "close", "alternate",
+             "LANDS IT: one line that settles whether the SFX Guy keeps his job this hour, then straight on with "
+             "the show.", "ES", "FL2close"),
+    ], "SUPERCUT REACTION"),
     "track_talk": _line_structure("track_talk", "Record talk", [
         _leg("link", "The record link", "close", "A",
              "names the record and says one true thing about the sound.", "ES")], "RECORD LINK"),
@@ -2096,7 +2145,7 @@ def validate_structure(road, st):
         if str(leg.get("seat") or "") not in ("A", "B", "C", "D", "E", "alternate"):
             out.append("leg %s: seat must be A-E or alternate" % leg["id"])
         for d in leg.get("draws") or []:
-            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS"):
+            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS", "REACT"):   # [supercut-react]
                 out.append("leg %s: unknown draw %r" % (leg["id"], d))
         if "diversity_families" in leg:
             import call_diversity

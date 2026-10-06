@@ -17242,6 +17242,7 @@ _SHELF: dict[str, list[dict[str, Any]]] = {}
 # items at twelve airings is ninety-six goes, which at three an hour is
 # thirty-two hours before anything is heard twice.
 SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 8, "caller": 8,
+              "supercut_react": 6,   # [supercut-react] one reaction per supercut, a few ahead
               # #855: the gallery press. Nine of the owner's sixty
               # canonical minutes, the DEAREST road on the board - up to
               # four vision passes before a word of it is written - and
@@ -50061,7 +50062,8 @@ _KITCHEN: dict[str, Any] = {"on": False, "since": 0.0, "why": "",
 # [kitchen] the shelves whose rows are ROUNDS - written by dj_banter with a
 # bank_to pile, finished by the recording rooms a line at a time. The ad and
 # station_id shelves are reads with their own finishing road (prep_voice_pending).
-ROUND_SHELF_KINDS = ("manager", "caller", "gallery", "news", "gazette_review", "mixtape")
+ROUND_SHELF_KINDS = ("manager", "caller", "gallery", "news", "gazette_review", "mixtape",
+                     "supercut_react")                                   # [supercut-react]
 
 
 def kitchen_open() -> bool:
@@ -93585,6 +93587,110 @@ def sfx_video_cooldown_state() -> dict[str, Any]:
             "rotation": rotation}
 
 
+# --- [unseen-video] THE SET STUDIES WHAT IT SHOWS --------------------------------
+# "I need endless video to become 'unseen video mode' where I see only clips that
+# have never gotten categorized as we calibrate the gain, gather the tags, and
+# internalize the data of the clip" (operator, 2026-10-06). The pick prefers a
+# clip with no transcript or no studied frames; the ring studies it as it plays.
+_SFX_UNSEEN: dict[str, Any] = {"studied": 0, "heard": 0, "seen": 0, "failed": 0, "at": 0.0,
+                               "last": "", "pool": -1, "pool_at": 0.0, "busy": 0}
+SFX_UNSEEN_STUDY_MOST = 2            # clips studied at once; the set rings faster than vision looks
+
+
+def sfx_video_unseen_on() -> bool:
+    try:
+        return bool((dj_settings() or {}).get("sfx_video_unseen", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def sfx_unseen_pool() -> int:
+    """How many playable video clips are still uncategorised (30 s memo, reader)."""
+    now = time.time()
+    if now - float(_SFX_UNSEEN.get("pool_at") or 0) < 30.0 and int(_SFX_UNSEEN.get("pool") or -1) >= 0:
+        return int(_SFX_UNSEEN["pool"])
+    try:
+        con = sfx_db_reader()
+        n = int(con.execute("SELECT COUNT(*) FROM clips WHERE playable = 1 AND video = 1 "
+                            "AND (said_at IS NULL OR seen_desc_at IS NULL)").fetchone()[0])
+    except Exception:  # noqa: BLE001
+        n = int(_SFX_UNSEEN.get("pool") or 0)
+    _SFX_UNSEEN.update({"pool": n, "pool_at": now})
+    return n
+
+
+def sfx_unseen_state() -> dict[str, Any]:
+    return {"on": sfx_video_unseen_on(), "pool": sfx_unseen_pool(),
+            "studied": int(_SFX_UNSEEN.get("studied") or 0), "heard": int(_SFX_UNSEEN.get("heard") or 0),
+            "seen": int(_SFX_UNSEEN.get("seen") or 0), "failed": int(_SFX_UNSEEN.get("failed") or 0),
+            "last": str(_SFX_UNSEEN.get("last") or ""), "at": float(_SFX_UNSEEN.get("at") or 0),
+            "say": ("unseen video: %d clip(s) still uncategorised; %d studied this session (%d heard, %d seen)"
+                    % (sfx_unseen_pool(), int(_SFX_UNSEEN.get("studied") or 0),
+                       int(_SFX_UNSEEN.get("heard") or 0), int(_SFX_UNSEEN.get("seen") or 0)))}
+
+
+async def sfx_study_clip(pick: Any, seconds: float = 0.0) -> dict[str, Any]:
+    """Categorise one clip the set just rang: transcribe its words if it has none,
+    look at its frames if they were never studied. Each on its own road's worker;
+    nothing here touches the event loop for long."""
+    out: dict[str, Any] = {"path": str(pick), "heard": False, "seen": False}
+    if int(_SFX_UNSEEN.get("busy") or 0) >= SFX_UNSEEN_STUDY_MOST:
+        out["why"] = "the study room is full"
+        return out
+    _SFX_UNSEEN["busy"] = int(_SFX_UNSEEN.get("busy") or 0) + 1
+    try:
+        path = str(pick)
+        try:
+            row = await asyncio.to_thread(
+                lambda: sfx_db_reader().execute(
+                    "SELECT said_at, seen_desc_at, seen_desc, sid, seconds FROM clips WHERE path = ?", (path,)).fetchone())
+        except Exception:  # noqa: BLE001
+            row = None
+        if row is None:
+            out["why"] = "not in the book"
+            return out
+        said_at, seen_at, old_desc, sid, secs = row[0], row[1], row[2], row[3], float(row[4] or seconds or 0)
+        if not said_at and clip_speech is not None:
+            try:
+                said = await asyncio.to_thread(clip_speech.transcribe_file, path)
+            except Exception:  # noqa: BLE001
+                said = ""
+            try:
+                def _write_said() -> None:
+                    with _SFX_DB_LOCK:
+                        sfx_db().execute("UPDATE clips SET said = ?, said_at = ? WHERE path = ?",
+                                         (str(said or "")[:600], time.time(), path))
+                        sfx_db().commit()
+                await asyncio.to_thread(_write_said)
+                out["heard"] = bool(said)
+                if said:
+                    _SFX_UNSEEN["heard"] = int(_SFX_UNSEEN.get("heard") or 0) + 1
+            except Exception:  # noqa: BLE001
+                _SFX_UNSEEN["failed"] = int(_SFX_UNSEEN.get("failed") or 0) + 1
+        if not seen_at:
+            look = globals().get("sfx_vision_look")
+            write = globals().get("sfx_vision_write")
+            if callable(look) and callable(write):
+                try:
+                    frames = await look(path, secs)
+                    await asyncio.to_thread(write, path, frames, str(old_desc or ""))
+                    out["seen"] = bool(frames)
+                    if frames:
+                        _SFX_UNSEEN["seen"] = int(_SFX_UNSEEN.get("seen") or 0) + 1
+                except Exception:  # noqa: BLE001
+                    _SFX_UNSEEN["failed"] = int(_SFX_UNSEEN.get("failed") or 0) + 1
+        _SFX_UNSEEN["studied"] = int(_SFX_UNSEEN.get("studied") or 0) + 1
+        _SFX_UNSEEN.update({"at": time.time(), "last": str(sid or Path(path).stem)[:80], "pool_at": 0.0})
+        if _SFX_UNSEEN["studied"] % 10 == 0:
+            try:
+                sfx_match_kick()                                    # what he can hear has changed
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+    finally:
+        _SFX_UNSEEN["busy"] = max(0, int(_SFX_UNSEEN.get("busy") or 1) - 1)
+
+
 async def sfx_video_fresh_pick(tries: int = 40) -> Any:
     """The next random row in the current no-repeat deck generation.
 
@@ -93595,6 +93701,10 @@ async def sfx_video_fresh_pick(tries: int = 40) -> Any:
     after the indexed query proves the eligible book is exhausted.
     """
     del tries  # kept for callers/tests from the former rejection sampler
+    if sfx_video_unseen_on():                                             # [unseen-video] the uncategorised first
+        got = await sfx_db_pick_rotation_async(True, unseen=True)
+        if got is not None:
+            return got
     got = await sfx_db_pick_rotation_async(True)
     if got is not None:
         return got
@@ -93822,6 +93932,8 @@ async def sfx_video_cycle() -> None:
                    if _match_why else {}),
                 "endless": True},          # 2026-09-14: withdrawable
                 at_ms=int(start * 1000))
+            if sfx_video_unseen_on():                                 # [unseen-video] studied as it plays
+                fire_and_forget(sfx_study_clip(pick, seconds))
             plan.append({"sting": pick.stem, "start": start,
                          "end": start + seconds, "id": key})   # [#1200]
             # [pause-bed] the set's own sound, kept where the stream can see
@@ -93861,6 +93973,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
     cycle["left"] = max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1))
     banking = sfx_video_banking_owned()
     return {"on": sfx_video_mode_on(),
+            "unseen": sfx_unseen_state(),                       # [unseen-video] the pool and the session's study
             "banking": bool(sfx_video_mode_on() and radio_paused()),
             "banking_owned": banking,
             "off_air": radio_paused(),
@@ -184281,7 +184394,7 @@ def _wall_folder_category(path: Any) -> dict[str, Any]:
 
 
 def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
-                             _tried: tuple = ()) -> tuple[Path, float] | None:   # [s3-wall-folder:def]
+                             _tried: tuple = (), unseen: bool = False) -> tuple[Path, float] | None:   # [s3-wall-folder:def] [unseen-video]
     """One uniform random row from the unspent part of the video deck.
 
     This is still COUNT/OFFSET over a covering local index, never
@@ -184315,6 +184428,8 @@ def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
             for avoid in ([recent, []] if recent else [[]]):
                 where = "playable = 1 AND video = ? AND deck_cycle < ?"
                 args: tuple[Any, ...] = (want, cycle)
+                if unseen:                                                # [unseen-video] never categorised
+                    where += " AND (said_at IS NULL OR seen_desc_at IS NULL)"
                 if _fold:                                                 # [s3-wall-folder:where]
                     where += " AND folder = ?"
                     args += (_fold,)
@@ -184367,8 +184482,8 @@ def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
         if _fold:                                                         # [s3-wall-folder:fallback]
             (globals().get("_WALL_FOLDER_ROLL") or {}).clear()
             if len(_tried) < 2:
-                return sfx_db_pick_rotation_row(video, False, tuple(_tried) + (_fold,))
-            return sfx_db_pick_rotation_row(video, True)
+                return sfx_db_pick_rotation_row(video, False, tuple(_tried) + (_fold,), unseen=unseen)   # [unseen-video]
+            return sfx_db_pick_rotation_row(video, True, unseen=unseen)
         with _SFX_VIDEO_ROTATION_LOCK:
             _SFX_VIDEO_ROTATION["why"] = "exhausted"
         return None
@@ -184379,11 +184494,11 @@ def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
 
 
 async def sfx_db_pick_rotation_async(
-        video: bool = True) -> tuple[Path, float] | None:
+        video: bool = True, unseen: bool = False) -> tuple[Path, float] | None:   # [unseen-video]
     """The generation-aware pick on the clip book's private worker."""
     try:
         return await asyncio.get_running_loop().run_in_executor(
-            _SFX_DB_EXEC, sfx_db_pick_rotation_row, video)
+            _SFX_DB_EXEC, sfx_db_pick_rotation_row, video, False, (), unseen)
     except Exception as exc:  # noqa: BLE001
         with _SFX_VIDEO_ROTATION_LOCK:
             _SFX_VIDEO_ROTATION["why"] = "pick: %s" % str(exc)[:120]

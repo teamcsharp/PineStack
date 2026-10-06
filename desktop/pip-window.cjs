@@ -297,7 +297,7 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
           .map(f => ({ label: (f.name || f.path) + '  (' + (f.video || 0) + ' video, ' + (f.audio || 0) + ' audio)', type: 'radio', checked: !!playback?.pin && playback.pin.path === f.path,
             click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', path: f.path }) }))
       ] },
-      { label: 'Endless video', type: 'checkbox', checked: playback?.on === true,
+      { label: 'Unseen video (endless - clips he has never categorised)', type: 'checkbox', checked: playback?.on === true,   /* [unseen-video] */
         click: item => getWindow()?.webContents.send('pip:playback', { on: item.checked }) },
       { label: 'Seamless video', type: 'checkbox', checked: playback?.seamless === true,
         click: item => getWindow()?.webContents.send('pip:playback', { seamless: item.checked }) },
