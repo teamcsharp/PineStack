@@ -1,5 +1,5 @@
-/* PineViz bundle 379e5fb94680 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
-/* pineviz-build:379e5fb94680 */
+/* PineViz bundle f2e638357749 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
+/* pineviz-build:f2e638357749 */
 /* ---- core/PineViz.js ---- */
 /* PineViz - the Pine PiP's living background. One telemetry road, ten visual environments.
  *
@@ -1896,7 +1896,7 @@
 
   PineViz.register({
     id: 'shape-burst', index: 10, name: 'Shape Burst', blurb: 'reactive floating symbols', persist: true,
-    defaults: { symbols: 480, trail: .6, bloom: .8 },
+    defaults: { symbols: 420, trail: .6, bloom: .6 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, veil, veilMat, mesh, material, n = 0, items = [], paths = [], extent = { x: 8, y: 4.5 }, lastBeat = 0, dummy, burstLeft = 0, glyphAttr, sizeAttr, heatAttr;
       const KINDS = 8;
@@ -1936,26 +1936,26 @@
           material = new THREE.ShaderMaterial({ transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
             uniforms: { uTime: { value: 0 }, uRms: { value: 0 }, uEnergy: { value: 0 }, uA: { value: new THREE.Color(p.secondary) }, uB: { value: new THREE.Color(p.primary) }, uC: { value: new THREE.Color(p.accent) }, uV: { value: new THREE.Color(ctx.palette.name === 'Monochrome' ? p.glow : '#b86bff') } },
             vertexShader: `attribute mat4 instanceMatrix; attribute float glyph; attribute float gsize; attribute float heat; varying vec2 vUv; varying float vGlyph; varying float vHeat; varying float vDepth;
-              void main(){ vUv = uv; vGlyph = glyph; vHeat = heat; vec4 mv = modelViewMatrix * instanceMatrix * vec4(position * gsize, 1.0); vDepth = clamp(1.0 - (-mv.z - 4.0) / 14.0, 0.0, 1.0); gl_Position = projectionMatrix * mv; }`,
+              void main(){ vUv = uv; vGlyph = glyph; vHeat = heat; vec4 mv = modelViewMatrix * instanceMatrix * vec4(position * gsize * 0.5, 1.0);   /* [viz-shapeburst] half the size: mostly small, a few large */ vDepth = clamp(1.0 - (-mv.z - 4.0) / 14.0, 0.0, 1.0); gl_Position = projectionMatrix * mv; }`,
             fragmentShader: `uniform float uRms; uniform float uEnergy; uniform vec3 uA; uniform vec3 uB; uniform vec3 uC; uniform vec3 uV; varying vec2 vUv; varying float vGlyph; varying float vHeat; varying float vDepth;
               float sdCircle(vec2 p, float r){ return length(p) - r; }
               float sdBox(vec2 p, vec2 b){ vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
               float sdTri(vec2 p, float r){ const float k = sqrt(3.0); p.x = abs(p.x) - r; p.y = p.y + r / k; if (p.x + k * p.y > 0.0) p = vec2(p.x - k * p.y, -k * p.x - p.y) / 2.0; p.x -= clamp(p.x, -2.0 * r, 0.0); return -length(p) * sign(p.y); }
               float sdHex(vec2 p, float r){ const vec3 k = vec3(-0.866025404, 0.5, 0.577350269); p = abs(p); p -= 2.0 * min(dot(k.xy, p), 0.0) * k.xy; p -= vec2(clamp(p.x, -k.z * r, k.z * r), r); return length(p) * sign(p.y); }
               float sdStar(vec2 p, float r){ const float an = 0.628318; const float en = 0.9; vec2 acs = vec2(cos(an), sin(an)); vec2 ecs = vec2(cos(en), sin(en)); float bn = mod(atan(p.x, p.y), 2.0 * an) - an; p = length(p) * vec2(cos(bn), abs(sin(bn))); p -= r * acs; p += ecs * clamp(-dot(p, ecs), 0.0, r * acs.y / ecs.y); return length(p) * sign(p.x); }
-              void main(){ vec2 p = vUv - 0.5; int g = int(vGlyph + 0.5); float d = 1.0; float w = 0.055;
+              void main(){ vec2 p = vUv - 0.5; int g = int(vGlyph + 0.5); float d = 1.0; float w = 0.032;   /* [viz-shapeburst] thin neon strokes */
                 if (g == 0) d = abs(sdCircle(p, 0.3)) - w;                                                  /* ring */
-                else if (g == 1) d = abs(sdBox(vec2(p.x + p.y, p.x - p.y) * 0.7071, vec2(0.26))) - w;        /* diamond outline */
+                else if (g == 1) d = abs(sdBox(p, vec2(0.25))) - w;                                              /* square outline */
                 else if (g == 2) d = min(sdBox(p, vec2(0.34, w)), sdBox(p, vec2(w, 0.34)));                   /* cross */
-                else if (g == 3) d = sdCircle(p, 0.24);                                                       /* filled dot */
+                else if (g == 3) d = abs(sdCircle(p, 0.16)) - w;                                                /* small ring */
                 else if (g == 4) d = abs(sdTri(p * 1.1, 0.26)) - w;                                           /* triangle */
-                else if (g == 5) d = sdStar(p * 1.2, 0.3);                                                    /* star */
-                else if (g == 6) d = abs(sdHex(p, 0.28)) - w;                                                 /* hexagon */
-                else d = min(abs(sdBox(p + vec2(0.18, 0.0), vec2(0.06, 0.3))) - w * 0.6, abs(sdBox(p - vec2(0.18, 0.0), vec2(0.06, 0.3))) - w * 0.6);   /* bracket glyph */
+                else if (g == 5) { vec2 q = vec2(p.x + p.y, p.x - p.y) * 0.7071; d = min(sdBox(q, vec2(0.3, w)), sdBox(q, vec2(w, 0.3))); }   /* the X */
+                else if (g == 6) d = abs(sdBox(p, vec2(0.18))) - w;                                              /* small square */
+                else d = abs(sdTri(p * 1.1, 0.2)) - w;                                                         /* small triangle */
                 float edge = fwidth(d) * 1.2; float a = 1.0 - smoothstep(0.0, edge, d);
                 float glowA = exp(-max(d, 0.0) * 14.0) * 0.35;
-                vec3 c = mix(uB, uA, vDepth * 0.7); c = mix(c, uV, step(4.5, vGlyph) * 0.5); c = mix(c, uC, vHeat * 0.7);
-                float lum = (0.35 + 0.4 * uRms + 0.25 * uEnergy + vHeat * 0.5) * (0.35 + 0.65 * vDepth);
+                vec3 c = mix(uB, uA, vDepth * 0.7); c = mix(c, uV, step(4.5, vGlyph) * 0.5); c = mix(c, uC, vHeat * 0.35);
+                float lum = min(0.85, (0.5 + 0.25 * uRms + 0.2 * uEnergy + vHeat * 0.3) * (0.45 + 0.55 * vDepth));   /* glyphs are present at rest, as in the panel */   /* [viz-shapeburst] colour stays colour; the bloom makes the glow */
                 gl_FragColor = vec4(c * lum, (a + glowA) * lum); }` });
           buildPaths(); build();
         },

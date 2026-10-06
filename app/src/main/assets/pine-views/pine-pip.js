@@ -89,7 +89,7 @@
       if (w.PineViz && w.PineViz.mount) return Promise.resolve(w.PineViz);
       if (vizLoading) return vizLoading;
       vizLoading = new Promise((resolve, reject) => {
-        const tag = doc.createElement('script'); tag.src = '/vendor/pineviz.bundle.js?v=' + Math.floor(Date.now() / 3600000);
+        const tag = doc.createElement('script'); tag.src = '/vendor/pineviz.bundle.js?v=' + Math.floor(Date.now() / 600000);   /* [viz-eager] a ten-minute key: a fixed bundle reaches a desk at its next reload */
         tag.onload = () => w.PineViz && w.PineViz.mount ? resolve(w.PineViz) : reject(new Error('PineViz unavailable'));
         tag.onerror = () => { vizLoading = null; reject(new Error('PineViz unavailable')); };
         doc.head.appendChild(tag);
