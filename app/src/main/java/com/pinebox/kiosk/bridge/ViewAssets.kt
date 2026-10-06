@@ -68,7 +68,9 @@ object ViewAssets {
         "sfx-db.js",            // [sfx-library] the SFX database window (opened from the file manager)
         "production-feed.js",   // [prod-feed] the pause, as a feed, above the script view
         "flow-chart.js",        // [flowchart] the conversation as a growing flowchart (script view toggle)
+        "hour-flow.js",         // [hour-flow] the hour's entry as a vertical flowchart editor
         "speech-gates.js",      // [speech-gates] every gate on the station's speech (script view toolbar)
+        "llm-commands.js",      // [llm-command] the LLM command book (PineLlmCommands.open / mount)
         // Voice Actor strips: the last eight profiles under each seat
         // (tap assigns, hold auditions a never-aired sample + meter).
         "voice-actor-strips.js",
@@ -150,6 +152,9 @@ object ViewAssets {
         // #1317: the terminal noticing its own deafness. Before rail so
         // it is watching whatever else fails to start.
         "deaf-watch.js",
+        "blocked-book.js",        // [blocked-book] the blocked book (The Works' second tab)
+        "the-works.js",           // [works-portable] The Works: the rooms and the blocked book
+        "pine-tools-view.js",     // [tools-view] the TOOLS tab: every portable tool on this screen
         "rail.js",                // it looks for the globals above
         "pinelens.js",
         // THE HOT CORNERS, after everything they reach for: line-deep.js
@@ -166,6 +171,9 @@ object ViewAssets {
     private val STYLES = listOf(
         "pinelens.css",
         "view-chrome.css",
+        "blocked-book.css",       // [blocked-book]
+        "the-works.css",          // [works-portable]
+        "pine-tools-view.css",    // [tools-view]
         "changelog.css",          // the Git task history panel
         "boot-splash.css",        // the startup assembly
         "console-trace.css",      // the trace popup and the strip's menu
@@ -197,7 +205,9 @@ object ViewAssets {
         "sfx-db.css",           // [sfx-library] the SFX database window
         "production-feed.css",  // [prod-feed] the pause, as a feed
         "flow-chart.css",       // [flowchart] the conversation as a growing flowchart
+        "hour-flow.css",        // [hour-flow] the hour's entry as a vertical flowchart editor
         "speech-gates.css",     // [speech-gates] the speech gates panel
+        "llm-commands.css",     // [llm-command] the command book
         "voice-actor-strips.css",  // the profile strips and the audition sheet
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
