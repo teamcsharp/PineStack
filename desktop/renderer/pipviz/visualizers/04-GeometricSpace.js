@@ -11,7 +11,7 @@
 
   PineViz.register({
     id: 'geometric-space', index: 4, name: 'Geometric Space', blurb: 'floating glass geometry',
-    defaults: { objects: 26, bloom: .5, glass: 1 },
+    defaults: { objects: 26, bloom: .8, glass: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, bodies = [], fragments = [], ribbon, lights = [], lastBeat = 0, impulse;
       const geometries = () => [new THREE.TetrahedronGeometry(1), new THREE.OctahedronGeometry(1), new THREE.IcosahedronGeometry(1, 0), new THREE.TorusGeometry(.9, .18, 10, 36), new THREE.BoxGeometry(1.3, 1.3, 1.3), new THREE.DodecahedronGeometry(1, 0), new THREE.ConeGeometry(.8, 1.6, 5)];

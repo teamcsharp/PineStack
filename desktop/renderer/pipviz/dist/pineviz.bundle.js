@@ -1,5 +1,5 @@
-/* PineViz bundle 91888738b581 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
-/* pineviz-build:91888738b581 */
+/* PineViz bundle f71f113dec67 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
+/* pineviz-build:f71f113dec67 */
 /* ---- core/PineViz.js ---- */
 /* PineViz - the Pine PiP's living background. One telemetry road, ten visual environments.
  *
@@ -275,8 +275,8 @@
   const { clamp, GLSL_NOISE } = PineViz.util;
 
   const QUALITY = {
-    low: { pixelRatio: .75, scale: .35, bloom: false, post: false },
-    medium: { pixelRatio: 1, scale: .6, bloom: false, post: true },
+    low: { pixelRatio: .75, scale: .35, bloom: true, post: true },      /* [viz-look] the glow is the look: bloom at every rung */
+    medium: { pixelRatio: 1, scale: .6, bloom: true, post: true },
     high: { pixelRatio: 1.25, scale: 1, bloom: true, post: true },
     ultra: { pixelRatio: 2, scale: 1.5, bloom: true, post: true }
   };
@@ -325,15 +325,17 @@
       this.canvas = options.canvas || document.createElement('canvas');
       this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: options.antialias !== false, alpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: !!options.preserveDrawingBuffer });
       this.renderer.autoClear = true;
+      /* [viz-look] ACES at the end of the stack, exposure up: neon highlights roll off instead of clipping white */
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping; this.renderer.toneMappingExposure = 1.15;
       this.width = 2; this.height = 2;
       this.qualityCap = options.quality || 'high';
       this.quality = this.qualityCap; this.q = QUALITY[this.quality];
       this.auto = options.autoQuality !== false;
       this.frameAvg = 16; this.slowFor = 0; this.fastFor = 0; this.listeners = new Set();
-      this.bloomStrength = .5; this.bloomThreshold = .55;
-      const pars = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: true };
+      this.bloomStrength = 1.15; this.bloomThreshold = .22;   /* [viz-look] was .5 / .55, a restraint the reference does not have */
+      const pars = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: true, type: THREE.HalfFloatType };   /* [viz-look] HDR: values past 1 survive into the bloom */
       this.targetA = new THREE.WebGLRenderTarget(2, 2, pars); this.targetB = new THREE.WebGLRenderTarget(2, 2, pars);
-      const small = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: false };
+      const small = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: false, type: THREE.HalfFloatType };
       this.bright = new THREE.WebGLRenderTarget(2, 2, small); this.blur1 = new THREE.WebGLRenderTarget(2, 2, small); this.blur2 = new THREE.WebGLRenderTarget(2, 2, small);
       this.quadScene = new THREE.Scene(); this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
       this.composite = new THREE.ShaderMaterial({ vertexShader: QUAD_VERT, fragmentShader: COMPOSITE_FRAG, depthTest: false, depthWrite: false,
@@ -392,7 +394,7 @@
       this.quad.material = this.composite;
       const u = this.composite.uniforms;
       u.uMix.value = clamp(mix || 0, 0, 1); u.uMode.value = mode || 0; u.uTime.value = time || 0; u.uHasB.value = incoming ? 1 : 0;
-      u.uBloom.value = useBloom ? bloom * .9 : 0;
+      u.uBloom.value = useBloom ? bloom * 1.25 : 0;   /* [viz-look] */
       R.setRenderTarget(null); R.render(this.quadScene, this.quadCamera);
     }
     dispose() { for (const t of [this.targetA, this.targetB, this.bright, this.blur1, this.blur2]) t.dispose(); this.quad.geometry.dispose(); this.composite.dispose(); this.brightMat.dispose(); this.blurMat.dispose(); this.renderer.dispose(); }
@@ -443,7 +445,7 @@
       this.renderer.onQuality((level, q) => { for (const [id, v] of this.instances) { if (v === this.active || v === this.incoming) this.rebuild(id); else { this.disposeInstance(id); } } this.emit('quality', level); });
       this.presets.onChange((id, key, value) => { const v = this.instances.get(id); if (v) { v.preset = this.presets.get(id); v.presetChanged?.(key, value); } });
       this.renderer.clearColor(this.palette.colors.bg);
-      if (options.click !== false) this.installClick();
+      this.clickMode = options.click; if (options.click !== false) this.installClick();
       if (options.keys !== false) this.installKeys();
       this.resize();
       const first = options.mode || this.remembered() || (PineViz.registry[0] && PineViz.registry[0].id);
@@ -509,14 +511,16 @@
     setByIndex(index) { const def = PineViz.registry.find(d => d.index === index) || PineViz.registry[index - 1]; if (def) this.set(def.id); return def ? def.id : null; }
     /* ---------------------------------------------------------------- input roads */
     installClick() {
-      /* a click on the background cycles; a double-click is left to whoever owns the surface (the PiP expands on it) */
-      let timer = 0;
+      /* [viz-dblclick] click: true - a click cycles (260 ms wait so a double-click still reaches the surface's owner);
+         click: 'double' - a DOUBLE-click cycles and does not reach the owner (the PiP would expand on it); a click is left alone */
+      let timer = 0; const dbl = this.clickMode === 'double';
       this.canvas.addEventListener('click', e => {
+        if (dbl) return;
         if (e.detail > 1) { clearTimeout(timer); timer = 0; return; }
         clearTimeout(timer);
         timer = setTimeout(() => { timer = 0; this.next(e.shiftKey ? -1 : 1); }, 260);
       });
-      this.canvas.addEventListener('dblclick', () => { clearTimeout(timer); timer = 0; });
+      this.canvas.addEventListener('dblclick', e => { clearTimeout(timer); timer = 0; if (dbl) { e.stopPropagation(); e.preventDefault(); this.next(e.shiftKey ? -1 : 1); } });
     }
     installKeys() {
       this.keyHandler = e => {
@@ -1034,7 +1038,7 @@
 
   PineViz.register({
     id: 'smooth-wave', index: 1, name: 'Smooth Wave', blurb: 'flowing ribbons',
-    defaults: { ribbons: 6, width: 1, bloom: .55, intensity: 1 },
+    defaults: { ribbons: 8, width: .9, bloom: .9, intensity: 1.15 },   /* [viz-look] thinner silk, more of it, glowing */
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, ribbons = [], pulse, time = 0, extent = { x: 8, y: 4.5 };
       const SEGMENTS = 160;
@@ -1077,7 +1081,7 @@
       }
       function layout(r, s, t) {
         const pos = r.mesh.geometry.attributes.position, span = extent.x * 1.35, scroll = t * r.speed * .35;
-        const widthScale = (ctx.preset.width || 1) * (1 + pulse.value * .5) * (1 + s.bass * .35) * (.8 + s.energy * .4) * extent.y * .3;
+        const widthScale = (ctx.preset.width || 1) * (1 + pulse.value * .5) * (1 + s.bass * .35) * (1.0 + s.energy * .4) * extent.y * .3;
         const cols = SEGMENTS + 1;
         for (let i = 0; i < cols; i++) {
           const u = i / SEGMENTS, x = (u - .5) * 2 * span;
@@ -1105,7 +1109,7 @@
           pulse.step(dt);
           backdrop.tick(s.energy, t);
           const idle = .35 + .65 * clamp(s.energy * 1.4, 0, 1);
-          for (const r of ribbons) { layout(r, s, t * idle); const u = r.mesh.material.uniforms; u.uTime.value = t; u.uEdge.value = s.treble * 1.3 + s.beat * .4; u.uOpacity.value = (.3 + .35 * idle) * (ctx.preset.opacity ?? 1); }
+          for (const r of ribbons) { layout(r, s, t * idle); const u = r.mesh.material.uniforms; u.uTime.value = t; u.uEdge.value = s.treble * 1.3 + s.beat * .4; u.uOpacity.value = (.6 + .3 * idle) * (ctx.preset.opacity ?? 1); }
         },
         resize(w, h) { camera.fitAspect(w / h); extent = halfExtent(camera, 10 - (-2)); },
         dispose() { for (const r of ribbons) { r.mesh.geometry.dispose(); r.mesh.material.dispose(); } ribbons = []; backdrop?.dispose(); },
@@ -1130,7 +1134,7 @@
 
   PineViz.register({
     id: 'particle-flow', index: 2, name: 'Particle Flow', blurb: 'swarming luminous matter',
-    defaults: { particles: 24000, size: 1, bloom: .6 },
+    defaults: { particles: 36000, size: .85, bloom: .9 },   /* [viz-look] a swarm of fine sparks, not discs */
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, points, material, sprite, count = 0, shock = { at: -10, strength: 0 }, lastBeat = 0;
       function build() {
@@ -1191,7 +1195,7 @@
                 vec3 c = mix(uB, uA, vDepth);
                 c = mix(c, uV, vCluster * 0.7 + vHeat * 0.35);
                 c = mix(c, uC, pow(vHeat, 2.0) * 0.6);
-                float lum = (0.18 + 0.55 * uRms + 0.25 * uEnergy) * (0.35 + 0.65 * vDepth);
+                float lum = (0.45 + 0.55 * uRms + 0.3 * uEnergy) * (0.35 + 0.65 * vDepth);
                 gl_FragColor = vec4(c * lum * 1.6, a * lum); }` });
           build();
         },
@@ -1226,7 +1230,7 @@
 
   PineViz.register({
     id: 'line-spectrum', index: 3, name: 'Line Spectrum', blurb: 'luminous contour lines',
-    defaults: { lines: 34, bloom: .45, indicators: 28 },
+    defaults: { lines: 40, bloom: .75, indicators: 28 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, lines = [], bars, barGeo, extent = { x: 8, y: 4.5 }, pulse = null, lastBeat = 0, pulseX = -99, heights = null, peaks = null;
       const POINTS = 170;
@@ -1308,7 +1312,7 @@
 
   PineViz.register({
     id: 'geometric-space', index: 4, name: 'Geometric Space', blurb: 'floating glass geometry',
-    defaults: { objects: 26, bloom: .5, glass: 1 },
+    defaults: { objects: 26, bloom: .8, glass: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, bodies = [], fragments = [], ribbon, lights = [], lastBeat = 0, impulse;
       const geometries = () => [new THREE.TetrahedronGeometry(1), new THREE.OctahedronGeometry(1), new THREE.IcosahedronGeometry(1, 0), new THREE.TorusGeometry(.9, .18, 10, 36), new THREE.BoxGeometry(1.3, 1.3, 1.3), new THREE.DodecahedronGeometry(1, 0), new THREE.ConeGeometry(.8, 1.6, 5)];
@@ -1411,7 +1415,7 @@
 
   PineViz.register({
     id: 'speed-lines', index: 5, name: 'Speed Lines', blurb: 'hyperdrive streaks', persist: true,
-    defaults: { streaks: 520, trail: .82, bloom: .5 },
+    defaults: { streaks: 640, trail: .84, bloom: .8 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, veil, streaks, material, count = 0, surge, lastBeat = 0, vp = { x: 0, y: 0 }, travel = 0, veilMat;
       function build() {
@@ -1626,7 +1630,7 @@
 
   PineViz.register({
     id: 'audio-bars', index: 7, name: 'Audio Bars', blurb: 'dimensional spectrum columns',
-    defaults: { columns: 80, bloom: .55, height: 1 },
+    defaults: { columns: 80, bloom: .85, height: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, body, cap, peakMesh, mirror, floor, floorMat, n = 0, heights, peaks, dummy, lights, floorPulse, lastBeat = 0, bodyMat, capMat, peakMat, mirrorMat;
       const WIDTH = 16;
@@ -1711,7 +1715,7 @@
 
   PineViz.register({
     id: 'liquid-glass', index: 8, name: 'Liquid Glass', blurb: 'refractive liquid membrane',
-    defaults: { droplets: 18, bloom: .45, thickness: 1 },
+    defaults: { droplets: 22, bloom: .75, thickness: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, membrane, mat, drops = [], lights, pressure, lastBeat = 0, waveAt = -9, glow;
       const uniforms = { uTime: { value: 0 }, uBass: { value: 0 }, uMid: { value: 0 }, uTreble: { value: 0 }, uRms: { value: 0 }, uWaveAt: { value: -9 }, uWave: { value: 0 }, uThick: { value: 1 } };
@@ -1812,7 +1816,7 @@
 
   PineViz.register({
     id: 'retro-grid', index: 9, name: 'Retro Grid', blurb: 'wireframe landscape and sun',
-    defaults: { bloom: .6, density: 1, fog: 1 },
+    defaults: { bloom: .85, density: 1, fog: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, grid, gridMat, sun, sunMat, sky, skyMat, lastBeat = 0, pulseZ = 99, speed = 0;
       function build() {
@@ -1892,7 +1896,7 @@
 
   PineViz.register({
     id: 'shape-burst', index: 10, name: 'Shape Burst', blurb: 'reactive floating symbols', persist: true,
-    defaults: { symbols: 360, trail: .55, bloom: .5 },
+    defaults: { symbols: 480, trail: .6, bloom: .8 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, veil, veilMat, mesh, material, n = 0, items = [], paths = [], extent = { x: 8, y: 4.5 }, lastBeat = 0, dummy, burstLeft = 0, glyphAttr, sizeAttr, heatAttr;
       const KINDS = 8;

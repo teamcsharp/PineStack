@@ -100,13 +100,15 @@
       /* the PiP theme as a visualizer palette: the surface is the night, the accent the light */
       const rgb = String(palette.surface || '8 23 19').split(/[\s,]+/).map(Number);
       const hex = (r, g, b) => '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
-      P.PALETTES.pinepip = { name: 'Pine PiP', bg: hex(rgb[0] * .5, rgb[1] * .5, rgb[2] * .6), bg2: palette.button || '#17382c', primary: palette.accent || '#98e9ae', secondary: palette.text || '#e1f8ea', accent: '#ffffff', glow: palette.accent || '#98e9ae', ink: palette.text || '#e1f8ea' };
+      /* [viz-look] the visuals are NOT coloured by the PiP theme: a graphite theme made every mode grey on grey.
+         This is the reference palette - deep navy night, electric blue, violet, cyan light, pale ink. */
+      P.PALETTES.pinepip = { name: 'Pine PiP', bg: '#03061a', bg2: '#0a1c4d', primary: '#2b7bff', secondary: '#8a4dff', accent: '#3de1ff', glow: '#6f8cff', ink: '#eaf2ff' };
       return 'pinepip';
     }
     function mountViz(P) {
       if (viz || !enabled || shell) return;
       vizProvider = new P.ExternalProvider();
-      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: true, modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
+      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: 'double', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
       viz.on((kind, value) => { if (kind === 'mode') { vizMode = value; try { w.postMessage({ type: 'pine-pip-background', mode: value }, '*'); } catch (_) {} } });
       vizMode = viz.activeId || '';
       if (particles) { particles.dispose(); particles = null; }

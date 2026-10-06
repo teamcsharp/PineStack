@@ -11,7 +11,7 @@
 
   PineViz.register({
     id: 'speed-lines', index: 5, name: 'Speed Lines', blurb: 'hyperdrive streaks', persist: true,
-    defaults: { streaks: 520, trail: .82, bloom: .5 },
+    defaults: { streaks: 640, trail: .84, bloom: .8 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, veil, streaks, material, count = 0, surge, lastBeat = 0, vp = { x: 0, y: 0 }, travel = 0, veilMat;
       function build() {

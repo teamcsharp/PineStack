@@ -11,7 +11,7 @@
 
   PineViz.register({
     id: 'particle-flow', index: 2, name: 'Particle Flow', blurb: 'swarming luminous matter',
-    defaults: { particles: 24000, size: 1, bloom: .6 },
+    defaults: { particles: 36000, size: .85, bloom: .9 },   /* [viz-look] a swarm of fine sparks, not discs */
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, points, material, sprite, count = 0, shock = { at: -10, strength: 0 }, lastBeat = 0;
       function build() {
@@ -72,7 +72,7 @@
                 vec3 c = mix(uB, uA, vDepth);
                 c = mix(c, uV, vCluster * 0.7 + vHeat * 0.35);
                 c = mix(c, uC, pow(vHeat, 2.0) * 0.6);
-                float lum = (0.18 + 0.55 * uRms + 0.25 * uEnergy) * (0.35 + 0.65 * vDepth);
+                float lum = (0.45 + 0.55 * uRms + 0.3 * uEnergy) * (0.35 + 0.65 * vDepth);
                 gl_FragColor = vec4(c * lum * 1.6, a * lum); }` });
           build();
         },

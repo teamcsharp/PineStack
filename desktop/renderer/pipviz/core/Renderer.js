@@ -8,8 +8,8 @@
   const { clamp, GLSL_NOISE } = PineViz.util;
 
   const QUALITY = {
-    low: { pixelRatio: .75, scale: .35, bloom: false, post: false },
-    medium: { pixelRatio: 1, scale: .6, bloom: false, post: true },
+    low: { pixelRatio: .75, scale: .35, bloom: true, post: true },      /* [viz-look] the glow is the look: bloom at every rung */
+    medium: { pixelRatio: 1, scale: .6, bloom: true, post: true },
     high: { pixelRatio: 1.25, scale: 1, bloom: true, post: true },
     ultra: { pixelRatio: 2, scale: 1.5, bloom: true, post: true }
   };
@@ -58,15 +58,17 @@
       this.canvas = options.canvas || document.createElement('canvas');
       this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: options.antialias !== false, alpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: !!options.preserveDrawingBuffer });
       this.renderer.autoClear = true;
+      /* [viz-look] ACES at the end of the stack, exposure up: neon highlights roll off instead of clipping white */
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping; this.renderer.toneMappingExposure = 1.15;
       this.width = 2; this.height = 2;
       this.qualityCap = options.quality || 'high';
       this.quality = this.qualityCap; this.q = QUALITY[this.quality];
       this.auto = options.autoQuality !== false;
       this.frameAvg = 16; this.slowFor = 0; this.fastFor = 0; this.listeners = new Set();
-      this.bloomStrength = .5; this.bloomThreshold = .55;
-      const pars = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: true };
+      this.bloomStrength = 1.15; this.bloomThreshold = .22;   /* [viz-look] was .5 / .55, a restraint the reference does not have */
+      const pars = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: true, type: THREE.HalfFloatType };   /* [viz-look] HDR: values past 1 survive into the bloom */
       this.targetA = new THREE.WebGLRenderTarget(2, 2, pars); this.targetB = new THREE.WebGLRenderTarget(2, 2, pars);
-      const small = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: false };
+      const small = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, depthBuffer: false, type: THREE.HalfFloatType };
       this.bright = new THREE.WebGLRenderTarget(2, 2, small); this.blur1 = new THREE.WebGLRenderTarget(2, 2, small); this.blur2 = new THREE.WebGLRenderTarget(2, 2, small);
       this.quadScene = new THREE.Scene(); this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
       this.composite = new THREE.ShaderMaterial({ vertexShader: QUAD_VERT, fragmentShader: COMPOSITE_FRAG, depthTest: false, depthWrite: false,
@@ -125,7 +127,7 @@
       this.quad.material = this.composite;
       const u = this.composite.uniforms;
       u.uMix.value = clamp(mix || 0, 0, 1); u.uMode.value = mode || 0; u.uTime.value = time || 0; u.uHasB.value = incoming ? 1 : 0;
-      u.uBloom.value = useBloom ? bloom * .9 : 0;
+      u.uBloom.value = useBloom ? bloom * 1.25 : 0;   /* [viz-look] */
       R.setRenderTarget(null); R.render(this.quadScene, this.quadCamera);
     }
     dispose() { for (const t of [this.targetA, this.targetB, this.bright, this.blur1, this.blur2]) t.dispose(); this.quad.geometry.dispose(); this.composite.dispose(); this.brightMat.dispose(); this.blurMat.dispose(); this.renderer.dispose(); }

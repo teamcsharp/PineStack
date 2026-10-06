@@ -10,7 +10,7 @@
 
   PineViz.register({
     id: 'retro-grid', index: 9, name: 'Retro Grid', blurb: 'wireframe landscape and sun',
-    defaults: { bloom: .6, density: 1, fog: 1 },
+    defaults: { bloom: .85, density: 1, fog: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, grid, gridMat, sun, sunMat, sky, skyMat, lastBeat = 0, pulseZ = 99, speed = 0;
       function build() {

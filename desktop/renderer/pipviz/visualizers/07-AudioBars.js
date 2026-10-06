@@ -10,7 +10,7 @@
 
   PineViz.register({
     id: 'audio-bars', index: 7, name: 'Audio Bars', blurb: 'dimensional spectrum columns',
-    defaults: { columns: 80, bloom: .55, height: 1 },
+    defaults: { columns: 80, bloom: .85, height: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, body, cap, peakMesh, mirror, floor, floorMat, n = 0, heights, peaks, dummy, lights, floorPulse, lastBeat = 0, bodyMat, capMat, peakMat, mirrorMat;
       const WIDTH = 16;

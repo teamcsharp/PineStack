@@ -40,7 +40,7 @@
       this.renderer.onQuality((level, q) => { for (const [id, v] of this.instances) { if (v === this.active || v === this.incoming) this.rebuild(id); else { this.disposeInstance(id); } } this.emit('quality', level); });
       this.presets.onChange((id, key, value) => { const v = this.instances.get(id); if (v) { v.preset = this.presets.get(id); v.presetChanged?.(key, value); } });
       this.renderer.clearColor(this.palette.colors.bg);
-      if (options.click !== false) this.installClick();
+      this.clickMode = options.click; if (options.click !== false) this.installClick();
       if (options.keys !== false) this.installKeys();
       this.resize();
       const first = options.mode || this.remembered() || (PineViz.registry[0] && PineViz.registry[0].id);
@@ -106,14 +106,16 @@
     setByIndex(index) { const def = PineViz.registry.find(d => d.index === index) || PineViz.registry[index - 1]; if (def) this.set(def.id); return def ? def.id : null; }
     /* ---------------------------------------------------------------- input roads */
     installClick() {
-      /* a click on the background cycles; a double-click is left to whoever owns the surface (the PiP expands on it) */
-      let timer = 0;
+      /* [viz-dblclick] click: true - a click cycles (260 ms wait so a double-click still reaches the surface's owner);
+         click: 'double' - a DOUBLE-click cycles and does not reach the owner (the PiP would expand on it); a click is left alone */
+      let timer = 0; const dbl = this.clickMode === 'double';
       this.canvas.addEventListener('click', e => {
+        if (dbl) return;
         if (e.detail > 1) { clearTimeout(timer); timer = 0; return; }
         clearTimeout(timer);
         timer = setTimeout(() => { timer = 0; this.next(e.shiftKey ? -1 : 1); }, 260);
       });
-      this.canvas.addEventListener('dblclick', () => { clearTimeout(timer); timer = 0; });
+      this.canvas.addEventListener('dblclick', e => { clearTimeout(timer); timer = 0; if (dbl) { e.stopPropagation(); e.preventDefault(); this.next(e.shiftKey ? -1 : 1); } });
     }
     installKeys() {
       this.keyHandler = e => {

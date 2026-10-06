@@ -81,19 +81,18 @@ app.whenReady().then(async () => {
   assert.equal(m.particles, false, 'the old particle cloud gave way');
   assert.equal(bundleHits, 1, 'the bundle came from the station once');
   await delay(1500); await shot('1-pip-background');
-  at('click'); /* ---- 2. a click on the background cycles; a double-click does not ---- */
-  const before = m.mode;
+  at('click'); /* ---- 2. [viz-dblclick] a double-click on the background cycles; a single click leaves the mode alone ---- */
+  const before = JSON.parse(await inFrame('JSON.stringify(window.PinePipPanel.background())')).mode;
   await inFrame(`document.querySelector('#pine-pip-panel canvas.pineviz-canvas').dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 300, clientY: 200 }))`);
-  await delay(1500);   /* the click waits 260 ms for a second click, then the crossfade takes a second */
+  await delay(900);
+  assert.equal(JSON.parse(await inFrame('JSON.stringify(window.PinePipPanel.background())')).mode, before, '[viz-dblclick] a single click leaves the background alone');
+  await inFrame(`document.querySelector('#pine-pip-panel canvas.pineviz-canvas').dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, clientX: 300, clientY: 200 }))`);
+  await delay(1500);   /* the crossfade takes a second */
   const after = JSON.parse(await inFrame('JSON.stringify(window.PinePipPanel.background())')).mode;
-  assert.notEqual(after, before, '[pip-viz] a click cycles the background: ' + before + ' -> ' + after);
+  assert.notEqual(after, before, '[viz-dblclick] a double-click cycles the background: ' + before + ' -> ' + after);
   const order = JSON.parse(await inFrame('JSON.stringify(window.PineViz.modes().map(x => x.id))'));
   assert.equal(after, order[(order.indexOf(before) + 1) % order.length], 'to the next in order');
-  /* the second click of a double-click (detail 2) cancels the cycle; the host's own dblclick listener then expands the window, which is not exercised here */
-  await inFrame(`(()=>{const c=document.querySelector('#pine-pip-panel canvas.pineviz-canvas');c.dispatchEvent(new MouseEvent('click',{bubbles:true,detail:1}));c.dispatchEvent(new MouseEvent('click',{bubbles:true,detail:2}));})()`);
-  await delay(1500);
-  assert.equal(JSON.parse(await inFrame('JSON.stringify(window.PinePipPanel.background())')).mode, after, 'a double-click leaves the mode alone (it expands the window instead)');
-  assert.equal(win.__pinePip, true, 'still in PiP');
+  assert.equal(win.__pinePip, true, 'still in PiP: the double-click did not expand the window');
   assert.equal(await inFrame('localStorage.getItem("pinePipVizMode")'), after, 'the choice is kept');
   at('menu'); /* ---- 3. the menu names a mode; the shell's action road sets it ---- */
   await page('pineDesktop.pipMenu({})'); await delay(100);

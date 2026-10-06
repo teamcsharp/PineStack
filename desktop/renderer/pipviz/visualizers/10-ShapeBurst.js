@@ -11,7 +11,7 @@
 
   PineViz.register({
     id: 'shape-burst', index: 10, name: 'Shape Burst', blurb: 'reactive floating symbols', persist: true,
-    defaults: { symbols: 360, trail: .55, bloom: .5 },
+    defaults: { symbols: 480, trail: .6, bloom: .8 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, veil, veilMat, mesh, material, n = 0, items = [], paths = [], extent = { x: 8, y: 4.5 }, lastBeat = 0, dummy, burstLeft = 0, glyphAttr, sizeAttr, heatAttr;
       const KINDS = 8;

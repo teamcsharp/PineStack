@@ -11,7 +11,7 @@
 
   PineViz.register({
     id: 'liquid-glass', index: 8, name: 'Liquid Glass', blurb: 'refractive liquid membrane',
-    defaults: { droplets: 18, bloom: .45, thickness: 1 },
+    defaults: { droplets: 22, bloom: .75, thickness: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, membrane, mat, drops = [], lights, pressure, lastBeat = 0, waveAt = -9, glow;
       const uniforms = { uTime: { value: 0 }, uBass: { value: 0 }, uMid: { value: 0 }, uTreble: { value: 0 }, uRms: { value: 0 }, uWaveAt: { value: -9 }, uWave: { value: 0 }, uThick: { value: 1 } };

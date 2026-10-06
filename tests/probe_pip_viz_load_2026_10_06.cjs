@@ -33,6 +33,7 @@ app.whenReady().then(async () => {
     await delay(round === 0 ? 2000 : 5000);
     console.log('t+' + (2 + round * 5) + 's', await inFrame(Q));
   }
+  console.log('manual mount:', await inFrame(`(() => { try { const P = window.PineViz; if (!P) return 'no PineViz'; const el = document.createElement('div'); el.style.cssText = 'position:fixed;left:0;top:0;width:320px;height:180px;'; document.body.appendChild(el); const v = P.mount(el, { palette: 'pinepip', quality: 'low', keys: false, click: false }); return 'ok mode=' + v.activeId + ' running=' + v.running; } catch (e) { return 'THROW ' + e.message + ' | ' + String(e.stack || '').split('\\n').slice(0, 4).join(' / ').slice(0, 500); } })()`));
   console.log('frame console since PiP (' + (frameLog.length - mark) + '):');
   frameLog.slice(mark).slice(0, 40).forEach(l => console.log('  ' + l));
   win.destroy(); process.exit(0);

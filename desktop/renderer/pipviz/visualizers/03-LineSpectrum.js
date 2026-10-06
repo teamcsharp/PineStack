@@ -10,7 +10,7 @@
 
   PineViz.register({
     id: 'line-spectrum', index: 3, name: 'Line Spectrum', blurb: 'luminous contour lines',
-    defaults: { lines: 34, bloom: .45, indicators: 28 },
+    defaults: { lines: 40, bloom: .75, indicators: 28 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, lines = [], bars, barGeo, extent = { x: 8, y: 4.5 }, pulse = null, lastBeat = 0, pulseX = -99, heights = null, peaks = null;
       const POINTS = 170;

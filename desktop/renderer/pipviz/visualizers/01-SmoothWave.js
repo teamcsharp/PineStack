@@ -10,7 +10,7 @@
 
   PineViz.register({
     id: 'smooth-wave', index: 1, name: 'Smooth Wave', blurb: 'flowing ribbons',
-    defaults: { ribbons: 6, width: 1, bloom: .55, intensity: 1 },
+    defaults: { ribbons: 8, width: .9, bloom: .9, intensity: 1.15 },   /* [viz-look] thinner silk, more of it, glowing */
     create(ctx) {
       const { THREE } = ctx; let scene, camera, backdrop, ribbons = [], pulse, time = 0, extent = { x: 8, y: 4.5 };
       const SEGMENTS = 160;
@@ -53,7 +53,7 @@
       }
       function layout(r, s, t) {
         const pos = r.mesh.geometry.attributes.position, span = extent.x * 1.35, scroll = t * r.speed * .35;
-        const widthScale = (ctx.preset.width || 1) * (1 + pulse.value * .5) * (1 + s.bass * .35) * (.8 + s.energy * .4) * extent.y * .3;
+        const widthScale = (ctx.preset.width || 1) * (1 + pulse.value * .5) * (1 + s.bass * .35) * (1.0 + s.energy * .4) * extent.y * .3;
         const cols = SEGMENTS + 1;
         for (let i = 0; i < cols; i++) {
           const u = i / SEGMENTS, x = (u - .5) * 2 * span;
@@ -81,7 +81,7 @@
           pulse.step(dt);
           backdrop.tick(s.energy, t);
           const idle = .35 + .65 * clamp(s.energy * 1.4, 0, 1);
-          for (const r of ribbons) { layout(r, s, t * idle); const u = r.mesh.material.uniforms; u.uTime.value = t; u.uEdge.value = s.treble * 1.3 + s.beat * .4; u.uOpacity.value = (.3 + .35 * idle) * (ctx.preset.opacity ?? 1); }
+          for (const r of ribbons) { layout(r, s, t * idle); const u = r.mesh.material.uniforms; u.uTime.value = t; u.uEdge.value = s.treble * 1.3 + s.beat * .4; u.uOpacity.value = (.6 + .3 * idle) * (ctx.preset.opacity ?? 1); }
         },
         resize(w, h) { camera.fitAspect(w / h); extent = halfExtent(camera, 10 - (-2)); },
         dispose() { for (const r of ribbons) { r.mesh.geometry.dispose(); r.mesh.material.dispose(); } ribbons = []; backdrop?.dispose(); },
