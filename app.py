@@ -230745,7 +230745,7 @@ function drawScope(canvas, player) {
   if (!canvas || !player) return;
   // #745: costs nothing while it cannot be seen. The booth dock's scope
   // kept drawing at 60fps with the dock stowed.
-  if (!canvas.offsetParent) return;
+  if (!pineSeen(canvas)) return;   /* [pip-power] */
   const scope = audioScope(player);
   if (scope && scope.context.state === "suspended" && !player.paused) {
     scope.context.resume().catch(() => {});
@@ -230940,7 +230940,7 @@ async function stageStart(hostEl) {
     // every frame. The cover flow already bails like this; the stage and
     // the Mind never did, and the Mind is opened inline for the whole time
     // the station is on air.
-    if (document.hidden || !renderer.domElement.offsetParent) return;
+    if (!pineSeen(renderer.domElement)) return;   /* [pip-power] */
 
     if (phase === "idle") {
       // Breathing, and a slow drift so it never looks frozen.
@@ -231299,7 +231299,7 @@ function swirlStart(host) {
     const delta = Math.min(0.05, (now - last) / 1000 || 0);
     last = now;
     // Nothing to do while the tab is hidden or the panel is rolled up.
-    if (document.hidden || !host.offsetParent) return;
+    if (!pineSeen(host)) return;   /* [pip-power] */
     if (host.querySelector(".cf-focus")) return;
 
     tiles.forEach((tile) => {
@@ -232464,10 +232464,27 @@ function boothRoomPaint(state, live) {
   });
 }
 
+/* [pip-power] Whether a painter's surface can be seen at all. offsetParent is null only for
+ * display:none; in Pine PiP the station's panels under <main> are hidden with visibility:hidden
+ * (body.pine-pip > main > :not(#control)), so every canvas and three.js stage kept drawing at
+ * 60 fps behind the PiP - measured 2026-10-06 with tests/probe_pip_perf_2026_10_06.cjs:
+ * boothGlassDraw 0.95 s, drawScope 0.93 s and the stages' ticks of every 20 s, 60% of a core
+ * for a page nobody could see. checkVisibility() reads the visibility chain too; a hidden
+ * document is never seen; an engine without checkVisibility keeps the old answer. */
+function pineSeen(el) {
+  if (document.hidden || !el || !el.offsetParent) return false;
+  try {
+    if (typeof el.checkVisibility === "function") {
+      return el.checkVisibility({checkVisibilityCSS: true, visibilityProperty: true});
+    }
+  } catch (e) { /* the old answer */ }
+  return true;
+}
+
 function boothGlassDraw() {
   boothGlassRaf = requestAnimationFrame(boothGlassDraw);
   const canvas = document.getElementById("boothSpec");
-  if (!canvas || !canvas.offsetParent || document.hidden) return;
+  if (!pineSeen(canvas)) return;   /* [pip-power] */
   const ctx = canvas.getContext("2d");
   const ratio = window.devicePixelRatio || 1;
   // #737: the backing store used to be reassigned EVERY FRAME from
@@ -233567,7 +233584,7 @@ function adTraceDraw() {
   if (document.hidden) return;
   adTraces.forEach((canvas) => {
     if (!canvas.isConnected) { adTraces.delete(canvas); return; }
-    if (!canvas.offsetParent) return;
+    if (!pineSeen(canvas)) return;   /* [pip-power] */
     const ratio = window.devicePixelRatio || 1;
     const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
     const wantH = Math.max(1, Math.round(26 * ratio));
@@ -243601,7 +243618,7 @@ async function rhetSphereBuild(host) {
 
   function tick() {
     frame = requestAnimationFrame(tick);
-    if (document.hidden || !renderer.domElement.offsetParent) return;  // #745
+    if (!pineSeen(renderer.domElement)) return;   /* [pip-power] */  // #745
     tsec += 0.016;
     if (!dragging) { spinY += (0.003 - spinY) * 0.02;
                      spinX += (0.0006 - spinX) * 0.02; }
@@ -243820,7 +243837,7 @@ async function rhetVecBuild(host) {
   let pulse = 0;
   function tick() {
     frame = requestAnimationFrame(tick);
-    if (document.hidden || !renderer.domElement.offsetParent) return;  // #745
+    if (!pineSeen(renderer.domElement)) return;   /* [pip-power] */  // #745
     if (!dragging) { spinY += (0.0018 - spinY) * 0.02;
                      spinX += (0.0004 - spinX) * 0.02; }
     group.rotation.y += spinY; group.rotation.x += spinX;
@@ -256514,11 +256531,11 @@ function djGraphPanel() {
     if (!alive) return;
     raf = requestAnimationFrame(tick);
     // #745: costs nothing while it cannot be seen.
-    if (document.hidden || !renderer.domElement.offsetParent) return;
+    if (!pineSeen(renderer.domElement)) return;   /* [pip-power] */
     // #745: the Mind is opened inline whenever the station is on air, so
     // this WebGL scene was rendering all night whether or not it was on
     // screen. Reschedule, then bail — it picks straight back up.
-    if (document.hidden || !renderer.domElement.offsetParent) return;
+    if (!pineSeen(renderer.domElement)) return;   /* [pip-power] */
     const dt = Math.min(0.05, clock.getDelta());
     frame += 1;
     if (!dragging) yaw += dt * 0.05;      // a slow drift when left alone
