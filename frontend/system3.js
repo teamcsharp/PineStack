@@ -738,6 +738,10 @@ Object.assign(FAMILY_WHAT, {
 Object.assign(FAMILY_WHAT, {   /* [supercut-react] the booth's stance on the supercut */
   BOOK: ['Book work (BK1 manner, BK2 angle, BK3 errand)',
     'What a host does with the book in hand on the Book Time roads (book_open, book_read, book_close): the manner the next passage is read in, the angle the other host takes on it, and the errand run with the book - rolled per turn, never gated.'],
+  WELCOME: ['The welcome (BK4)',
+    'The shape Book Time opens in tonight, rolled on the two welcome legs of the book_open road: the book first, as if the listener just walked in, one word then the book, a question, a confession, formally, already reading, mid-argument, a promise. The station and the book are always named; the words are never the same welcome twice.'],
+  SIGNOFF: ['The sign-off (BK5)',
+    'The shape Book Time closes in tonight, rolled on the sign-off leg of the book_close road: the book has the last word, a promise for next time, plain thanks, a verdict, a question left open, abruptly, a dedication, the argument unsettled, quietly, a recommendation. The book is named and the music handed back every time.'],
   REACT: ['Supercut stance (REACT1)',
     'How a host takes the supercut that just played, rolled once per turn on the supercut_react road: loves it, hates it, split, wants it as the jingle, baffled, moved, suspicious, reviews it - each item a direction the host performs and never names. The wheel decides whether they love it or not.'],
 });
@@ -6807,7 +6811,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
   const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL',
-    'MGRTOPIC', 'MGRSUB', 'REACT', 'BOOK'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 - [book-nodes] BK1-BK3 */
+    'MGRTOPIC', 'MGRSUB', 'REACT', 'BOOK', 'WELCOME', 'SIGNOFF'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 - [book-nodes] BK1-BK3 */
   TABLE_FAMILIES.push('CALLOPEN', 'CALLANGLE', 'CALLSTAKES', 'CALLPROBE', 'CALLSOURCE', 'RW');
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */

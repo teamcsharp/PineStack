@@ -198,7 +198,7 @@ class RollTests(unittest.TestCase):
         self.assertEqual((out["rest"]["exclude_last"], out["rest"]["rest_factor"]), (mt.HISTORY_KEEP, 0.0))
 
     def test_the_default_config_hash_does_not_move(self):
-        self.assertEqual(system3.config_hash(system3.default_config()), "46d24d6641e2eb18")
+        self.assertEqual(system3.config_hash(system3.default_config()), "6541cb19bdeb701d")
         self.assertFalse({"MGRTOPIC1", "MGRSUB1"} & {t["id"] for t in system3.default_config()["tables"]})
 
 

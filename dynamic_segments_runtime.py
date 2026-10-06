@@ -475,8 +475,10 @@ class DynamicSegments:
                     or not isinstance(verdict, dict) or entry.get('phase_repaired_by')
                     or entry.get('dynamic_handed_off') or entry.get('dynamic_source_rejected')):
                 continue
-            if self.phase_error(row, rows):
-                continue
+            # [book-nodes-2] it comes back whatever the old rule still thinks; the rule's opinion is a note
+            why_now = self.phase_error(row, rows)
+            if why_now and not entry.get('book_phase_note'):
+                self.note_phase(row, why_now)
             entry.pop('dynamic_phase_rejected', None)
             entry.pop('dynamic_superseded', None)
             held = entry.get('handoff_unavailable')
@@ -633,17 +635,18 @@ class DynamicSegments:
             rows = self.book_rows(occurrence)
             if any(row.get('dynamic_handed_off') for row in rows):
                 return False  # once transport owns the episode, its body stays frozen
-            kept = []
+            # [book-nodes-2] NO GATE ON THE SHELF EITHER. This re-read every written part under the old phase
+            # rule and superseded the ones it disliked (10-06, 14:43-14:48: three closings written on the
+            # book_close road, each struck, nothing of the episode aired). What the rule would have said is a
+            # NOTE on the part (note_phase, kept once); the part stands, and the nodes do the book work.
+            noted = 0
             for row in rows:
-                why = self.phase_error(row, kept)
-                if why:
-                    self.reject_phase(row, why)
-                else:
-                    kept.append(row)
-            if len(kept) != len(rows):
+                why = self.phase_error(row, [r for r in rows if r is not row])
+                if why and not self.source_entry(row).get('book_phase_note'):
+                    self.note_phase(row, why)
+                    noted += 1
+            if noted:
                 self.call('_larder_save')
-                self.coverage_cache.clear()
-            rows = kept
             if self.readmit_phases(occurrence, rows):      # [book-opening] a second look
                 self.call('_larder_save')
                 self.coverage_cache.clear()
@@ -911,6 +914,18 @@ class DynamicSegments:
             # in order - the recorded opening first, then every recorded part as it lands - and an earlier
             # episode's recorded parts nobody heard go out before a new book is opened: the hosts read ON.
             ready = self.original.get('dialogue_row_ready') or (lambda kind, row: True)
+            # [book-nodes-3] A PART WITH A TAKE GONE IS RE-MADE AT THE DOOR, NOT REFUSED. The 14:45 opening on
+            # 10-06 had 7 of its 8 takes: its welcome was the same words as three earlier openings, one key in
+            # the pantry, spent when they aired - and the window went out as music. The kitchen's own re-make
+            # (larder_prepare renders only what is missing) runs here for the part the window wants next,
+            # bounded, before the door is asked.
+            remake = self.g.get('larder_prepare')
+            waiting = sorted([row for row in rows if not row.get('dynamic_handed_off')], key=self.book_order)
+            if waiting and callable(remake) and not ready('banter', waiting[0]) and not waiting[0].get('preparing'):
+                try:
+                    await asyncio.wait_for(remake(waiting[0]), timeout=self.BOOK_REMAKE_SECONDS)
+                except Exception:   # noqa: BLE001 - a re-make that fails or runs long leaves the door its choice
+                    pass
             candidates = [row for row in rows if not row.get('dynamic_handed_off') and ready('banter', row)]
             candidates.sort(key=self.book_order)
             carry_from, carry = '', []
@@ -956,6 +971,7 @@ class DynamicSegments:
     # dictate how they respond" (operator, 2026-10-06). Written and banked when the
     # supercut is prepared (road supercut_react, legs + REACT1 stances), aired
     # straight after it from the shelf; live when the shelf holds none.
+    BOOK_REMAKE_SECONDS = 45.0          # [book-nodes-3] the door's wait for a part's missing takes to be re-made
     REACT_ROAD = 'supercut_react'
     REACT_LINES = 4
 

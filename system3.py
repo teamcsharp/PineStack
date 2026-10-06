@@ -4089,6 +4089,7 @@ FAMILIES = FAMILIES + system3_tables.CALLEND_FAMILIES                        # [
 FAMILIES = FAMILIES + ("REACT",)                                              # [supercut-react] the booth's stance
 ROADS = ROADS + ("supercut_react",)                                           # [supercut-react] the road
 FAMILIES = FAMILIES + ("BOOK",)                                               # [book-nodes] the book work: manner, angle, errand
+FAMILIES = FAMILIES + ("WELCOME", "SIGNOFF")                                  # [book-nodes-3] the shape of the welcome and the sign-off
 ROADS = ROADS + ("book_open", "book_read", "book_close")                      # [book-nodes] Book Time's own roads
 FAMILIES = FAMILIES + system3_tables.CALLARC_FAMILIES                        # [s3-callarc] CALLARC, CALLSHIFT
 CALLEND_STATION = ("A", "B", "D", "S")     # the booth: host, co-host, third seat, Sam (where a call has his seat)
@@ -5234,6 +5235,12 @@ def _leg_row_add(t):
         book = [x["text"] for x in t.get("directions") or [] if x["family"] == "BOOK"]     # [book-nodes]
         if book:
             add += "; the book work: " + book[-1]
+        welcome = [x["text"] for x in t.get("directions") or [] if x["family"] == "WELCOME"]   # [book-nodes-3]
+        if welcome:
+            add += "; the welcome: " + welcome[-1]
+        signoff = [x["text"] for x in t.get("directions") or [] if x["family"] == "SIGNOFF"]   # [book-nodes-3]
+        if signoff:
+            add += "; the sign-off: " + signoff[-1]
         # [s3-es-dir] the feeling's own words - not on a drawn stock line (its words are fixed)
         _es = "" if any(x.get("family") == "LINE" for x in t.get("decisions") or []) \
             else (direction_block(t) or _es_line(t))                          # [s3-direction] legs, calls, lines

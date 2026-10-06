@@ -1756,6 +1756,75 @@ DEFAULT_TABLES.append(BK1)                                                   # [
 DEFAULT_TABLES.append(BK2)                                                   # [book-nodes]
 DEFAULT_TABLES.append(BK3)                                                   # [book-nodes]
 
+# [book-nodes-3] THE WELCOME AND THE SIGN-OFF ARE WHEELS. A leg that says "welcomes the listener and names the
+# station" writes the same sentence every episode; the pantry keys a take on its words, so one take served four
+# openings and was spent when they aired - and the fifth opening could not go out. The shape is rolled now.
+BK4 = {
+    "id": "BK4", "family": "WELCOME", "label": "The welcome (the shape the opening takes)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "How Book Time is opened tonight, rolled on the two welcome legs of the book_open road. The station "
+                   "and the book are always named; the shape, the first words and the order are the wheel's - never "
+                   "the same welcome twice.",
+    "categories": [
+        {"id": "shape", "label": "Shape", "weight": 1.0,
+         "items": _items([
+             {"id": "book_first", "label": "The book first", "weight": 1.0,
+              "text": "opens on the book itself - its title, said like a secret - and only then says hello and who is reading"},
+             {"id": "walked_in", "label": "As if they just walked in", "weight": 0.9,
+              "text": "welcomes the listener as if they had just walked into the room mid-sentence, and catches them up"},
+             {"id": "one_word", "label": "One word, then the book", "weight": 0.8,
+              "text": "one word of greeting, a pause, then straight into what tonight's book is and why it is on the desk"},
+             {"id": "weather", "label": "The hour first", "weight": 0.8,
+              "text": "names the hour and the mood of the station first, then that it is Book Time, then the book"},
+             {"id": "question", "label": "A question to the listener", "weight": 0.8,
+              "text": "opens with a question to the listener about the book's subject, then the welcome, then the title"},
+             {"id": "confession", "label": "A confession", "weight": 0.7,
+              "text": "confesses something about how tonight's book was chosen, then welcomes the listener properly"},
+             {"id": "formal", "label": "Formally", "weight": 0.7,
+              "text": "a formal, old-radio welcome - the station, the programme, the readers, the book - in that order, no jokes"},
+             {"id": "midread", "label": "Already reading", "weight": 0.7,
+              "text": "is already reading a line of the book aloud when the welcome starts, breaks off, and welcomes the listener"},
+             {"id": "argument", "label": "Mid-argument", "weight": 0.6,
+              "text": "is in the middle of an argument with the other host about the book when the welcome starts, and lets the listener in on it"},
+             {"id": "promise", "label": "A promise", "weight": 0.6,
+              "text": "promises the listener one thing they will know by the end of tonight's reading, then says who is reading and what"},
+         ])},
+    ],
+}
+BK5 = {
+    "id": "BK5", "family": "SIGNOFF", "label": "The sign-off (the shape the close takes)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "How Book Time is closed tonight, rolled on the sign-off leg of the book_close road. The book is "
+                   "named and the music is handed back every time; the shape and the last words are the wheel's.",
+    "categories": [
+        {"id": "shape", "label": "Shape", "weight": 1.0,
+         "items": _items([
+             {"id": "last_line", "label": "The book's last words", "weight": 1.0,
+              "text": "lets the book have the last word - one more sentence of it - then names it and hands back to the music"},
+             {"id": "next_time", "label": "A promise for next time", "weight": 0.9,
+              "text": "says what will be read next time, names the book, and hands back to the music"},
+             {"id": "thanks_plain", "label": "Plain thanks", "weight": 0.8,
+              "text": "thanks the listener plainly for sitting through the reading, names the book once more, and hands back to the music"},
+             {"id": "verdict", "label": "A verdict", "weight": 0.8,
+              "text": "gives a one-line verdict on the book as it stands tonight, then hands back to the music"},
+             {"id": "question_back", "label": "A question left open", "weight": 0.8,
+              "text": "leaves the listener one question the reading raised, names the book, and hands back to the music"},
+             {"id": "abrupt", "label": "Abruptly", "weight": 0.7,
+              "text": "closes abruptly - the book shut mid-thought, the title said once, and the music back before anyone objects"},
+             {"id": "dedication", "label": "A dedication", "weight": 0.7,
+              "text": "dedicates tonight's reading of the book to somebody listening, and hands back to the music"},
+             {"id": "argument_close", "label": "The argument unsettled", "weight": 0.6,
+              "text": "hands back to the music with the argument about the book still unsettled, and says so"},
+             {"id": "whisper", "label": "Quietly", "weight": 0.6,
+              "text": "closes quietly, almost a whisper - the book, the station, goodnight - and the music comes up under it"},
+             {"id": "recommend", "label": "A recommendation", "weight": 0.6,
+              "text": "tells the listener whether to pick the book up themselves and why, then hands back to the music"},
+         ])},
+    ],
+}
+DEFAULT_TABLES.append(BK4)                                                   # [book-nodes-3]
+DEFAULT_TABLES.append(BK5)                                                   # [book-nodes-3]
+
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
 # Initial Statement [CTS1] -> Response A [ES1, RS1] -> Response B [ES1, RS1]
@@ -2134,11 +2203,14 @@ DEFAULT_ROAD_STRUCTURES = {
     # writer make is what airs.
     "book_open": _legs_structure("book_open", "Book Time: the opening", 4, 6, [
         _leg("hello_a", "The welcome", "open", "A",
-             "WELCOMES the listener to Book Time on {stationname} and says their own name - I'm, and the name - "
-             "then names the book, {book}, and the chapter being read tonight, {bookchapter}", "ES"),
+             "opens Book Time on {stationname} in the shape rolled - the station, their own name, the book {book} "
+             "and the chapter being read tonight, {bookchapter}, all get said, but in fresh words and in that "
+             "shape's order: never the station's stock welcome sentence, never the same welcome as another night",
+             "ES", "WELCOME"),
         _leg("hello_b", "The other host", "middle", "B",
-             "says their own name the same way, welcomes the listener too, and says in one line what pulled "
-             "them into this book tonight", "ES", "RS"),
+             "says their own name, takes up the welcome in the shape rolled for them - in their own words, not "
+             "an echo of the first host's - and says in one line what pulled them into this book tonight",
+             "ES", "RS", "WELCOME"),
         _leg("first_read", "The first reading", "middle", "A",
              "READS the first passage word for word, exactly as the book has it - {booksentences} - in the "
              "manner rolled, and stops where it stops", "ES", "BOOK"),
@@ -2169,8 +2241,8 @@ DEFAULT_ROAD_STRUCTURES = {
         _leg("takeaway", "The takeaway", "middle", "B",
              "their takeaway from tonight's reading, in the feeling rolled, in two lines at most", "ES", "RS"),
         _leg("signoff", "The sign-off", "close", "alternate",
-             "THANKS the listener for Book Time on {stationname}, names {book} once more, and hands back to "
-             "the music", "ES", "FL2close"),
+             "closes Book Time on {stationname} in the shape rolled - {book} is named and the music is handed "
+             "back, in fresh words, never the same sign-off as another night", "ES", "FL2close", "SIGNOFF"),
     ], "BOOK TIME CLOSE"),
     "supercut_react": _legs_structure("supercut_react", "Supercut reaction", 3, 5, [   # [supercut-react]
         _leg("first", "First word on the supercut", "open", "A",
@@ -2322,7 +2394,7 @@ def validate_structure(road, st):
         if str(leg.get("seat") or "") not in ("A", "B", "C", "D", "E", "alternate"):
             out.append("leg %s: seat must be A-E or alternate" % leg["id"])
         for d in leg.get("draws") or []:
-            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS", "REACT", "BOOK"):   # [supercut-react] [book-nodes]
+            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS", "REACT", "BOOK", "WELCOME", "SIGNOFF"):   # [supercut-react] [book-nodes]
                 out.append("leg %s: unknown draw %r" % (leg["id"], d))
         if "diversity_families" in leg:
             import call_diversity

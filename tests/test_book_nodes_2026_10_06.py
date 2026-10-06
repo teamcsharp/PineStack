@@ -40,7 +40,7 @@ class TheNodes(unittest.TestCase):
         self.assertIn("{bookchapter}", opening["hello_a"]["act"])
         close = {leg["id"]: leg for leg in system3_tables.DEFAULT_ROAD_STRUCTURES["book_close"]["legs"]}
         self.assertTrue(any(d.get("closes") for d in close["signoff"]["draws"]), "the sign-off closes")
-        self.assertIn("hands back to the music", close["signoff"]["act"])
+        self.assertIn("the music is handed back", close["signoff"]["act"])   # [book-nodes-3] the sign-off is a wheel now
 
     def test_a_reading_round_is_planned_from_its_own_legs(self):
         cfg = system3.default_config()
