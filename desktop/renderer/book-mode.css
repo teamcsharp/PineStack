@@ -34,7 +34,7 @@
 .bm-card{flex:0 0 150px;min-width:0;scroll-snap-align:center;transition:transform .2s ease,background .2s ease;transform:rotateY(-8deg);transform-origin:center;background:transparent;padding:6px}
 .bm-card:hover,.bm-card:focus-within{transform:rotateY(0);background:#1c3038}
 .bm-card.bm-selected{transform:translateY(-6px) rotateY(0);background:#25453f;box-shadow:0 0 0 1px #86b7a3;border-radius:9px}
-.bm-card .bm-cover{position:relative;display:block;width:100%;aspect-ratio:5/7;flex-shrink:0;padding:0;overflow:hidden;border-radius:4px;border:1px solid #526b65;background:linear-gradient(135deg,#37574e,#162c34);box-shadow:4px 7px 14px #0008}
+.bm-card .bm-cover{position:relative;display:block;width:100%;height:0;padding:0 0 140%;box-sizing:content-box;min-height:0;flex-shrink:0;overflow:hidden;border-radius:4px;border:1px solid #526b65;background:linear-gradient(135deg,#37574e,#162c34);box-shadow:4px 7px 14px #0008}
 .bm-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0}
 .bm-cover.bm-cover-loaded img{opacity:1}
 .bm-cover-title{position:absolute;inset:0;display:flex;align-items:center;padding:20px 12px;border-left:5px solid #dcb880;color:#f8e8cb;font:18px/1.3 Georgia,serif;overflow-wrap:anywhere;text-align:left}
@@ -82,14 +82,15 @@
 /* [book-shelf] THE LIBRARY AS A WALL OF COVERS. "I want it formatted more like the second image":
    a grid of the books' own covers with the title and author beneath, that scrolls down. Every rule
    here comes after the strip's and wins by order; the markup is unchanged. */
-.bm-books{display:grid;grid-template-columns:repeat(auto-fill,minmax(176px,1fr));gap:30px 24px;align-items:start;overflow-x:hidden;overflow-y:auto;scroll-snap-type:none;perspective:none;padding:20px 18px 26px;max-height:min(64vh,calc(100vh - 280px))}
+.bm-books{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:34px 28px;align-items:start;overflow-x:hidden;overflow-y:auto;scroll-snap-type:none;perspective:none;padding:20px 18px 26px;max-height:min(64vh,calc(100vh - 280px))}
 .bm-card,.bm-card:hover,.bm-card:focus-within,.bm-card.bm-selected{flex-basis:auto;transform:none;scroll-snap-align:none;background:transparent;box-shadow:none;border-radius:0}
 .bm-card{display:grid;grid-template-columns:1fr 1fr;gap:7px 8px;padding:0}
 .bm-card>.bm-cover,.bm-card>.bm-card-title,.bm-card>small{grid-column:1/-1}
 .bm-card .bm-cover{border:0;border-radius:3px 7px 7px 3px;background:linear-gradient(135deg,#2b4a46,#13262d);box-shadow:0 12px 26px #000b,0 2px 6px #0009;transition:transform .15s ease,box-shadow .15s ease}
 .bm-card:hover .bm-cover,.bm-card:focus-within .bm-cover{transform:translateY(-4px);box-shadow:0 18px 30px #000c,0 2px 6px #0009}
 .bm-card.bm-selected .bm-cover{outline:3px solid #8fd3bf;outline-offset:3px}
-.bm-cover img{object-fit:cover;background:#fff}
+/* [book-cover-box] the whole cover, never cut; the gradient behind it is the shelf */
+.bm-cover img{object-fit:contain;background:transparent}
 .bm-cover-title{font-size:16px;padding:16px 12px}
 .bm-card .bm-card-title{margin-top:4px;font:600 14px/1.35 system-ui,sans-serif;color:#f2efe6;min-height:0;-webkit-line-clamp:2}
 .bm-card small{font:12px/1.35 system-ui,sans-serif;color:#a9bab8;min-height:0;-webkit-line-clamp:2}
