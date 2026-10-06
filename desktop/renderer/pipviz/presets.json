@@ -11,6 +11,6 @@
   "audio-bars": { "columns": 80, "height": 1, "bloom": 0.55 },
   "liquid-glass": { "droplets": 18, "thickness": 1, "bloom": 0.45 },
   "retro-grid": { "density": 1, "fog": 1, "bloom": 0.6 },
-  "shape-burst": { "symbols": 360, "trail": 0.55, "bloom": 0.5 },
+  "shape-burst": { "symbols": 320, "pine": 0.28, "bloom": 0.7 },
   "_palettes": ["playstation", "neon", "mono", "radioNight"]
 }
