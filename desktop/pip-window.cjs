@@ -259,6 +259,19 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
     ] : [];
     activeMenu = Menu.buildFromTemplate([
       ...updateItems,
+      /* [pip-resume] "I want to be able to resume playback and start broadcast
+         from a single option getting the station fully back on the air" —
+         one click handles both axes: the DJ engine being off entirely, and
+         the station merely paused (rooms open, off air). Each half is a
+         no-op if that half is already live.
+         The same slot reads the station's own state back: while it is live,
+         it instead offers to pause it, which turns on the endless video set
+         in the same click — "cycle into endless video, it should already
+         know to go into pause mode and begin banking" — so a paused station
+         is never just sitting on a frozen frame. */
+      playback?.off_air !== true
+        ? { label: 'Pause broadcast — bank with endless video', click: () => getWindow()?.webContents.send('pip:action', 'pause-broadcast') }
+        : { label: 'Resume broadcast — back on air', click: () => getWindow()?.webContents.send('pip:action', 'resume-broadcast') },
       { label: 'Resolve playback + restore DJs', click: () => repairPlayback ? repairPlayback() : getWindow()?.webContents.send('pip:action', 'repair-playback') },
       { label: 'Troubleshoot station...', click: () => troubleshoot ? troubleshoot() : getWindow()?.webContents.send('pip:action', 'troubleshoot') },
       { type: 'separator' },

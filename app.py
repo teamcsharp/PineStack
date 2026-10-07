@@ -103591,6 +103591,25 @@ BANTER_DICE_SEED: tuple[tuple[str, str, int], ...] = (
     ("rebuttal", "concede the point, out loud, and be changed by it", 1),
     ("rebuttal", "concede the small thing to win the large one", 1),
     ("rebuttal", "laugh and let it go, then take it somewhere else", 1),
+    # [disgust-focus] "have the roulette result provide context to the LLM
+    # about what it finds disgusting so it responds with a line saying what
+    # they are disgusted about... expressing randomness based on what made
+    # them feel that way." A second, independent roll that names the
+    # CONCRETE thing a negative stance is actually about, so the line has
+    # somewhere specific to land instead of reaching for the same stock
+    # phrase ("this is disgusting") every time — see banter_beat_sheet.
+    ("disgust_focus", "the specific detail they tossed off like it was nothing", -1),
+    ("disgust_focus", "how pleased with themselves they clearly are about it", -1),
+    ("disgust_focus", "that someone filmed it and thought it belonged anywhere", -1),
+    ("disgust_focus", "who it would actually hurt, and that nobody involved seems to care", -1),
+    ("disgust_focus", "the hypocrisy of it - they would be furious if it happened to them", -1),
+    ("disgust_focus", "the casualness of it, like it is completely normal", -1),
+    ("disgust_focus", "one exact word or phrase they used, repeated back", -1),
+    ("disgust_focus", "exactly who this is clearly made for", -1),
+    ("disgust_focus", "the sound, smell or texture of it, said out loud", -1),
+    ("disgust_focus", "that this is not even the worst part of it", -1),
+    ("disgust_focus", "the timing of it - of all moments to do that", -1),
+    ("disgust_focus", "that they are not even the one who should be telling it", -1),
 )
 
 
@@ -103620,7 +103639,19 @@ def banter_dice_rules() -> list[dict[str, Any]]:
         if not isinstance(rows, list) or not rows:
             rows = _banter_dice_seed()
             _banter_dice_write(rows)
-        return [r for r in rows if isinstance(r, dict)]
+        rows = [r for r in rows if isinstance(r, dict)]
+        # An axis added to BANTER_DICE_SEED after the deck was first written
+        # to disk (e.g. [disgust-focus]) would otherwise sit in the seed
+        # forever, unused, because a non-empty file always wins above.
+        # Add whichever whole axes are missing, once, leaving every
+        # existing row (and the operator's weights on it) untouched.
+        have_axes = {str(r.get("axis") or "") for r in rows}
+        added = [r for r in _banter_dice_seed()
+                 if str(r.get("axis") or "") not in have_axes]
+        if added:
+            rows = rows + added
+            _banter_dice_write(rows)
+        return rows
 
 
 def banter_dice_range(axis: str = "") -> tuple[float, float]:
@@ -103896,6 +103927,7 @@ def banter_beat_sheet(lines: int, seats: list[str], dj: dict[str, Any],
     out: list[str] = []
     last_seat = ""
     last_id = ""
+    last_focus_id = ""   # [disgust-focus] its own cooldown pool, separate from stance/rebuttal
     for turn in range(1, min(int(lines), 40) + 1):
         # Who holds the floor. Never the seat that just spoke - that is the
         # parser's own contract and the prompt's ("no one speaks twice in a
@@ -103935,16 +103967,32 @@ def banter_beat_sheet(lines: int, seats: list[str], dj: dict[str, Any],
             out.append("%2d  %s  - answers the turn before it." % (turn, seat))
             last_seat = seat
             continue
+        # [disgust-focus] a negative stance gets a second, independent roll
+        # naming the CONCRETE thing it is actually about - a line with a
+        # specific reason to point to has somewhere new to land, instead of
+        # every hard-negative turn reaching for the same stock phrase
+        # ("this is disgusting") regardless of which stance put it there.
+        focus_text = ""
+        if axis == "stance" and int(pick.get("lean") or 0) < 0:
+            focus = banter_dice_pick("disgust_focus", last_id=last_focus_id)
+            last_focus_id = str(focus.get("id") or "")
+            focus_text = str(focus.get("text") or "")
         if axis == "rebuttal":
             out.append("%2d  %s  - %s, %s. Answer the objection itself; do "
                        "not restate the point." % (turn, seat, text, word))
+        elif focus_text:
+            out.append("%2d  %s  - %s, %s - and say so because of %s. Name "
+                       "that thing out loud, specifically; never just say "
+                       "it is disgusting or gross and leave it there. Quote "
+                       "back the word or claim you are answering."
+                       % (turn, seat, text, word, focus_text))
         else:
             out.append("%2d  %s  - %s, %s. Quote back the word or claim you "
                        "are answering." % (turn, seat, text, word))
         rolls.append({"turn": turn, "seat": seat, "axis": axis,
                       "id": pick.get("id"), "roll": pick.get("roll"),
                       "hard": pick.get("hard"), "lean": pick.get("lean"),
-                      "text": text, "answers": turn - 1})
+                      "text": text, "focus": focus_text, "answers": turn - 1})
         last_seat = seat
     if not out:
         return "", rolls
@@ -127014,6 +127062,11 @@ PIP_DEFAULTS: dict[str, Any] = {
               "messages": "bottom", "cast": "bottom", "voices": "bottom", "roulette": "bottom"},
     "order": {name: index for index, name in enumerate(("dialogue", "task", "audit", "production", "music", "chat", "messages", "cast", "voices", "roulette", "rec"))},   # [pip-rec-order] every widget has an order
     "voiceStyles": {"host": 0, "cohost": 1, "sfx": 2, "callers": 3},
+    # [pinepip-bg] the living PineViz mode behind Pine PiP (e.g. "classic",
+    # "shape-burst"): empty means "whatever the viewer mounts on its own".
+    # The one field of this file a public listener page is allowed to read -
+    # see /api/system3/public/background below.
+    "vizMode": "",
 }
 
 
@@ -127104,6 +127157,8 @@ def normalize_pip_settings(raw: Any) -> dict[str, Any]:
     for key, fallback in PIP_DEFAULTS["voiceStyles"].items():
         try: out["voiceStyles"][key] = max(0, min(15, int(out["voiceStyles"].get(key, fallback))))
         except (TypeError, ValueError, OverflowError): out["voiceStyles"][key] = fallback
+    viz_mode = raw.get("vizMode")
+    out["vizMode"] = viz_mode if isinstance(viz_mode, str) and re.fullmatch(r"[a-z0-9-]{1,40}", viz_mode or "") else ""
     favorites = raw.get("popupFavorites")
     out["popupFavorites"] = list(dict.fromkeys(item for item in favorites if isinstance(item, str) and len(item) < 160))[:80] if isinstance(favorites, list) else []
     return out
@@ -127149,6 +127204,17 @@ async def api_put_pip_config(request: Request, authorization: str | None = Heade
         temporary.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
         temporary.replace(PIP_SETTINGS_PATH)
     return {"settings": normalized, "configured": True}
+
+
+@app.get("/api/system3/public/background")
+async def public_pip_background(t: str = "", authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[pinepip-bg] The one field of Pine PiP's settings a public listener
+    page may read: which living PineViz mode the operator has chosen, so
+    the tune page can show the same background behind its own content.
+    Tune-in token only - nothing else about pip/config crosses this door."""
+    require_listen_auth(t, authorization)
+    settings, _ = read_pip_settings()
+    return {"mode": settings.get("vizMode") or ""}
 
 
 @app.get("/api/settings")
@@ -170647,8 +170713,16 @@ _PUBLIC_GET |= {"/api/system3/public/messenger",
                 "/tune-messenger/system3.js",
                 "/tune-messenger/system3.css",
                 "/tune-messenger/system3-message-tile.js",
-                "/tune-messenger/system3-message-tile.css"}
-_PUBLIC_GET_PREFIX = _PUBLIC_GET_PREFIX + ("/api/system3/public/poster/",)
+                "/tune-messenger/system3-message-tile.css",
+                "/tune-messenger/tune-background.js",
+                # [pinepip-bg] which living PineViz mode is behind Pine PiP
+                # right now - see /api/system3/public/background above.
+                "/api/system3/public/background"}
+_PUBLIC_GET_PREFIX = _PUBLIC_GET_PREFIX + ("/api/system3/public/poster/",
+                                            # [pinepip-bg] plain browser libraries and the
+                                            # PineViz bundle itself - no secrets, vendor_asset()
+                                            # already sniffs the name and the extension.
+                                            "/vendor/")
 
 
 def _public_allows(method: str, path: str) -> bool:
@@ -171885,7 +171959,9 @@ try:
         "system3.js": Path(__file__).resolve().parent / "frontend" / "system3.js",
         "system3.css": Path(__file__).resolve().parent / "frontend" / "system3.css",
         "system3-message-tile.js": Path(__file__).resolve().parent / "frontend" / "system3-message-tile.js",
-        "system3-message-tile.css": Path(__file__).resolve().parent / "frontend" / "system3-message-tile.css"})
+        "system3-message-tile.css": Path(__file__).resolve().parent / "frontend" / "system3-message-tile.css",
+        # [pinepip-bg] the living PineViz background + the DJ-photo flourish.
+        "tune-background.js": Path(__file__).resolve().parent / "frontend" / "tune-background.js"})
 except Exception as _tune_msg_exc:  # noqa: BLE001
     _tune_messenger = None
     _TUNE_MSG = None
@@ -279562,13 +279638,30 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
+  /* [stable-anchor] top-anchored, not vertically centred: the message tile
+     below the photo box grows and shrinks continuously as lines come and
+     go, and a centred column drags everything above it - including the
+     photo window - up and down with it. Anchoring from the top means only
+     the fixed-height controls above the photo box can ever move it. */
   body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    margin: 0; min-height: 100vh; display: flex; align-items: flex-start;
     justify-content: center; background: #04060b; color: #e6edf5;
     font: 15px/1.5 PineIcons, PineIcons, system-ui, -apple-system, "Segoe UI", sans-serif;
     padding: 24px;
   }
   .set { width: min(560px, 100%); }
+  /* [pinepip-bg] every panel on this page drew its 1px border against a
+     flat black page - against the living background now behind them, that
+     same saturated blue-grey border reads as a hard, lit-up rectangle.
+     Translucent borders blend into whatever is glowing behind them
+     instead of fighting it; the opaque fills underneath are untouched, so
+     readability does not move. Website-only - Pine PiP's own panels are a
+     separate stylesheet and are not touched by this. */
+  .dial, .levels, button, input, .gallery-stage, .s3-drum, .s3-card,
+  .tune-s3-tile .pip-system3-message {
+    border-color: rgba(255, 255, 255, .08) !important;
+  }
+  button.big { border-color: #4bb3ff !important; }
   body { padding-left: max(24px, env(safe-area-inset-left));
          padding-right: max(24px, env(safe-area-inset-right));
          padding-top: max(24px, env(safe-area-inset-top));
@@ -279849,6 +279942,11 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
+<!-- [pinepip-bg] the living PineViz background, behind every element on
+     this page - see frontend/tune-background.js. A fixed, negative-z-index
+     host painted before anything else in the body, so it never needs its
+     own content to be transparent. -->
+<div id="pbBg" aria-hidden="true"></div>
 <!-- [listener-uploads] "a plus icon on the page that a user can click and
      then upload a file from their phone / computer": a video, a sound or a
      picture, up to 20 MB, into the station's samples folder. -->
@@ -279991,22 +280089,6 @@ the library files untouched">📶 quality</label>
            onkeydown="if(event.key==='Enter')shout()">
     <button onclick="shout()">Say it</button>
   </div>
-  <div class="row" style="margin-top:8px">
-    <input id="adIdea" placeholder="Make an H3 ad to air..."
-           onkeydown="if(event.key==='Enter')makeAd()">
-    <button onclick="dictateAd()" title="Dictate an H3 ad prompt"
-            aria-label="Dictate an H3 ad prompt">Mic</button>
-    <button onclick="makeAd()">Make ad</button>
-  </div>
-  <div class="row" style="margin-top:6px;gap:4px">
-    <button aria-label="Applause" onclick="shout('👏')" title="Applause">👏</button>
-    <button aria-label="This one is hot" onclick="shout('🔥')" title="This one is hot">🔥</button>
-    <button aria-label="They are being funny" onclick="shout('😂')" title="They are being funny">😂</button>
-    <button aria-label="What was that" onclick="shout('😱')" title="What was that">😱</button>
-    <button aria-label="They have killed it" onclick="shout('💀')" title="They have killed it">💀</button>
-    <button onclick="shout('❤')" title="Love" aria-label="Love">❤</button>
-  </div>
-
   <div class="patter" id="patter"></div>
   <div class="note" id="note"></div>
   <!-- [#1244] the endless set, in words. The stage shows artwork both
@@ -281008,9 +281090,7 @@ function renderGallery(state) {
   if (galleryTimer) clearInterval(galleryTimer);
   show();
   if (galleryNames.length > 1) {
-    galleryTimer = setInterval(
-      show, (typeof streamMode !== "undefined" && streamMode)
-              ? 20000 : 7000);
+    galleryTimer = setInterval(show, 5000);
   }
 }
 
@@ -283998,12 +284078,15 @@ setTimeout(clockLoop, 1500);
      the station were doing, and files it as a Pine Box report. Deferred
      and last, so a script that fails to load leaves the page as it was. -->
 <script src="__CAR_DIAG_SRC__" defer></script>
-<!-- [tune-messenger] System 3's Messenger in place of the feed below the
-     controls (a switch keeps the feed): the conversation assembling message
-     by message, in step with the line this page is sounding. Deferred and
-     last, like the diagnostics: a module that fails leaves the page and its
-     feed exactly as they were. -->
+<!-- [tune-messenger] The on-air message, below the controls: one card for
+     whatever line is sounding right now - the same System3 tile widget
+     Pine PiP shows, no scrollback. Deferred and last: a module that fails
+     leaves the page and its old plain feed exactly as they were. -->
 <script src="/tune-messenger/tune-messenger.js" defer></script>
+<!-- [pinepip-bg] the living PineViz background behind this page, and the
+     DJ-photo cycle's own flourish - both mirroring Pine PiP. Deferred and
+     last, same as above: best-effort, never required for the page to work. -->
+<script src="/tune-messenger/tune-background.js" defer></script>
 <!-- [tune-fullscreen] "allow a user to double click / tap a video / popup to
      go in fullscreen and to do the same to go back to windowed mode." One
      listener for the page: a double click, or two taps inside 320 ms and

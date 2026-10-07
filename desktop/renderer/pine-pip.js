@@ -109,7 +109,12 @@
       if (viz || !enabled || shell) return;
       vizProvider = new P.ExternalProvider();
       viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: 'both', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
-      viz.on((kind, value) => { if (kind === 'mode') { vizMode = value; try { w.postMessage({ type: 'pine-pip-background', mode: value }, '*'); } catch (_) {} } });
+      viz.on((kind, value) => { if (kind === 'mode') { vizMode = value; try { w.postMessage({ type: 'pine-pip-background', mode: value }, '*'); } catch (_) {}
+        /* [pinepip-bg] the server's own copy of "which mode is on", so a
+           listener's page over Tailscale can show the same background -
+           see /api/system3/public/background. Best-effort: a PiP with no
+           server behind it (a bare preview window) must not break for it. */
+        try { api().pipUpdate({ vizMode: value }).catch(() => {}); } catch (_) {} } });
       vizMode = viz.activeId || '';
       if (particles) { particles.dispose(); particles = null; }
     }
@@ -1724,6 +1729,19 @@
       if (action === 'menu') await showMenu();
       if (action === 'troubleshoot') await api().troubleshootStation();
       if (action === 'repair-playback') await api().troubleshootStation('playback');
+      if (action === 'resume-broadcast') {   /* [pip-resume] one click, both axes */
+        say('Bringing the station back on air...', 0);
+        const dj = await api().get('/api/dj');
+        if (!dj?.on) await api().post('/api/dj/start', { force: true });
+        const pause = await api().get('/api/radio/pause');
+        if (pause?.paused) await api().post('/api/radio/pause', { paused: false });
+        say('On air.', 6000);
+      }
+      if (action === 'pause-broadcast') {   /* [pip-resume] the other half: off air, banking behind endless video */
+        say('Pausing the broadcast - banking behind endless video...', 0);
+        await api().post('/api/sfx/video/mode', { on: true });
+        say('Off air. Banking dialogue behind the endless video set.', 6000);
+      }
       if (action === 'appearance') showAppearance();
       if (action === 'tablet') { const result = await api().mirrorShow(); if (result?.ok === false) throw new Error(result.detail || 'Tablet display unavailable'); }
       if (action === 'export') { say('Opening tablet recording range editor...'); const result = await api().glassClip(0, { target: 'tablet', replay: true }); if (result?.ok === false) throw new Error(result.detail || 'Tablet recording unavailable'); }
