@@ -152,7 +152,10 @@ class DynamicSegments:
         radio = self.g.get('_RADIO') or {}
         slot = dict(radio.get('sched_slot') or {})
         pos = radio.get('sched_pos') or {}
-        return {'kind': slot.get('kind'), 'slot': slot,
+        # [book-nodes-8] System 2 publishes a window under its prep road (banter); the window's own kind is the
+        # segment's, and dispatch() / window_owned() must see it as theirs
+        kind = str(slot.get('dynamic_kind') or '') if str(slot.get('dynamic_kind') or '') in dynamic_segments.TEMPLATES else slot.get('kind')
+        return {'kind': kind, 'slot': slot,
                 'slot_id': slot.get('id'), 'due_at': pos.get('started'),
                 'occurrence': pos.get('occurrence')}
 

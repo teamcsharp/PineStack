@@ -63319,6 +63319,14 @@ async def _torrent_talk() -> None:
                 _slot = schedule_take()
                 _sched_occurrence = _schedule_dispatch_occurrence() if _slot else ""
                 kind = str(_slot.get("kind") or "")
+                # [book-nodes-8] A DYNAMIC WINDOW IS ITS OWN ROAD. System 2's clock publishes a Book Time or
+                # supercut window under its prep road (banter, ad), so when System 2 had nothing staged and this
+                # chain served the entry, it served banter - the segment's door was never asked (10-06: every
+                # window after 14:36; the door's ledger read 0 asks). The window's own kind is the one
+                # schedule_extra_round knows.
+                _dyn = str(_slot.get("dynamic_kind") or "")
+                if _dyn in ("book_time", "sfx_supercut"):
+                    kind = _dyn
                 if kind:
                     _pos = _RADIO.get("sched_pos") or {}
                     # #937: written down, so "is the sheet being kept"
