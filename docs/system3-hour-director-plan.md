@@ -111,3 +111,32 @@ beside it.
    inner shape - or does the hour move into the System 3 window entirely?
 3. Writer lanes: one lane with priorities, or a second lane for banked work?
 4. The canary: odd/even hours, or a whole day on System 3 with the fallback armed?
+
+## 7. The operator's decisions (2026-10-06, 18:20 CST)
+
+1. **Both as one build**: the clock, the booking and the kitchen move together and switch at once.
+2. **The hour moves into the System 3 window entirely**: the sheet editor becomes a System 3 system (the hour as a
+   road of legs, the leg's inner shape through the hour-flow editor, the hour's own dice as tables).
+3. **Writer lanes are dynamic**: one lane most of the time; a second lane when no H3 task is processing and it helps
+   the broadcast stay ahead and keep its spontaneity.
+4. **The canary is a whole day on System 3 with the fallback armed.**
+
+## 8. The build (three waves in parallel, one switch)
+
+- **Wave G - the Hour Director (station):** `system3_hour.py`; `engine: system3` in the same config file (System 2
+  stands down, the fallback stays); the legacy clock keeps the time (`schedule_take()`'s own branch publishes
+  `_RADIO.sched_*` with the sheet's kinds, so a Book Time window is `book_time`); the hour's own dice as System 3
+  tables (family HOUR: the draw when the sheet is silent, the quota pressure, the jam chance); the booking as a
+  draw over the cupboard's ready compatible rows (`s3_weighted("hour.book")`), taken by the doors that exist
+  (`_ready_shelf_air` with a pick, the segment door, the produced-ad door, the record pin); the round ledger
+  (`GET /api/system3/hour`: named, policy, booked, served, why); the chain asks the director where it asks
+  System 2 today.
+- **Wave H - one kitchen:** System 2's prepare jobs stand down under `system3`; the board's needs are the hour's
+  upcoming legs AND the dynamic windows' unvoiced parts (cost = the chunks left, deadline = the window); the
+  deferred writer's priority is time to the leg; the writer lanes dial: a second lane only while no H3 render is in
+  flight and the pantry is short.
+- **Wave I - the System 3 window's Hour tab (desk + tablet):** the hour as a road of legs (add, remove, move,
+  minutes, the instruction), the leg's inner shape through PineHourFlow, the HOUR tables, the ledger view, the engine
+  switch and fallback; the sheet's store stays the store (the schedule APIs), so the old sheet view keeps reading it.
+- **The switch:** `engine: system3` for a whole day with the fallback armed; the ledgers compared (adherence, dead
+  air, repeats, Book Time windows aired, cover rounds) before the default flips.
