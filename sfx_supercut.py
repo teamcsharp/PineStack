@@ -1211,9 +1211,14 @@ class SupercutRuntime:
             bans, weights, _only = self.controls()
             result = await asyncio.to_thread(render_source_plan, plan, output, imageio_ffmpeg.get_ffmpeg_exe(),
                                              banned=bans, weights=weights)
-            video = await asyncio.to_thread(render_video, plan, result, output.with_suffix(".mp4"), imageio_ffmpeg.get_ffmpeg_exe())
+            brand_plan = self.host.get("supercut_brand_plan")      # [supercut-brand] app.py's: the font and the effects, System 3's
+            brand = await brand_plan(str(plan["id"])) if callable(brand_plan) else None
+            station = str((brand or {}).get("station") or (plan.get("config") or {}).get("station") or "Pine Box FM")
+            video = await asyncio.to_thread(render_video, plan, result, output.with_suffix(".mp4"), imageio_ffmpeg.get_ffmpeg_exe(),
+                                            brand=brand, station=station)
             result.update(video)
-            result["source_plan"].update(video=video["video"], video_sha256=video["video_sha256"], video_source_only=True)
+            result["source_plan"].update(video=video["video"], video_sha256=video["video_sha256"], video_source_only=True,
+                                         brand=video.get("brand") or {})           # [supercut-brand] the plan remembers the card
             await asyncio.to_thread(self.save, result["source_plan"])
             sign = self.host.get("media_sign")
             if callable(sign):

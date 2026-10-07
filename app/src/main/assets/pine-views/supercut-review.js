@@ -202,6 +202,10 @@
     function showArchive(row) {
       if (dead) return; selected = row; stop(audio); resultBody.replaceChildren();
       resultBody.append(make('b', '', row.title || row.product || 'Supercut'), make('p', 'psc-hint', Number(row.seconds || 0).toFixed(1) + ' seconds · ' + (row.cues || []).length + ' source cuts · Saved in SFX ads'));
+      if (row.brand && row.brand.font) {   /* [supercut-brand] the font the card is set in, and how it arrives and leaves */
+        var arrives = row.brand.effect_in_used || row.brand.effect_in, leaves = row.brand.effect_out_used || row.brand.effect_out;
+        resultBody.append(make('p', 'psc-hint psc-brand', 'Set in ' + row.brand.font + (arrives ? ' - arrives: ' + arrives + ', leaves: ' + leaves : '')));
+      }
       audio = make(row.video_url ? 'video' : 'audio', 'psc-audio'); audio.controls = true; audio.preload = 'none'; audio.autoplay = false;
       audio.src = url(row.video_url || row.audio_url || '/api/sfx/supercut/archive/' + encodeURIComponent(row.id) + '/audio'); resultBody.appendChild(audio);
       if (row.generated_script) { resultBody.append(make('b', '', 'Written script'), make('pre', 'psc-script', row.generated_script)); }

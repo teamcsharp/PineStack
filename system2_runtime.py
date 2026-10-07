@@ -189,6 +189,11 @@ class System2Runtime:
     def enabled(self):
         return self.config.get("engine") == "system2"
 
+    def stood_down(self):
+        """[kitchen-hour] Under engine system3 the hour director owns the air and the kitchen: System 2's prepare
+        jobs, writer tickets and spawns idle here, and its store stays readable."""
+        return str(self.config.get("engine") or "") == "system3"
+
     def content_gate_enabled(self, gate):
         policy = getattr(self.host, "content_gate_enabled", None)
         if callable(policy):
@@ -264,8 +269,8 @@ class System2Runtime:
             raise ValueError("Unknown System2 settings: " + ", ".join(sorted(unknown)))
         new = dict(self.config)
         if "engine" in payload:
-            if payload["engine"] not in ("legacy", "system2"):
-                raise ValueError("engine must be legacy or system2")
+            if payload["engine"] not in ("legacy", "system2", "system3"):
+                raise ValueError("engine must be legacy, system2 or system3")
             new["engine"] = payload["engine"]
         for key in ("legacy_keepers", "fallback"):
             if key in payload:
@@ -564,6 +569,9 @@ class System2Runtime:
     FUTURE_SWAP_LOCK_WAIT = 2.0
 
     async def refresh(self, force=False, want_status=True):
+        # [wave-g] Under engine system3 System 2 plans nothing: the Hour Director owns the hour.
+        if self.config.get("engine") == "system3":
+            return await asyncio.to_thread(self.status) if want_status else None
         # #1070: status() deep-copies every plan (about a megabyte) and the
         # UI polls it; build it in a worker thread so the air clock is not
         # the one paying for the copy, and skip it when the caller only
@@ -1248,7 +1256,7 @@ class System2Runtime:
         No global cache-full or old commitment-sheet gate can veto this job.
         The actual model and voice providers still enforce shared admission.
         """
-        if not self.enabled or self._prepare_lock.locked() or not self._rooms_open():   # [kitchen]
+        if self.stood_down() or not self.enabled or self._prepare_lock.locked() or not self._rooms_open():   # [kitchen]
             return
         h = self.host
         async with self._prepare_lock:
@@ -1523,7 +1531,7 @@ class System2Runtime:
         """#1084: start one more sitting when a lane is free. The prepare
         loop used to await one job at a time, so the second lane was left
         to the legacy keepers; now each sitting is its own task."""
-        if not self.enabled or self._prepare_lock.locked():
+        if self.stood_down() or not self.enabled or self._prepare_lock.locked():
             return None
         return asyncio.create_task(self.prepare(), name="system2:prepare")
 

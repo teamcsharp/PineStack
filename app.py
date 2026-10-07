@@ -90,6 +90,7 @@ import prompt_history
 import word_cause_edits
 import clip_speech
 import comfy_workshop
+import kitchen_hour  # [kitchen-hour] the window needs and the writer lanes' rules
 import h3_plotline
 import gazette_prompt
 import gazette_editorial
@@ -1846,6 +1847,9 @@ DEFAULT_DJ = {
     "cupboard_air_unheard": True,
     "cupboard_unheard_hours": 2.0,
     "cupboard_unheard_every": 420,
+    # [kitchen-hour] THE SECOND WRITER LANE. Off, a second lane is admitted only when engine system3 is on;
+    # on, it is also admitted when no render is in flight, the box is cool and the pantry is short.
+    "kitchen_second_lane": True,
     # #1033: THE CALLER BANK FLOOR. How many finished, never-aired calls
     # must stand on the shelf before the phone road counts as covered -
     # off the sheet as well as on it. Below it the writing rooms treat
@@ -1921,6 +1925,7 @@ DEFAULT_DJ = {
     "records_whole": True,
     "mixtape_folder": "_music by me",
     "fordtape_folder": "samples_grabbed/user/ford",   # [h3-slots] General Ford's tapes (his submissions), for {fordtape}
+    "supercut_fonts_folder": "Fonts",   # [supercut-brand] the operator's font collection the supercut card's face is rolled from (under SFX_ROOT, or an absolute path)
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
     # persona is its own thing until you say otherwise.
@@ -2953,6 +2958,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "cupboard_unheard_every": max(60, min(7200, int(
             raw_dj.get("cupboard_unheard_every",
                        DEFAULT_DJ["cupboard_unheard_every"]) or 60))),
+        "kitchen_second_lane": bool(raw_dj.get(
+            "kitchen_second_lane", DEFAULT_DJ["kitchen_second_lane"])),
         "caller_every": max(0, min(50, int(
             raw_dj.get("caller_every", DEFAULT_DJ["caller_every"]) or 0))),
         "manager_every": max(0, min(50, int(
@@ -3089,6 +3096,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "fordtape_folder": (str(raw_dj.get("fordtape_folder")             # [h3-slots]
                                 or DEFAULT_DJ["fordtape_folder"])
                             .strip().strip("/")[:200]),
+        "supercut_fonts_folder": (str(raw_dj.get("supercut_fonts_folder")   # [supercut-brand] an absolute path keeps its slash
+                                      or DEFAULT_DJ["supercut_fonts_folder"])
+                                  .strip().rstrip("/")[:300]),
         "follow_prompt": bool(raw_dj.get("follow_prompt", False)),
         "overlap": max(0, min(100, int(
             raw_dj.get("overlap", DEFAULT_DJ["overlap"]) or 0))),
@@ -24294,6 +24304,8 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                           if off_air() else set())                    # [kitchen]
         except Exception:  # noqa: BLE001
             _short_now = set()
+        # [kitchen-hour] the roads a window part is waiting on stay on the board whatever the ledger says
+        _window_roads = kitchen_window_roads()
         for kind in order:
             if kind in skip:
                 _off[kind] = "already tried this pass"
@@ -24305,6 +24317,8 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                                     and bool(_assigned_unready))
                 if kind in _short_now:
                     _needs_script = True        # #1131: the hour says so
+                if kind in _window_roads:
+                    _needs_script = True        # [kitchen-hour] a window part is owed a voice
                 if kind == "caller" and story_bank_short():
                     _needs_script = True        # #1033: the caller floor
                 # #1177: ...and the two roads the sheet cannot name.
@@ -24351,7 +24365,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             # into a round that could not finish goes into one that can.
             try:
                 _said = commit_for(kind)
-                if _said == "prerecord":
+                if _said == "prerecord" and kind not in _window_roads:
                     continue
             except Exception:  # noqa: BLE001
                 _said = ""
@@ -24535,14 +24549,17 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             if not _slot_row:
                 continue
             _asked.append((_need, _slot_row))
-            if float(_slot_row["cost"]) > room:
+            # [kitchen-hour] a window's part is priced by its own chunks, not the road's average
+            _cost = float(_need["cost"]) if _need.get("window") else float(_slot_row["cost"])
+            if _cost > room:
                 continue
             _SLOT_STARVED[0] = 0
             out.update({
                 "kind": _slot_row["kind"], "forced": True,
                 "slot": _need["why"],
+                "window_need": (dict(_need) if _need.get("window") else None),   # [kitchen-hour]
                 "why": (_need["why"] + f" - building {_slot_row['label']}"
-                        f" at about {int(_slot_row['cost'])}s against "
+                        f" at about {int(_cost)}s against "
                         f"{int(room)}s of window (#1050)")})
             return out
         # #1094: THE DESK ASKED AND NOTHING FITTED. The window governing
@@ -24567,6 +24584,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 out.update({
                     "kind": _slot_row["kind"], "forced": True,
                     "slot": _need["why"],
+                    "window_need": (dict(_need) if _need.get("window") else None),   # [kitchen-hour]
                     "why": (_need["why"] + " - the desk has asked "
                             f"{SLOT_STARVED_MOST} passes running and "
                             "nothing has fitted, so "
@@ -49856,12 +49874,183 @@ def prep_has_assigned_work(kind: str) -> bool:
                and not dialogue_row_ready(str(kind), row) for row in rows)
 
 
+# --- [kitchen-hour] ONE KITCHEN UNDER THE HOUR (wave H, 2026-10-06) -----------------
+# The board's needs gain the dynamic windows' unvoiced parts (the rules are in kitchen_hour.py). A window's part is
+# made by the segment runtime's own voicing pass under the task's own room. The writer lanes dial lets a second
+# writer lane in only while the box can take it. Measured before this: a Book Time part stood at 3 of 10 takes for
+# an hour while the board owed other roads first.
+KITCHEN_WINDOW_MEMO_SECONDS = 5.0
+_KITCHEN_WINDOWS: dict[str, Any] = {"at": 0.0, "needs": []}
+KITCHEN_LANE_MEMO_SECONDS = 5.0
+_KITCHEN_LANES: dict[str, Any] = {"at": 0.0, "lanes": 1, "why": "", "facts": {}}
+
+
+def _kitchen_window_parts(runtime: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """A window's parts that are not ready to air, as the segment runtime reads them: a Book Time part is one of
+    its book rows (chunks not yet taken); a supercut is one clip, owed until one is held on the shelf."""
+    kind = kitchen_hour.window_kind(row)
+    if kind == "sfx_supercut":
+        occurrence = str(row.get("occurrence") or "")
+        held = any(isinstance(item, dict) and str(item.get("dynamic_occurrence") or "") == occurrence
+                   for item in list(_SHELF.get("sfx_supercut") or []))
+        return [] if held else [{"id": "clip", "phase": "clip", "chunks_left": 1, "takes": 0}]
+    if kind != "book_time" or runtime is None:
+        return []
+    parts = []
+    for held in list(runtime.unvoiced_parts(row) or []):
+        entry = runtime.source_entry(held)
+        takes = list(entry.get("takes") or [])
+        chunks = max(1, int(entry.get("chunks") or 0) - len(takes))
+        parts.append({"id": str(entry.get("sid") or ""), "phase": str(entry.get("book_phase") or "discussion"),
+                      "chunks_left": chunks, "takes": len(takes)})
+    return parts
+
+
+def kitchen_window_needs() -> list[dict[str, Any]]:
+    """The upcoming windows' unvoiced parts as board needs, nearest deadline first (kitchen_hour.window_needs).
+    Read over the coordinator's own horizon and memoised for five seconds, as the board itself is."""
+    # [kitchen-gate] the window needs wait for the System 3 switch: under System 2 the board takes none
+    _s2 = globals().get("_system2")
+    if callable(_s2) and not _s2().stood_down():
+        return []
+    now = time.time()
+    if now - float(_KITCHEN_WINDOWS.get("at") or 0) < KITCHEN_WINDOW_MEMO_SECONDS:
+        return [dict(one) for one in _KITCHEN_WINDOWS.get("needs") or []]
+    needs: list[dict[str, Any]] = []
+    try:
+        runtime = globals().get("DYNAMIC_SEGMENTS_RUNTIME")
+        if runtime is not None:
+            rows = [row for row in coord_upcoming(coord_ahead_seconds(), measure=False)
+                    if not row.get("cannot") and kitchen_hour.window_kind(row)]
+            needs = kitchen_hour.window_needs(
+                rows, lambda row: _kitchen_window_parts(runtime, row), now=now,
+                chunk_seconds=kitchen_hour.CHUNK_SECONDS)
+    except Exception:  # noqa: BLE001
+        needs = []                      # a window that cannot be read owes the board nothing
+    _KITCHEN_WINDOWS.update(at=now, needs=needs)
+    return [dict(one) for one in needs]
+
+
+def kitchen_window_roads() -> set[str]:
+    """The prep roads a window need is waiting on (banter for both windows today)."""
+    try:
+        return {str(one.get("prep") or "") for one in kitchen_window_needs()} - {""}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+async def kitchen_window_pass(need: dict[str, Any]) -> bool:
+    """The board picked a window's part for its road: the segment runtime makes it (the voicing pass for a Book
+    Time part, its clip for a supercut) under the task's own room - the part's cost plus fifteen seconds, the way
+    the recovery road holds its room."""
+    row = dict(need.get("window") or {})
+    run = globals().get("dynamic_segment_prepare_supercut" if kitchen_hour.window_kind(row) == "sfx_supercut"
+                        else "dynamic_segment_prepare_pass")
+    if not callable(run):
+        return False
+    prep_note(str(need.get("prep") or "banter"), "voicing the window: " + str(need.get("why") or "")[:160])
+    scope = _PREP_TASK_DEADLINE.set(time.time() + float(need.get("cost") or 0) + 15.0)
+    try:
+        return bool(await run(row))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("lookahead", ("the window's part fell over: " + type(exc).__name__ + ": " + str(exc))[:200])
+        return False
+    finally:
+        _PREP_TASK_DEADLINE.reset(scope)
+
+
+def kitchen_lane_facts() -> dict[str, Any]:
+    """The readings the writer lanes dial takes, each read the way its owner reads it."""
+    facts: dict[str, Any] = {"ceiling": int(OLLAMA_LANES)}
+    engine = ""
+    try:
+        runtime = globals().get("_system2")
+        engine = str((runtime().config or {}).get("engine") or "") if callable(runtime) else ""
+    except Exception:  # noqa: BLE001
+        engine = ""
+    facts["system3"] = engine == "system3"
+    try:
+        facts["second_lane"] = bool(dj_settings().get("kitchen_second_lane", True))
+    except Exception:  # noqa: BLE001
+        facts["second_lane"] = True
+    try:
+        render = bool(_parody_stinger_queue().active())     # an H3 stinger that is working
+    except Exception:  # noqa: BLE001
+        render = True
+    comfy = dict(_RESOURCE_STATE.get("comfy") or {})
+    fresh = time.time() - float(_RESOURCE_STATE.get("at") or 0) < 120.0
+    if not fresh or not comfy.get("observed") or comfy.get("busy"):
+        render = True                    # ComfyUI busy, or unknown: no second lane on a guess
+    facts["render_in_flight"] = render
+    facts["hot_c"] = box_hottest_c()                         # the same reading the H3 governor refuses on
+    facts["hot_ceiling_c"] = RENDER_TEMP_CEILING_C
+    try:
+        facts["pantry_seconds"] = round(float(pantry_seconds()), 1)
+        facts["target_seconds"] = round(float(prepare_target_seconds()), 1)
+    except Exception:  # noqa: BLE001
+        facts["pantry_seconds"], facts["target_seconds"] = 0.0, 0.0
+    facts["pantry_short"] = bool(facts["target_seconds"] > 0 and facts["pantry_seconds"] < facts["target_seconds"])
+    facts["window_soon"] = kitchen_hour.window_due_soon(kitchen_window_needs())
+    return facts
+
+
+def writer_lanes() -> int:
+    """How many writer lanes the request book admits now: one, or two when kitchen_hour.writer_lanes finds every
+    condition true (never past OLLAMA_LANES). Memoised for five seconds; a change is logged once, when it happens."""
+    now = time.time()
+    if now - float(_KITCHEN_LANES.get("at") or 0) < KITCHEN_LANE_MEMO_SECONDS:
+        return int(_KITCHEN_LANES.get("lanes") or 1)
+    try:
+        facts = kitchen_lane_facts()
+        lanes, why = kitchen_hour.writer_lanes(facts)
+    except Exception as exc:  # noqa: BLE001
+        facts, lanes, why = {}, 1, "the lane readings failed: " + type(exc).__name__
+    before = int(_KITCHEN_LANES.get("lanes") or 1)
+    _KITCHEN_LANES.update(at=now, facts=facts, why=why, lanes=int(lanes))
+    if int(lanes) != before:
+        try:
+            pipeline_log("lookahead", ("the kitchen opens a second writer lane: " + why) if int(lanes) > 1
+                         else ("back to one lane: " + why))
+        except Exception:  # noqa: BLE001
+            pass
+    return int(lanes)
+
+
+def kitchen_lanes_state() -> dict[str, Any]:
+    """The lanes the kitchen holds right now, for /api/cupboard."""
+    lanes = writer_lanes()
+    return {"lanes": lanes, "ceiling": int(OLLAMA_LANES), "why": str(_KITCHEN_LANES.get("why") or ""),
+            "facts": dict(_KITCHEN_LANES.get("facts") or {}), "window_needs": len(kitchen_window_needs())}
+
+
+async def kitchen_lane_enter(model: str, identity: str) -> None:
+    """THE WRITER LANES DIAL, at the request book. An ask waits here while this model already holds as many lanes
+    as writer_lanes() admits. The flag it sets is what the others count; call_ollama's finally takes the job row,
+    and the flag with it, when the ask ends. Check and flag share one synchronous step, so two asks cannot both
+    take the last lane."""
+    while True:
+        job = _OLLAMA_JOBS.get(identity)
+        if job is None:
+            return
+        held = sum(1 for row in list(_OLLAMA_JOBS.values())
+                   if row.get("model") == model and row.get("lane_held"))
+        if kitchen_hour.lane_admits(held, writer_lanes()):
+            job["lane_held"] = True
+            return
+        await asyncio.sleep(0.25)
+
+
 async def prep_one(kind: str) -> bool:
     """One producer per road; concurrent clocks share its still-owed work."""
     if kind in _PREP_ROAD_ACTIVE:
         return False
     _PREP_ROAD_ACTIVE[kind] = time.time()
     try:
+        # [kitchen-hour] the board picked a window's part for this road: the part is made, not a new round
+        _win = _PREP_LAST.get("window_need") if _PREP_LAST.get("kind") == kind else None
+        if _win:
+            _PREP_LAST.pop("window_need", None)
+            return await kitchen_window_pass(dict(_win))
         return await _prep_one_work(kind)
     finally:
         _PREP_ROAD_ACTIVE.pop(kind, None)
@@ -52863,6 +53052,12 @@ def slot_needs() -> list[dict[str, Any]]:
                     "why": (f"the {row.get('face')} half hour is "
                             f"{pick['short']} {pick['prep']} short and it "
                             f"is {row.get('verdict')}")})
+        # [kitchen-hour] THE WINDOWS' UNVOICED PARTS ARE NEEDS TOO: a Book Time or supercut window inside the
+        # coordinator's horizon that still has a part not ready to air, placed by time to the leg
+        try:
+            out = kitchen_hour.merge_needs(out, kitchen_window_needs())
+        except Exception:  # noqa: BLE001
+            pass
         _SLOT_WANT.update({"at": time.time(), "needs": out,
                            "kind": (out[0]["prep"] if out else ""),
                            "why": (out[0]["why"] if out else "")})
@@ -63136,6 +63331,15 @@ async def _torrent_talk() -> None:
                     _S2_FALLBACK_SAID[0] = _occ
                     pipeline_log("air", "(#1070) System2 has nothing staged for the "
                                  "running entry; the legacy chain serves it")
+            elif globals().get("_system3_hour") and _system3_hour().enabled():
+                # [wave-g] THE HOUR DIRECTOR. Under engine system3 System 2 stands down (its enabled is False) and
+                # the chain asks the director where it asked System 2: the running entry's own door, then the
+                # cupboard's booked round. The legacy draw runs only when the director aired nothing and its
+                # fallback is armed (fallback_due()).
+                served = await _system3_hour().dispatch(_RADIO.get("now"), dj_settings())
+                if served or not _system3_hour().fallback_due():
+                    await asyncio.sleep(0.5)
+                    continue
             dj = dj_settings()
             if not dj.get("talk_radio_mode"):
                 await asyncio.sleep(5)
@@ -63165,6 +63369,11 @@ async def _torrent_talk() -> None:
             if globals().get("_system2") and _system2().enabled:
                 served = await _system2().dispatch()
                 if served or not _system2().fallback_due():
+                    continue
+            elif globals().get("_system3_hour") and _system3_hour().enabled():
+                # [wave-g] the Hour Director asks at the breath after the wait, as System 2 was asked
+                served = await _system3_hour().dispatch(_RADIO.get("now"), dj)
+                if served or not _system3_hour().fallback_due():
                     continue
             # Never two rounds at once: the per-record intro is its own
             # task and this must not talk over it. But it does NOT wait
@@ -125676,6 +125885,7 @@ async def call_ollama(
     _OLLAMA_JOBS[identity] = {"model": model, "purpose": str(purpose)[:100],
                             "category": category, "state": "waiting", "at": time.time()}
     try:
+        await kitchen_lane_enter(model, identity)     # [kitchen-hour] the writer lanes dial
         async with _ollama_lane(model), _OLLAMA_GATE, \
                 httpx.AsyncClient(timeout=180) as client:
             _OLLAMA_JOBS[identity]["state"] = "active"
@@ -156452,7 +156662,7 @@ async def api_cupboard(
     """#1064: the LCD's paused-state view - the cupboard, the desk and the
     grader's verdicts, line by line."""
     require_read_auth(authorization)
-    return cupboard_state()
+    return {**cupboard_state(), "writer_lanes": kitchen_lanes_state()}   # [kitchen-hour]
 
 
 @app.get("/api/battle")
@@ -193110,6 +193320,141 @@ H3_SUPERCUT_STATION = "Pine Box FM"        # the second line of the caption
 _H3_SUPERCUT_BUSY: set[str] = set()        # prompt ids being cut now (done can be marked twice)
 _H3_SUPERCUT_LOCK = asyncio.Lock()         # one cut at a time: a restart's repair can land several
 
+# [supercut-brand] THE CARD, THE FONT AND THE WAY IT ARRIVES. "for the supercut text, I
+# want it to use a font rolled on the roulette from ... Fonts ... the text with a
+# cinematic kerning and a 2nd row with the station name and then a brand of the preset
+# on a row"; "10 different cinematic text appearance animation effects ... entry and
+# exit animations chosen at random by the roulette" (the operator, 2026-10-06).
+# supercut_brand.py draws the three-row card (SUPERCUT / PINEBOX FM / the station's long
+# name) in ONE font per cut, rolled by System 3 over the operator's collection (the
+# supercut_fonts_folder setting; listed only while the collection answers; the pick
+# copied once into data/fonts_cache so a burn never touches the share) and renders its
+# entry and its exit as frames (supercut.text_in / supercut.text_out, two more rolls).
+# Both supercut roads - this one and the SFX guy's hourly and custom cuts in
+# sfx_supercut.py - take their brand from supercut_brand_plan and keep its record.
+import supercut_brand as _supercut_brand                                  # [supercut-brand]
+
+H3_SUPERCUT_FONT_CACHE = "fonts_cache"     # [supercut-brand] under DATA_DIR: the local copies the burn reads
+
+
+def supercut_fonts_folder() -> Path:
+    """[supercut-brand] The operator's font collection: the DJ setting, under SFX_ROOT
+    unless it is an absolute path (the NAS sits at another path after the move)."""
+    settings = globals().get("dj_settings")
+    defaults = globals().get("DEFAULT_DJ") or {}
+    try:
+        raw = str((settings() if callable(settings) else {}).get("supercut_fonts_folder") or "").strip()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    raw = raw or str(defaults.get("supercut_fonts_folder") or "Fonts")
+    path = Path(raw)
+    root = globals().get("SFX_ROOT")
+    return path if path.is_absolute() else Path(root if root is not None else "/samples") / raw
+
+
+def supercut_font_shelf() -> list[Path]:
+    """[supercut-brand] The fonts the die rolls over - the folder listed only while the
+    collection answers (a folder under SFX_ROOT is the share and waits for the probe; an
+    absolute folder elsewhere is not gated; with no probe at all, nothing is listed).
+    Blocking: a worker thread's."""
+    folder = supercut_fonts_folder()
+    reach = globals().get("sfx_reachable")
+    under = globals().get("sfx_reach_under")
+    gated = bool(under(folder)) if callable(under) else True
+    reachable = (bool(reach()) if callable(reach) else False) or not gated
+    return _supercut_brand.font_shelf(folder, reachable=reachable)
+
+
+def h3_supercut_station() -> str:
+    """[supercut-brand] The station's long name for the card's third row (the station setting)."""
+    settings = globals().get("dj_settings")
+    try:
+        name = str((settings() if callable(settings) else {}).get("station_name") or "").strip()
+    except Exception:  # noqa: BLE001
+        name = ""
+    return name or H3_SUPERCUT_STATION
+
+
+def supercut_brand_roll(shelf: list[Path], seed_text: str = "", note: Any = None) -> dict[str, Any]:
+    """[supercut-brand] The three rolls, System 3's: the font (supercut.font) over the
+    shelf's labels, the entry (supercut.text_in) and the exit (supercut.text_out) over the
+    ten effects - through the tabled die, so the desk can retire one. `note(key, options,
+    picked)` hears each roll (the hourly road's rolodex). Not blocking: the loop's."""
+    die = globals().get("s3_choice")
+    seed = _supercut_brand.seed_for(seed_text)
+    rolled = callable(die)
+    font = _supercut_brand.roll_font(
+        shelf, (lambda labels: die(_supercut_brand.KEY_FONT, labels, _supercut_brand.LABEL_FONT)) if rolled else None,
+        (lambda labels, picked: note(_supercut_brand.KEY_FONT, labels, picked)) if callable(note) else None, seed)
+    effect_in, effect_out = _supercut_brand.roll_effects(
+        (lambda key, options, label: die(key, options, label)) if rolled else None,
+        note if callable(note) else None, seed)
+    return {"font_path": str(font) if font else "", "effect_in": effect_in, "effect_out": effect_out,
+            "seed": seed, "rolled": rolled, "shelf": len(shelf)}
+
+
+async def supercut_brand_plan(seed_text: str = "", note: Any = None) -> dict[str, Any]:
+    """[supercut-brand] The brand a cut is burnt with: the shelf (a worker - the share),
+    the rolls (the loop), the rolled font cached locally (a worker), the station's long
+    name - the dict the burn and the record read. Never raises: with nothing to roll
+    over the card is set in Pillow's face and the record says so."""
+    try:
+        shelf = await asyncio.to_thread(supercut_font_shelf)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "supercut brand: the font shelf was not listed (%s)" % type(exc).__name__)
+        shelf = []
+    plan = supercut_brand_roll(list(shelf or []), seed_text, note)
+    plan["cached"] = ""
+    if plan["font_path"]:
+        try:
+            data = globals().get("data_path")
+            cache = data(H3_SUPERCUT_FONT_CACHE) if callable(data) else Path(H3_SUPERCUT_FONT_CACHE)
+            plan["cached"] = str(await asyncio.to_thread(_supercut_brand.cache_font, plan["font_path"], cache))
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "supercut brand: the font %s was not cached (%s)"
+                         % (Path(plan["font_path"]).name, type(exc).__name__))
+    plan["station"] = h3_supercut_station()
+    return plan
+
+
+def h3_supercut_hour_note(rec: Any, key: str, opts: list[str], picked: str) -> None:
+    """[supercut-brand] A supercut roll onto the hour's rolodex entry, after the fact: the
+    hour's own rolls were bound when its render was queued, so this goes through
+    _h3_slot_note (the roll's record, with what it was drawn from), is taken back off the
+    live tray, and is written onto the hour's entry by its id, committed to the store."""
+    name = "supercut_" + str(key).rsplit(".", 1)[-1]
+    slot_note = globals().get("_h3_slot_note")
+    tray = globals().get("_H3_HOURLY_ROLLS")
+    got = None
+    if callable(slot_note) and isinstance(tray, dict):
+        try:
+            slot_note(name, key, list(opts), str(picked))
+        except Exception:  # noqa: BLE001
+            pass
+        got = tray.pop(name, None)
+    got = dict(got) if isinstance(got, dict) and got else {"key": key, "picked": str(picked)[:300]}
+    got.setdefault("picked", str(picked)[:300])
+    words = rec.get("h3_prompts") if isinstance(rec, dict) and isinstance(rec.get("h3_prompts"), dict) else {}
+    hour = str(words.get("hour") or "")
+    if not hour:
+        return
+    memory = globals().get("_H3_PROMPTS_MEM")
+    store = memory[0] if isinstance(memory, list) and memory and isinstance(memory[0], dict) else {}
+    hours = list(store.get("history") or []) + list(globals().get("_H3_PROMPTS_HOURS") or [])
+    commit = globals().get("h3_prompts_commit_hour")
+    offloop = globals().get("_h3_prompts_offloop")
+    for entry in reversed(hours):
+        if isinstance(entry, dict) and entry.get("hour") == hour:
+            had = entry.get("rolls") if isinstance(entry.get("rolls"), dict) else {}
+            had[name] = got
+            entry["rolls"] = had
+            if callable(commit) and callable(offloop):
+                try:
+                    offloop(commit, dict(entry))
+                except Exception:  # noqa: BLE001 - the memory entry still carries it
+                    pass
+            return
+
 
 def h3_supercut_wanted(rec: Any) -> str:
     """The preset's name when this gallery row is an hourly render whose preset
@@ -193145,9 +193490,11 @@ def h3_supercut_product(rec: Any) -> str:
 
 
 def h3_supercut_caption(rec: Any) -> list[str]:
-    """[pineex-caption] What the bottom of the copy says: SUPERCUT, then the product the hour sold
-    ("SUPERCUT + the product" - the operator, 2026-10-06)."""
-    return [H3_SUPERCUT_CAPTION_WORD, h3_supercut_product(rec)[:80]]
+    """[supercut-brand] The card's three rows: SUPERCUT, PINEBOX FM, the station's long name
+    as the station setting has it ("a 2nd row with the station name and then a brand of the
+    preset on a row" - the operator, 2026-10-06; the product line of [pineex-caption] gave
+    way to the card; h3_supercut_product still reads what the hour sold)."""
+    return _supercut_brand.lines(h3_supercut_station())
 
 
 def h3_supercut_folder(name: str) -> Path:
@@ -193158,73 +193505,24 @@ def h3_supercut_folder(name: str) -> Path:
     return SFX_LOCAL_ROOT / slug
 
 
-def _h3_supercut_png(lines: list[str], width: int, height: int, out: Path) -> Path:
-    """The caption strip as a PNG no wider than the picture, drawn with Pillow's
-    bundled face (ImageFont.load_default(size=N) - no system font in the
-    container; the gazette card's road): a dark band the size of the words,
-    white text with a dark edge, centred. Disk and CPU - a worker thread."""
-    from PIL import Image, ImageDraw, ImageFont  # type: ignore
-
-    def font(size: int):  # noqa: ANN202
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:
-            return ImageFont.load_default()
-
-    big = max(14, int(round(height * 0.055)))
-    small = max(12, int(round(big * 0.72)))
-    pad = max(6, big // 2)
-    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
-
-    def measure(s: str, f: Any) -> float:
-        try:
-            return float(probe.textlength(s, font=f))
-        except Exception:  # noqa: BLE001
-            return len(s) * big * 0.55
-
-    def wrap(s: str, f: Any, most: int = 2) -> list[str]:
-        rows: list[str] = []
-        cur = ""
-        for word in str(s).split():
-            trial = (cur + " " + word).strip()
-            if measure(trial, f) <= width - 2 * pad or not cur:
-                cur = trial
-            else:
-                rows.append(cur)
-                cur = word
-            if len(rows) >= most:
-                break
-        if cur and len(rows) < most:
-            rows.append(cur)
-        return rows
-
-    rows: list[tuple[str, Any]] = []
-    for ix, line in enumerate([x for x in lines if x][:3]):
-        f = font(big if ix == 0 else small)
-        rows.extend((row, f) for row in wrap(line, f))
-    if not rows:
-        rows = [(H3_SUPERCUT_STATION, font(big))]
-    steps = [int(round(float(getattr(f, "size", big)) * 1.3)) for _r, f in rows]
-    band_w = int(min(width, max(measure(r, f) for r, f in rows) + 2 * pad))
-    band_h = int(sum(steps) + 2 * pad)
-    img = Image.new("RGBA", (max(8, band_w), max(8, band_h)), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle((0, 0, band_w - 1, band_h - 1), fill=(0, 0, 0, 150))
-    y = float(pad)
-    for (row, f), step in zip(rows, steps):
-        x = max(float(pad), (band_w - measure(row, f)) / 2)
-        draw.text((x, y), row, font=f, fill=(255, 255, 255, 255),
-                  stroke_width=max(1, big // 14), stroke_fill=(0, 0, 0, 255))
-        y += step
+def _h3_supercut_png(lines: list[str], width: int, height: int, out: Path, font_path: Any = None) -> Path:
+    """[supercut-brand] The finished card as a PNG exactly the picture's width: the shared
+    three-row card (supercut_brand.card) in the given font, Pillow's bundled face when none
+    loads - a still of the hold frame, for a probe or a test. Disk and CPU - a worker thread."""
+    rows = [x for x in lines if x][:3] or [H3_SUPERCUT_STATION]
+    img = _supercut_brand.card(rows, font_path, width, height)
     img.save(out)
     return out
 
 
-def h3_supercut_burn(source: Path, target: Path, lines: list[str], exe: str = "") -> dict[str, Any]:
-    """The captioned copy: the strip laid over the picture, centred,
-    H3_SUPERCUT_MARGIN_PX up from the bottom edge; the sound as it was (AAC
-    in an mp4). One ffmpeg pass through the overlay filter - the container's
-    imageio ffmpeg has no drawtext and no fonts. Blocking: a worker thread."""
+def h3_supercut_burn(source: Path, target: Path, lines: list[str], exe: str = "", brand: Any = None) -> dict[str, Any]:
+    """[supercut-brand] The branded copy: the card's entry, hold and exit laid over the
+    picture in ONE ffmpeg pass (three overlays, each enabled in its own window, centred,
+    H3_SUPERCUT_MARGIN_PX up from the bottom edge - the container's imageio ffmpeg has no
+    drawtext), the sound as it was (AAC in an mp4). `brand` is supercut_brand_plan's dict
+    (the cached font, the two rolled effects, the seed); without one the card is set in
+    Pillow's face with seeded effects. The frames live in a folder beside the target while
+    it is made and go with the temporary. Blocking: a worker thread."""
     import imageio_ffmpeg
     exe = exe or _sfx_ffmpeg() or "ffmpeg"
     source, target = Path(source), Path(target)
@@ -193236,25 +193534,26 @@ def h3_supercut_burn(source: Path, target: Path, lines: list[str], exe: str = ""
     width, height = (int(x) for x in (meta.get("size") or (0, 0)))
     if width <= 0 or height <= 0:
         raise ValueError("the render has no picture to caption")
+    seconds = float(meta.get("duration") or 0.0)
+    plan = dict(brand or {})
+    seed = int(plan.get("seed") or _supercut_brand.seed_for(target.stem))
+    if not plan.get("effect_in") or not plan.get("effect_out"):
+        plan["effect_in"], plan["effect_out"] = _supercut_brand.roll_effects(None, None, seed)
+    font = plan.get("cached") or plan.get("font_path") or ""
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.stem + ".tmp" + target.suffix)
-    strip = target.with_name(target.stem + ".caption.png")
+    workdir = target.with_name(target.stem + ".brand")
     try:
-        _h3_supercut_png(lines, width, height, strip)
-        subprocess.run(
-            [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-             "-i", str(source), "-i", str(strip),
-             "-filter_complex",
-             "[0:v:0][1:v:0]overlay=(main_w-overlay_w)/2:main_h-overlay_h-%d:format=auto,format=yuv420p[v]"
-             % H3_SUPERCUT_MARGIN_PX,
-             "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(temporary)],
-            capture_output=True, timeout=max(30.0, H3_SUPERCUT_SECONDS - 30.0), check=True)
-        temporary.replace(target)
+        prep = _supercut_brand.prepare(list(lines), font, width, height, seconds, plan["effect_in"],
+                                       plan["effect_out"], workdir, seed=seed)
+        made = _supercut_brand.burn(exe, source, target, prep, run=subprocess.run,
+                                    timeout=max(30.0, H3_SUPERCUT_SECONDS - 30.0))
     finally:
-        temporary.unlink(missing_ok=True)
-        strip.unlink(missing_ok=True)
-    return {"path": str(target), "size": [width, height], "lines": list(lines)}
+        _supercut_brand.clean_workdir(workdir)
+    record = _supercut_brand.record_of(prep, plan.get("font_path") or font, plan.get("cached") or "", list(lines),
+                                       plan["effect_in"], plan["effect_out"], rolled=bool(plan.get("rolled")),
+                                       ffmpeg_ms=made.get("ffmpeg_ms"), shelf=plan.get("shelf"))
+    return {"path": str(target), "size": [width, height], "lines": list(lines),
+            "seconds": round(seconds, 3), "brand": record}
 
 
 def h3_supercut_source(rec: dict[str, Any]) -> Path | None:
@@ -193294,20 +193593,28 @@ async def h3_supercut_version(rec: dict[str, Any]) -> dict[str, Any] | None:
             folder = h3_supercut_folder(name)
             stem = re.sub(r"[^A-Za-z0-9_-]+", "-", source.stem).strip("-")[:60] or pid[:8]
             target = folder / ("%s-%s-supercut.mp4" % (folder.name, stem))
-            await asyncio.wait_for(asyncio.to_thread(h3_supercut_burn, source, target, lines),
-                                   timeout=H3_SUPERCUT_SECONDS)
+            # [supercut-brand] the font and the two text effects, System 3's, noted on the hour's rolodex
+            brand = await supercut_brand_plan(pid, lambda key, opts, picked: h3_supercut_hour_note(rec, key, opts, picked))
+            got = await asyncio.wait_for(asyncio.to_thread(h3_supercut_burn, source, target, lines, "", brand),
+                                         timeout=H3_SUPERCUT_SECONDS)
             seconds = float(await asyncio.to_thread(_media_duration_probe, target) or 0.0)
             booked = bool(await asyncio.to_thread(sfx_db_write_row, target, seconds, 1 if seconds > 0 else 0))
             queued = bool(sfx_cycle_request(target, name, "the supercut version of this hour's %s render" % name))
+            record = got.get("brand") if isinstance(got, dict) and isinstance(got.get("brand"), dict) else {
+                "font": Path(brand["cached"]).stem if brand.get("cached") else _supercut_brand.DEFAULT_FACE,
+                "effect_in": brand.get("effect_in"), "effect_out": brand.get("effect_out"), "seed": brand.get("seed")}
             made = {"file": target.name, "path": str(target), "folder": folder.name, "sid": sfx_id(target),
                     "seconds": round(seconds, 3), "caption": lines, "booked": booked, "queued": queued,
-                    "source": source.name, "at": round(time.time(), 3)}
+                    "source": source.name, "at": round(time.time(), 3),
+                    "font": record.get("font"), "brand": record}                   # [supercut-brand] kept with the cut
             await update_generation(pid, supercut_version=made)
-            pipeline_log("ads", "supercut version (%s): %s - %.1f s, %s, %s" % (
+            pipeline_log("ads", "supercut version (%s): %s - %.1f s, %s, %s; set in %s, %s in / %s out" % (
                 name, target.name, seconds,
                 "in the clip book" if booked else "NOT in the clip book",
                 "handed to the endless set" if queued else
-                "not handed to the endless set (its door said no: four waiting, or on cooldown)"))
+                "not handed to the endless set (its door said no: four waiting, or on cooldown)",
+                record.get("font"), record.get("effect_in_used") or record.get("effect_in"),
+                record.get("effect_out_used") or record.get("effect_out")))          # [supercut-brand]
             return made
     except Exception as exc:  # noqa: BLE001 - the render itself is never at stake
         pipeline_log("ads", "supercut version (%s): not made for %s (%s: %s)"
@@ -284016,6 +284323,8 @@ dynamic_segments_runtime.install(app, globals())
 import dynamic_segments_system2
 dynamic_segments_system2.install(app, globals())
 gazette_review_runtime.install(app, globals())
+import system3_hour                                             # [wave-g] the Hour Director
+system3_hour.install(app, globals())                             # [wave-g] GET/POST /api/system3/engine, GET /api/system3/hour
 blocked_book.install(app, globals())                         # [blocked-book] GET /api/blocked
 llm_commands.install(app, globals())                         # [llm-command] GET /api/llm-commands; counts the parsers above
 

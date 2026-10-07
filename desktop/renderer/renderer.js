@@ -7696,6 +7696,15 @@ function worksSchedule(anchorPop) {
   });
   nav.appendChild(prev); nav.appendChild(label); nav.appendChild(next);
   pop.appendChild(nav);
+  /* [hour-tab] the sheet's entries are edited in the System 3 window's Hour tab now */
+  const s3Line = mk("div", "wk-note", "Edited in the System 3 window's Hour tab now. ");
+  s3Line.style.cssText = "font-size:11px;margin:2px 0 6px";
+  const s3Open = mk("button", "", "Open the Hour tab");
+  s3Open.title = "Open the System 3 window on the Hour tab";
+  s3Open.setAttribute("aria-label", "Open the System 3 window on the Hour tab");
+  s3Open.onclick = (e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent("pine:system3-open", {detail: {tab: "hour"}})); };
+  s3Line.appendChild(s3Open);
+  pop.appendChild(s3Line);
 
   const body = mk("div", "");
   pop.appendChild(body);

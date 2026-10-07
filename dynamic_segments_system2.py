@@ -423,6 +423,8 @@ class DynamicSystem2:
         return None
 
     async def claim(self, kinds, lookahead):
+        if self.runtime.stood_down():
+            return None   # [kitchen-hour] System 3 owns the kitchen
         requested_horizon = max(lookahead, int(self.runtime.config.get('horizon_hours') or 1)*3600)
         job = await asyncio.to_thread(self.requested_job, kinds, requested_horizon) if self.requested else None
         if not job:
@@ -440,7 +442,7 @@ class DynamicSystem2:
         slot = next((slot for hour in self.runtime._plans for slot in hour.get('slots', [])
                      if slot.get('id') == ticket['slot_id']), None)
         last = self.dynamic.last.get(ticket['occurrence'], {})
-        if (not self.runtime.enabled or now >= ticket['expires_at'] or now >= ticket['hard_deadline']
+        if (not self.runtime.enabled or self.runtime.stood_down() or now >= ticket['expires_at'] or now >= ticket['hard_deadline']
                 or not slot or slot.get('revision') != ticket['revision']
                 or (last.get('coverage') or {}).get('ready')
                 or last.get('state') in {'deferred', 'invalid'}):
@@ -456,6 +458,8 @@ class DynamicSystem2:
         return self.original['prep_has_assigned_work'](kind)
 
     async def wait_for_book_writer(self, job, work, *, wait_seconds=30.0):
+        if self.runtime.stood_down():
+            return False   # [kitchen-hour] no ticket under System 3
         writing = self.dynamic.g.setdefault('_LARDER_WRITING', [False])
         if not writing[0]:
             return True
@@ -479,6 +483,8 @@ class DynamicSystem2:
             self.writer_ticket = None
 
     async def prepare_job(self, job):
+        if self.runtime.stood_down():
+            return None   # [kitchen-hour]
         rt, h = self.runtime, self.runtime.host
         due = self.due(job['template'])
         kind = due['kind']

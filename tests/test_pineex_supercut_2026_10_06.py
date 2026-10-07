@@ -403,17 +403,19 @@ class SupercutRule(unittest.TestCase):
         self.assertEqual(wanted({"hourly": True, "h3_prompts": {"preset": {"name": "pineEX"}}}), "pineEX",
                          "a record without fields still names its preset")
 
-    def test_the_caption_is_supercut_and_the_product(self):
-        """[pineex-caption] "SUPERCUT + the product" (the operator)."""
+    def test_the_caption_is_the_three_row_brand_card(self):
+        """[supercut-brand] SUPERCUT / PINEBOX FM / the station's long name (the operator, 2026-10-06);
+        the product line of [pineex-caption] gave way to the card. h3_supercut_product still reads the hour."""
         caption = self.ns["h3_supercut_caption"]
         row = pineex_row()
         row["h3_prompts"]["direction"] = ('A music video. What is sold tonight is the product "Pine Box FM Vinyl Record Holder" '
                                           '- it keeps the records upright. Sing it.')
-        self.assertEqual(caption(row), ["SUPERCUT", "Pine Box FM Vinyl Record Holder"], "the product the hour sold")
-        row["h3_prompts"]["direction"] = 'Tonight it is the Pine Box feature "One press builds the PineTab" [tablet-update-ask] - pitch it.'
-        self.assertEqual(caption(row), ["SUPERCUT", "One press builds the PineTab"], "a feature when the offer rolled one")
-        self.assertEqual(caption(pineex_row()), ["SUPERCUT", "Pine Box FM"], "nothing sold in the words: the station")
-        self.assertEqual(caption({}), ["SUPERCUT", "Pine Box FM"])
+        self.assertEqual(self.ns["h3_supercut_product"](row), "Pine Box FM Vinyl Record Holder", "the product the hour sold")
+        self.assertEqual(caption(row), ["SUPERCUT", "PINEBOX FM", "Pine Box FM"], "no station setting: the short name")
+        self.ns["dj_settings"] = lambda: {"station_name": "Chicken Tendo Little Pine Box FM Station"}
+        self.assertEqual(caption(row), ["SUPERCUT", "PINEBOX FM", "Chicken Tendo Little Pine Box FM Station"],
+                         "the station setting's long name on the third row")
+        self.assertEqual(caption({}), ["SUPERCUT", "PINEBOX FM", "Chicken Tendo Little Pine Box FM Station"])
 
     def test_the_folder_is_named_for_the_preset_under_the_writable_root(self):
         folder = self.ns["h3_supercut_folder"]
@@ -432,7 +434,7 @@ class SupercutRoad(unittest.TestCase):
         self.ads.mkdir(parents=True)
         self.burns: list[tuple] = []
 
-        def fake_burn(source, target, lines, exe=""):
+        def fake_burn(source, target, lines, exe="", brand=None):      # [supercut-brand] the plan rides along
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             self.burns.append((Path(source), Path(target), list(lines)))
@@ -458,7 +460,7 @@ class SupercutRoad(unittest.TestCase):
         self.assertEqual(target.name, "pineEX-h3-pid1-clip-supercut.mp4")
         self.assertTrue(target.is_file())
         self.assertEqual(self.burns[0][0], self.ads / "h3-pid1-clip.mp4")
-        self.assertEqual(self.burns[0][2], ["SUPERCUT", "Pine Box FM"])   # [pineex-caption]
+        self.assertEqual(self.burns[0][2], ["SUPERCUT", "PINEBOX FM", "Pine Box FM"])   # [supercut-brand] three rows
         # the clip book, by hand, with the measured length
         self.assertEqual(self.ns["_booked"], [(target, 9.5, 1)])
         self.assertEqual((made["booked"], made["queued"], made["seconds"], made["folder"]), (True, True, 9.5, "pineEX"))
@@ -518,7 +520,7 @@ class SupercutRoad(unittest.TestCase):
     def test_a_failed_cut_never_raises_and_leaves_no_file(self):
         row = self.land(pineex_row())
 
-        def broken(source, target, lines, exe=""):
+        def broken(source, target, lines, exe="", brand=None):         # [supercut-brand]
             raise subprocess.CalledProcessError(1, "ffmpeg", stderr=b"no")
         self.ns["h3_supercut_burn"] = broken
         self.assertIsNone(asyncio.run(self.ns["h3_supercut_version"](row)))
@@ -618,7 +620,7 @@ class RealBurn(unittest.TestCase):
             return total / max(1, (y1 - y0) * w * 3)
         top, bottom = band_diff(0, h // 4), band_diff(h - h // 4, h)
         self.assertLess(top, 6.0, "the top of the picture is as it was (encoder noise only)")
-        self.assertGreater(bottom, top * 4 + 10, "the caption changed the bottom of the picture")
+        self.assertGreater(bottom, top * 4 + 3, "the card changed the bottom of the picture")   # [supercut-brand] light letters, no dark band
         # the strip itself: no wider than the picture, dark band, white ink
         strip = self.tmp / "strip.png"
         self.ns["_h3_supercut_png"](["Dance all night to the record", "Pine Box FM"], 320, 180, strip)

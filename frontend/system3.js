@@ -755,6 +755,10 @@ Object.assign(FAMILY_WHAT, {   /* [s3-inject] the honest forced card */
   INJECT: ['Forced onto the air (no roll)',
     'Something the station forced onto the air with no dice: the dead-air rescue putting a finished round out of turn, boot recovery republishing what a restart cut off, the level gate covering a live set that dropped out, MX Live taking or giving back the air, or a fixed surface (the Pine Cam) standing on the wall. The card says who injected it and why, at its point in the timeline - an injected node in the segment\'s executed tree, never an orphan, and never a faked roll.'],
 });
+Object.assign(FAMILY_WHAT, {   /* [wave-g] the Hour Director's own dice */
+  HOUR: ['The hour (HOUR1-3)',
+    "When the running order is silent, HOUR1 draws the kind of round the hour airs, weighted up for the kinds that are behind pace (HOUR2). HOUR3 is the chance that an entry jammed past 1.5 times its minutes is displaced. Every draw is written on the hour's ledger in the System 3 window."]
+});
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
   SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
@@ -6545,6 +6549,336 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
 }
 
 /* ======================================================================== */
+/* [hour-tab] THE HOUR AS A ROAD OF LEGS - the System 3 window's Hour tab (wave I, the Hour Director).
+ *
+ * The sheet stays the store. Entries are read and saved through the schedule APIs: GET /api/schedule/hours
+ * (the hours), POST /api/schedule/hours (the whole list of one hour), POST /api/schedule/hours/{key}/prompt
+ * (one entry's instruction), GET /api/schedule/kinds. When the Hour Director is the engine (system3), each leg
+ * adds what the director did with the entry: GET /api/system3/hour?hour=<key> gives the leg on air, the row
+ * booked and the ledger of why. GET and POST /api/system3/engine switch the engine, and a switch asks first.
+ * While the director is not on the station (404, or the engine is not system3) this tab is the sheet editor and
+ * says the director is not on this station yet. Nothing here scrolls: a repaint keeps the reader's place and the
+ * on-air leg is lit, never brought into view. The hour's own dice open the Tables tab on their table. */
+const HOUR_DYNAMIC = {book_time: 'Book Time window', sfx_supercut: 'Station supercut window'};
+const HOUR_ENGINES = [['legacy', 'Legacy clock'], ['system2', 'System 2'], ['system3', 'System 3']];
+const HOUR_DICE = [['HOUR1', 'When the sheet is silent'], ['HOUR2', 'Quota pressure'], ['HOUR3', 'The jam']];
+const HOUR_DERIVED = ['state', 'past', 'prep', 'slot_prep', 'starts_epoch', 'ends_epoch'];
+
+function hourIcon(name) {
+  const span = el('span', {class: 's3-hour-ic', 'aria-hidden': 'true'});
+  if (typeof window.pineIcon === 'function') span.innerHTML = window.pineIcon(name) || '';
+  return span;
+}
+function hourButton(text, onclick, o = {}) {
+  const extra = {class: 's3-hour-btn' + (o.cls ? ' ' + o.cls : ''), title: o.title || text || 'button',
+    'aria-label': o.title || text || 'button'};
+  if (o.pressed !== undefined) extra['aria-pressed'] = String(!!o.pressed);
+  const b = btn(text, onclick, extra);
+  if (o.icon) b.prepend(hourIcon(o.icon));
+  if (o.disabled) b.disabled = true;
+  return b;
+}
+const hourClock = t => (typeof t === 'number' || /^\d+(\.\d+)?$/.test(String(t == null ? '' : t)) ? clock(Number(t)) : String(t == null ? '' : t));
+const hourSince = s => (s == null || s === '' ? '-' : typeof s === 'number' ? day(s) : String(s));
+
+function makeHourTab({request, scroll = () => null, busy = () => false, active = () => true, openTable = () => {},
+  notice = () => {}, report = () => {}} = {}) {
+  const root = el('div', {class: 's3-hour', 'data-tab': 'hour'});
+  const state = {hours: [], key: '', hour: null, hourErr: '', engine: null, engineErr: '', kinds: [],
+    loadedAt: 0, inserting: ''};
+  const drafts = new Map();                       /* an instruction being typed, kept across repaints */
+  let token = 0, alive = true;
+  const post = (path, body) => request(path, {method: 'POST', body: JSON.stringify(body)});
+  const kindLabel = kind => { const k = state.kinds.find(x => x.kind === kind); return k ? (k.label || kind) : String(kind || ''); };
+  const currentRow = () => state.hours.find(h => h.key === state.key) || null;
+  const directorLive = () => !!(state.hour && Array.isArray(state.hour.legs)
+    && (!state.hour.engine || state.hour.engine === 'system3'));
+  const legOf = id => (directorLive() ? state.hour.legs : []).find(l => l.id === id) || null;
+  const instructionOf = (s, leg) => (leg && leg.act ? String(leg.act) : String(s.flow_prompt || ''));
+  const editing = () => {
+    const a = document.activeElement;
+    return (!!a && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) || !!document.querySelector('.s3-hour-back');
+  };
+
+  /* ---- reading: the hours, the engine, one hour's legs - each answer on its own ---- */
+  async function loadAll() {
+    const mine = ++token;
+    try {
+      const hours = await request('/api/schedule/hours?count=6');
+      state.hours = (hours && hours.hours) || [];
+      if (!state.hours.some(h => h.key === state.key)) {
+        const now = state.hours.find(h => h.is_now) || state.hours[0];
+        state.key = now ? now.key : '';
+      }
+    } catch (e) { report(e); }
+    const ask = p => request(p).then(v => ({v, err: ''}), e => ({v: null, err: (e && e.message) || String(e)}));
+    const [engine, hour, kinds] = await Promise.all([
+      ask('/api/system3/engine'),
+      state.key ? ask('/api/system3/hour?hour=' + encodeURIComponent(state.key)) : Promise.resolve({v: null, err: ''}),
+      state.kinds.length ? Promise.resolve({v: state.kinds, err: ''}) : ask('/api/schedule/kinds'),
+    ]);
+    if (!alive || mine !== token) return;
+    state.engine = engine.v; state.engineErr = engine.err;
+    state.hour = hour.v; state.hourErr = hour.err;
+    if (Array.isArray(kinds.v) && kinds.v.length) state.kinds = kinds.v;
+    state.loadedAt = Date.now();
+    paint();
+  }
+
+  /* ---- painting: the whole tab is rebuilt, and the reader's scroll place is kept ---- */
+  function paint() {
+    const box = scroll();
+    const top = box ? box.scrollTop : 0;
+    fill(root, topBar(), sheet());
+    if (box && box.scrollTop !== top) box.scrollTop = top;
+  }
+  function topBar() {
+    return el('div', {class: 's3-hour-top'}, engineBar(), hourPicker(), diceBar());
+  }
+  function engineBar() {
+    const eng = state.engine;
+    if (!eng) {
+      return el('div', {class: 's3-hour-engine s3-hour-off', role: 'status'},
+        el('b', {text: 'The Hour Director is not on this station yet.'}),
+        ' This tab is the sheet editor. ',
+        el('span', {class: 's3-muted', text: state.engineErr ? '(' + state.engineErr + ')' : ''}));
+    }
+    const cur = String(eng.engine || '');
+    const fallback = !!eng.fallback;
+    return el('div', {class: 's3-hour-engine'},
+      el('div', {class: 's3-hour-line'},
+        el('span', {class: 's3-muted', text: 'Engine'}),
+        HOUR_ENGINES.map(([id, label]) => hourButton(label, () => askEngine(id, fallback),
+          {cls: 'eng' + (cur === id ? ' on' : ''), pressed: cur === id, title: 'Engine: ' + label}))),
+      el('label', {class: 's3-hour-fb'},
+        el('input', {type: 'checkbox', checked: fallback, onchange: e => askEngine(cur, e.target.checked)}),
+        ' fallback to the legacy chain'),
+      el('div', {class: 's3-muted', text: 'since ' + hourSince(eng.since)}),
+      el('div', {class: 's3-hour-say', text: String(eng.say || '')}));
+  }
+  function hourPicker() {
+    return el('div', {class: 's3-hour-pick', role: 'group', 'aria-label': 'hours'},
+      state.hours.map(h => hourButton(h.label + (h.is_now ? ' now' : '') + (h.overridden ? ' own' : ''), () => {
+        state.key = h.key; state.inserting = ''; loadAll();
+      }, {cls: 'hr' + (h.key === state.key ? ' on' : ''), pressed: h.key === state.key,
+        title: h.key + (h.overridden ? ' - its own orders' : ' - running the plan')})));
+  }
+  function diceBar() {
+    return el('div', {class: 's3-hour-dice'},
+      el('span', {class: 's3-muted', text: 'The hour\'s dice'}),
+      HOUR_DICE.map(([id, words]) => hourButton(id + ' - ' + words, () => openTable(id),
+        {title: id + ': ' + words + ' - the Tables tab, on this table'})));
+  }
+  function sheet() {
+    const row = currentRow();
+    if (!row) return el('p', {class: 's3-muted', text: 'No hour to show. The schedule did not answer.'});
+    return el('div', {class: 's3-hour-body'}, directorNote(), road(row, row.slots || []));
+  }
+  function directorNote() {
+    if (directorLive() || !state.engine) return null;
+    if (state.engine.engine !== 'system3') {
+      return el('div', {class: 's3-muted', text: 'The director is not the engine (engine ' + (state.engine.engine || '?')
+        + '). The entries below are the sheet\'s own; the legs and the ledger show when the engine is System 3.'});
+    }
+    return el('div', {class: 's3-muted', text: 'The legs of this hour could not be read'
+      + (state.hourErr ? ' (' + state.hourErr + ')' : '') + '. The entries below are the sheet\'s own.'});
+  }
+  function road(row, slots) {
+    const start = el('div', {class: 's3-hour-start'},
+      hourIcon('c:time'),
+      el('b', {text: row.label + ' - the hour'}),
+      el('span', {class: 's3-muted', text: (row.preset ? ' preset ' + row.preset : '')
+        + (row.overridden ? ' - its own orders' : ' - running the plan')
+        + (row.is_now ? ' - on air now' : row.is_past ? ' - gone by' : '')}),
+      hourButton('Insert first', () => { state.inserting = '@top'; paint(); },
+        {icon: 'c:add', title: 'Insert an entry at the top of this hour'}));
+    const nodes = [];
+    if (state.inserting === '@top') nodes.push(insertForm(-1));
+    slots.forEach((s, i) => {
+      nodes.push(entryNode(s, i, slots));
+      if (state.inserting === s.id) nodes.push(insertForm(i));
+    });
+    if (!slots.length) nodes.push(el('p', {class: 's3-muted', text: 'This hour has no entries yet.'}));
+    return el('div', {class: 's3-hour-road', 'aria-label': 'the hour, entry by entry'}, start, nodes);
+  }
+  function insertForm(i) {
+    const sel = el('select', {class: 's3-hour-sel', 'aria-label': 'kind of the new entry', title: 'kind of the new entry'},
+      state.kinds.map(k => el('option', {value: k.kind, text: k.label || k.kind})));
+    return el('div', {class: 's3-hour-insert'},
+      el('span', {class: 's3-muted', text: 'new entry, kind'}), sel,
+      hourButton('Insert', () => insertAfter(i, sel.value), {icon: 'c:checkmark', cls: 'primary', title: 'Insert the entry'}),
+      hourButton('Cancel', () => { state.inserting = ''; paint(); }, {icon: 'c:close--filled', title: 'Cancel'}));
+  }
+  function entryNode(s, i, slots) {
+    const leg = legOf(s.id);
+    const kind = String(s.kind || '');
+    const dyn = (leg && leg.dynamic_kind) || (HOUR_DYNAMIC[kind] ? kind : '');
+    const onAir = !!((leg && leg.on_air) || s.state === 'on air');
+    const inner = Array.isArray(s.flow) && s.flow.length > 0;
+    const enabled = s.enabled !== false;
+    const ta = el('textarea', {rows: '2', value: drafts.has(s.id) ? drafts.get(s.id) : instructionOf(s, leg),
+      'aria-label': 'standing instruction for this entry', title: 'the standing instruction for this entry',
+      oninput: e => drafts.set(s.id, e.target.value)});
+    return el('div', {class: 's3-hour-node' + (onAir ? ' on-air' : '') + (inner ? ' inner' : '') + (enabled ? '' : ' off'),
+        'data-slot': String(s.id || '')},
+      el('div', {class: 's3-hour-nhead'},
+        el('span', {class: 's3-hour-idx', text: String(i + 1)}),
+        el('b', {text: s.label || kindLabel(kind)}),
+        el('span', {class: 's3-hour-chip', text: kindLabel(kind)}),
+        dyn ? el('span', {class: 's3-hour-chip dyn', text: HOUR_DYNAMIC[dyn] || 'Dynamic window',
+          title: 'a dynamic window: it takes its own segment door'}) : null,
+        onAir ? el('span', {class: 's3-hour-chip air', text: 'on air'}) : null,
+        inner ? el('span', {class: 's3-hour-chip', text: 'own inner shape'}) : null),
+      el('div', {class: 's3-hour-ctl'},
+        el('label', {class: 's3-hour-mins'}, el('span', {text: 'minutes '}),
+          el('input', {type: 'number', min: '0.25', max: '600', step: '0.25', value: String(s.minutes),
+            'aria-label': 'minutes', title: 'minutes for this entry', onchange: e => setMinutes(i, e.target.value)})),
+        el('label', {class: 's3-hour-en'},
+          el('input', {type: 'checkbox', checked: enabled, onchange: e => setEnabled(i, e.target.checked)}),
+          el('span', {text: ' enabled'})),
+        hourButton('', () => move(i, -1), {icon: 'c:arrow--up', title: 'Move up', disabled: i === 0}),
+        hourButton('', () => move(i, 1), {icon: 'c:arrow--up', cls: 'down', title: 'Move down', disabled: i === slots.length - 1}),
+        hourButton('', () => { state.inserting = s.id; paint(); }, {icon: 'c:add', title: 'Insert an entry after this one'}),
+        hourButton('', () => removeAt(i), {icon: 'c:trash-can', title: 'Remove this entry'}),
+        hourButton('Inner shape', () => openInner(s),
+          {icon: 'c:chart--network', title: 'Open the inner shape of this entry in the hour-flow editor'})),
+      el('div', {class: 's3-hour-instr'}, ta,
+        hourButton('Save instruction', () => saveInstruction(s, ta.value),
+          {icon: 'c:save', title: 'Save the standing instruction of this entry in this hour'})),
+      leg ? el('div', {class: 's3-hour-leg'},
+        el('span', {class: 's3-muted', text: 'road ' + (leg.road || kind) + ' - ' + (leg.minutes != null ? leg.minutes + ' min' : '')
+          + (leg.start ? ' - starts ' + hourClock(leg.start) : '') + (leg.deadline ? ' - deadline ' + hourClock(leg.deadline) : '')})) : null,
+      leg ? el('div', {class: 's3-hour-booked', text: leg.booked
+        ? 'booked ' + (leg.booked.label || leg.booked.id) + ' (' + leg.booked.kind + ')' : 'nothing booked for this leg yet'}) : null,
+      leg ? ledgerView(leg.ledger || []) : null);
+  }
+  function ledgerView(rows) {
+    if (!rows.length) return el('div', {class: 's3-muted', text: 'no draw on this leg yet'});
+    return el('ol', {class: 's3-hour-ledger', 'aria-label': 'the ledger of this leg'}, rows.slice(-8).map(r => el('li', null,
+      el('span', {class: 's3-muted', text: hourClock(r.at) + ' '}),
+      'named ', el('b', {text: String(r.named || '-')}), ' - policy ', el('b', {text: String(r.policy || '-')}),
+      r.booked ? ' - booked ' + (r.booked.label || r.booked.id) : '',
+      ' - served ', el('b', {text: String(r.served || '-')}),
+      r.why ? el('div', {class: 's3-muted', text: 'why: ' + r.why}) : null)));
+  }
+
+  /* ---- the engine: a switch asks first, and says what it does ---- */
+  function modal(title, kids, onDismiss = () => {}) {
+    const back = el('div', {class: 's3 s3-modal-back s3-hour-back'});
+    let open = true;
+    const close = dismissed => { if (!open) return; open = false; back.remove(); if (dismissed) onDismiss(); };
+    const x = hourButton('', () => close(true), {cls: 's3-hour-x', icon: 'c:close--filled', title: 'Close'});
+    back.append(el('div', {class: 's3-hour-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title},
+      el('div', {class: 's3-hour-mhead'}, el('b', {text: title}), x), kids));
+    back.addEventListener('click', e => { if (e.target === back) close(true); });
+    document.body.append(back);
+    return {close: () => close(false), dismiss: () => close(true)};
+  }
+  function askEngine(engine, fallback) {
+    const cur = state.engine || {};
+    if (engine === cur.engine && !!fallback === !!cur.fallback) return paint();
+    const label = (HOUR_ENGINES.find(x => x[0] === engine) || [engine, engine])[1];
+    const m = modal('Switch the engine?', [
+      el('p', {text: 'Engine ' + (cur.engine || 'unknown') + ' -> ' + engine + ', fallback ' + (fallback ? 'on' : 'off') + '.'}),
+      el('p', {class: 's3-muted', text: engine === 'system3'
+        ? 'System 3 takes the hour: System 2 stands down, and its store stays readable. '
+          + (fallback ? 'The fallback stays armed: the legacy chain still serves an entry the director aired nothing for.'
+            : 'The fallback is off: the legacy chain does not cover an entry the director aired nothing for.')
+        : 'The chosen engine takes the clock from the next entry. The fallback setting goes with it.'}),
+      el('div', {class: 's3-hour-mact'},
+        hourButton('Switch to ' + label, async () => {
+          m.close();
+          try {
+            await post('/api/system3/engine', {engine, fallback: !!fallback});
+            notice('Engine set to ' + label + (fallback ? ', fallback on.' : ', fallback off.'));
+          } catch (e) { report(e); }
+          loadAll();
+        }, {cls: 'primary', icon: 'c:checkmark', title: 'Switch the engine'}),
+        hourButton('Cancel', () => m.dismiss(), {icon: 'c:close--filled', title: 'Cancel - keep the engine'}))], () => paint());
+    return m;
+  }
+
+  /* ---- the sheet: every write posts the whole hour's list (the list you send IS that hour) ---- */
+  const cleanSlot = s => { const o = {...s}; HOUR_DERIVED.forEach(k => { delete o[k]; }); return o; };
+  const slotsNow = () => (currentRow() ? (currentRow().slots || []) : []).map(s => ({...s}));
+  async function writeSlots(slots, done) {
+    try {
+      await post('/api/schedule/hours', {key: state.key, slots: slots.map(cleanSlot)});
+      notice(done);
+    } catch (e) { report(e); }
+    loadAll();
+  }
+  function setMinutes(i, value) {
+    const n = Number(value);
+    if (!(n > 0)) { report(new Error('minutes must be a number above zero')); return paint(); }
+    const slots = slotsNow();
+    if (!slots[i]) return;
+    slots[i].minutes = Math.max(0.25, Math.min(600, n));
+    writeSlots(slots, 'Saved the minutes for ' + (slots[i].label || 'the entry') + '.');
+  }
+  function setEnabled(i, on) {
+    const slots = slotsNow();
+    if (!slots[i]) return;
+    slots[i].enabled = !!on;
+    writeSlots(slots, (on ? 'Enabled ' : 'Disabled ') + (slots[i].label || 'the entry') + '.');
+  }
+  function move(i, d) {
+    const slots = slotsNow();
+    const j = i + d;
+    if (!slots[i] || j < 0 || j >= slots.length) return;
+    [slots[i], slots[j]] = [slots[j], slots[i]];
+    writeSlots(slots, 'Moved ' + (slots[j].label || 'the entry') + ' ' + (d < 0 ? 'up' : 'down') + '.');
+  }
+  function removeAt(i) {
+    const slots = slotsNow();
+    if (!slots[i]) return;
+    const gone = slots.splice(i, 1)[0];
+    writeSlots(slots, 'Removed ' + (gone.label || 'the entry') + '.');
+  }
+  function insertAfter(i, kind) {
+    if (!kind) return;
+    const slots = slotsNow();
+    slots.splice(i + 1, 0, {kind, label: kindLabel(kind), minutes: 3, enabled: true, notes: ''});
+    state.inserting = '';
+    writeSlots(slots, 'Inserted ' + kindLabel(kind) + '.');
+  }
+  async function saveInstruction(s, text) {
+    const words = String(text || '').trim();
+    if (!words) { report(new Error('An instruction needs words. Remove the entry to drop it.')); return; }
+    try {
+      await post('/api/schedule/hours/' + encodeURIComponent(state.key) + '/prompt', {slot_id: s.id, text: words});
+      drafts.delete(s.id);
+      notice('Saved the instruction for ' + (s.label || 'the entry') + '.');
+    } catch (e) { report(e); }
+    loadAll();
+  }
+  /* the inner shape is the hour-flow editor's; on the desk it is a global, on the tablet it may not be */
+  function openInner(s) {
+    const P = window.PineHourFlow;
+    if (!P || typeof P.open !== 'function') {
+      report(new Error('The hour-flow editor is not loaded here - open the hour-flow editor on the desk.'));
+      return;
+    }
+    try {
+      P.open({road: s.kind, kind: s.kind, slot_id: s.id, label: s.label || kindLabel(s.kind), hour: state.key,
+        onBack: () => loadAll()});
+    } catch (e) { report(e); }
+  }
+
+  /* ---- the tab's life: shown by the router, polled while shown and not being edited ---- */
+  function show(host) {
+    if (host && host.firstChild !== root) fill(host, root);
+    if (!state.loadedAt) fill(root, el('p', {class: 's3-muted', text: 'Reading the hour...'}));
+    if (!state.loadedAt || Date.now() - state.loadedAt > 1500) loadAll(); else paint();
+  }
+  const timer = setInterval(() => {
+    if (!alive || !active() || document.hidden || busy() || editing()) return;
+    loadAll();
+  }, 15000);
+  return {node: root, show, refresh: loadAll, stop() { alive = false; clearInterval(timer); }};
+}
+/* [hour-tab-end] */
+
 export async function mount(root, {request, onClose, tab: startTab = '', table: startTable = '', conversationId = '', details = true} = {}) {
   request ||= defaultRequest();
   /* [s3-cast] 'tables:DIRECTIVE1' opens a tab on a table - the Mind desk's buttons use it */
@@ -6629,7 +6963,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   /* [s3-window] "a button icon '3' ... opening a popup": Tables, Segments, Prompts, Audit, Sys3 - and the
      director, the cycle's structure view and the controls behind them. */
   const TABS = [['visual', 'Visual Prompt'], ['tables', 'Tables'], ['segments', 'Segments'], ['prompts', 'Prompts'], ['audit', 'Audit'], ['sys3', 'Sys3'],
-    ['director', 'Director'], ['structure', 'Structure'], ['controls', 'Controls']];
+    ['hour', 'Hour'], ['director', 'Director'], ['structure', 'Structure'], ['controls', 'Controls']];
   function stopExtras() {
     if (sys3) { try { sys3.stop(); } catch (e) { /* gone */ } sys3 = null; }
     if (visualScene) { visualScene.stop(); visualScene = null; }
@@ -6813,6 +7147,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL',
     'MGRTOPIC', 'MGRSUB', 'REACT', 'BOOK', 'WELCOME', 'SIGNOFF'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 - [book-nodes] BK1-BK3 */
   TABLE_FAMILIES.push('CALLOPEN', 'CALLANGLE', 'CALLSTAKES', 'CALLPROBE', 'CALLSOURCE', 'RW');
+  TABLE_FAMILIES.push('HOUR');   /* [wave-g] the Hour Director's tables: HOUR1 silent, HOUR2 pace, HOUR3 jam */
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */
   function memoryFields(cat) {
@@ -9624,6 +9959,10 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     },
     structure: road => { if (structRoad !== road) { structRoad = road; steps = null; legs = null; } },
     audit: cid => { auditFilter = {family: '', conversation: cid}; }});
+  /* [hour-tab] the Hour tab: the hour as a road of legs (wave I); the router shows it through hourTab.show */
+  const hourTab = makeHourTab({request, scroll: () => scrollBox(), busy: () => reading(), active: () => tab === 'hour',
+    openTable: id => { stopExtras(); listId = ''; tableId = id; draft = null; tab = 'tables'; paint(); },
+    notice, report});
   function paint() {
     paintTabs();
     try {
@@ -9634,6 +9973,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       else if (tab === 'segments') paintSegments();
       else if (tab === 'prompts') paintPrompts();
       else if (tab === 'audit') paintAudit();
+      else if (tab === 'hour') hourTab.show(body);
       else if (tab === 'sys3') paintSys3();
       else if (tab === 'structure') paintStructure();
       else paintControls();
@@ -9683,7 +10023,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   paintTabs();if(tab==='sys3')paintSys3().catch(report);
   initialize().catch(report);
   timers.push(setInterval(poll, 2000));
-  return {dispose() { alive = false; v.alive = false; timers.forEach(clearInterval); stopExtras(); fill(root); }};
+  return {dispose() { alive = false; v.alive = false; timers.forEach(clearInterval); stopExtras(); hourTab.stop(); fill(root); }};
 }
 
 /* [s3-dice] A DIE ON THE FEED, TAPPED: the decision card of the roll it

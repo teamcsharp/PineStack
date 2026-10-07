@@ -112,6 +112,10 @@ class SupercutArchive:
     def decorate(self, row):
         value = json.loads(row['metadata'])
         value['reusable_ad_id'] = str(row['reusable_ad_id'] or '')
+        if not isinstance(value.get('brand'), dict):                        # [supercut-brand] an older row: its plan's
+            plan = value.get('source_plan') if isinstance(value.get('source_plan'), dict) else {}
+            if isinstance(plan.get('brand'), dict) and plan['brand']:
+                value['brand'] = plan['brand']
         sign = self.host.get('media_sign')
         signature = str(sign(value['id'])) if callable(sign) else ''
         value['audio_url'] = '/api/sfx/supercut/archive/' + value['id'] + '/audio'
@@ -176,6 +180,9 @@ class SupercutArchive:
                  'generated_script': generated, 'recorded_text': recorded,
                  'campaign': campaign, 'cues': cues, 'source_plan': plan,
                  'occurrence': str(plan.get('occurrence') or ''), 'autoplay': False}
+        brand = plan.get('brand') or result.get('brand')                   # [supercut-brand] the font, the effects
+        if isinstance(brand, dict) and brand:
+            value['brand'] = copy.deepcopy(brand)
         video_source = result.get('video_path') or (source.with_name(plan['video']) if plan.get('video') else None)
         if video_source:
             from sfx_supercut_video import video_facts, require_mp4_sources

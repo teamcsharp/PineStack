@@ -67,6 +67,7 @@ FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGU
 FAMILIES = FAMILIES + ("MEMORY",)                                    # [s3-memory] rules, then roulette
 FAMILIES = FAMILIES + ("GRAPH",)
 FAMILIES = FAMILIES + call_diversity.FAMILIES + ("RWFEATURE",)
+FAMILIES = FAMILIES + ("HOUR",)                                     # [wave-g] the Hour Director's dice: HOUR1 silent, HOUR2 pace, HOUR3 jam
 FAMILIES = FAMILIES + ("GOLD",)                                      # [s3-gold] a kept line, rolled as a reply
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
@@ -570,6 +571,8 @@ def validate_table(table):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,23}", tid):
         raise ValueError("table id must be a short name such as ES2")
     family = str(table.get("family") or "")
+    if family == "HOUR":                                     # [wave-g] the Hour Director's three tables
+        return system3_tables.validate_hour(table)
     if family == "MEMORY":                                   # [s3-memory] kinds with rules, how many a round
         return _validate_memory_table(table, tid)
     if family in ("MGRTOPIC", "MGRSUB"):                  # [s3-mgrtopics] the manager's topics, his sub messages

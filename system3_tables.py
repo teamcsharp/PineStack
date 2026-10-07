@@ -961,12 +961,117 @@ def default_blocks():
     return copy.deepcopy(DEFAULT_BLOCKS)
 
 
+# --- [wave-g] THE HOUR DIRECTOR'S OWN DICE (family HOUR) ---------------------------------
+#
+# 2026-10-06, the operator: "We need to migrate all System 2 systems over to System 3 ... put it under the roulette
+# node system of System 3." The Hour Director (system3_hour.py) answers the chain's question when the running
+# order is silent, behind pace, or jammed. Its three tables are the dice:
+#   HOUR1  the kinds it may draw when the sheet is silent (weight = the desk's chance of each kind)
+#   HOUR2  how far behind pace each kind is (gain = how hard the shortfall pulls its draw up)
+#   HOUR3  the chance a jammed entry (1.5x its minutes, schedule_jammed) is displaced by a HOUR1 draw (odds)
+# Every draw is written on the hour's ledger (GET /api/system3/hour).
+HOUR_KINDS = ("banter", "caller", "news", "gallery", "manager", "ad", "deep", "bombshell", "recap")
+HOUR1 = {
+    "id": "HOUR1", "family": "HOUR", "label": "When the sheet is silent (the kinds the hour may draw)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "The running order names nothing for this breath: the hour draws one of these kinds, weighted, "
+                   "and HOUR2 lifts the kinds that are behind pace.",
+    "categories": [
+        {"id": "silent", "label": "Silent draw", "weight": 1.0, "items": _items([
+            {"id": "banter", "label": "Banter", "weight": 4.0, "text": "a banked round between the two hosts"},
+            {"id": "caller", "label": "Caller", "weight": 2.0, "text": "a call from a listener"},
+            {"id": "news", "label": "News", "weight": 1.5, "text": "the wire, the lead story read and reacted to"},
+            {"id": "gallery", "label": "Gallery", "weight": 1.0, "text": "a piece from the Pine Box gallery"},
+            {"id": "manager", "label": "Manager", "weight": 0.8, "text": "a memo from upstairs"},
+            {"id": "ad", "label": "Ad", "weight": 0.6, "text": "a produced spot"},
+            {"id": "deep", "label": "Deep", "weight": 0.8, "text": "a longer piece on one subject"},
+            {"id": "bombshell", "label": "Bombshell", "weight": 0.5, "text": "a short written read that changes the room"},
+            {"id": "recap", "label": "Recap", "weight": 0.7, "text": "the hour so far, on the hour"},
+        ])},
+    ],
+}
+HOUR2 = {
+    "id": "HOUR2", "family": "HOUR", "label": "Quota pressure (how far behind pace each kind is)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "Per kind: the share of its planned legs not yet aired this hour, times its gain, lifts its HOUR1 "
+                   "weight. A kind the sheet never plans is never lifted.",
+    "categories": [
+        {"id": "pace", "label": "Pace", "weight": 1.0, "items": _items([
+            {"id": "banter", "label": "Banter", "weight": 1.0, "gain": 0.5, "text": "banter's gain"},
+            {"id": "caller", "label": "Caller", "weight": 1.0, "gain": 2.0, "text": "a caller behind pace pulls hard"},
+            {"id": "news", "label": "News", "weight": 1.0, "gain": 1.5, "text": "news's gain"},
+            {"id": "gallery", "label": "Gallery", "weight": 1.0, "gain": 1.0, "text": "gallery's gain"},
+            {"id": "manager", "label": "Manager", "weight": 1.0, "gain": 2.0, "text": "a memo behind pace pulls hard"},
+            {"id": "ad", "label": "Ad", "weight": 1.0, "gain": 1.5, "text": "ad's gain"},
+            {"id": "deep", "label": "Deep", "weight": 1.0, "gain": 1.0, "text": "deep's gain"},
+            {"id": "bombshell", "label": "Bombshell", "weight": 1.0, "gain": 1.0, "text": "bombshell's gain"},
+            {"id": "recap", "label": "Recap", "weight": 1.0, "gain": 1.0, "text": "recap's gain"},
+        ])},
+    ],
+}
+HOUR3 = {
+    "id": "HOUR3", "family": "HOUR", "label": "The jam (an entry overrunning 1.5 times its minutes)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "A jammed entry is not displaced by rule: this chance decides it.",
+    "categories": [
+        {"id": "jam", "label": "Jam", "weight": 1.0, "items": _items([
+            {"id": "displace", "label": "Displace the jammed entry", "weight": 1.0, "odds": 0.5,
+             "text": "the chance a jammed entry is displaced by a HOUR1 draw"},
+        ])},
+    ],
+}
+
+
+def validate_hour(table):
+    """[wave-g] Refuse an HOUR table the Hour Director cannot draw from; returns the cleaned copy."""
+    if not isinstance(table, dict):
+        raise ValueError("a table is an object")
+    tid = str(table.get("id") or "").strip()
+    if tid not in ("HOUR1", "HOUR2", "HOUR3"):
+        raise ValueError("an HOUR table is HOUR1, HOUR2 or HOUR3")
+    if str(table.get("family") or "HOUR") != "HOUR":
+        raise ValueError("an HOUR table has the family HOUR")
+    cats = table.get("categories")
+    if not isinstance(cats, list) or not cats:
+        raise ValueError("%s needs at least one category" % tid)
+    out = copy.deepcopy(table)
+    out["id"], out["family"] = tid, "HOUR"
+    out["weight"] = max(0.0, float(table.get("weight", 1.0) or 0))
+    out["enabled"] = bool(table.get("enabled", True))
+    out["version"] = int(table.get("version") or 1)
+    seen = set()
+    for cat in out["categories"]:
+        if not isinstance(cat, dict) or not str(cat.get("id") or "").strip():
+            raise ValueError("every category needs an id")
+        items = cat.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("category %s has no items" % cat["id"])
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                raise ValueError("every item needs an id")
+            key = (cat["id"], item["id"])
+            if key in seen:
+                raise ValueError("duplicate item %s/%s" % key)
+            seen.add(key)
+            if tid in ("HOUR1", "HOUR2") and item["id"] not in HOUR_KINDS:
+                raise ValueError("%s names %s, which is not a schedule kind" % (tid, item["id"]))
+            item["weight"] = max(0.0, float(item.get("weight", 1.0) or 0))
+            item.setdefault("label", item["id"])
+            if tid == "HOUR1" and not str(item.get("text") or "").strip():
+                raise ValueError("HOUR1 kind %s says nothing" % item["id"])
+            if tid == "HOUR2":
+                item["gain"] = max(0.0, float(item.get("gain", 0) or 0))
+            if tid == "HOUR3":
+                item["odds"] = round(min(1.0, max(0.0, float(item.get("odds", 0.5) or 0))), 4)
+    return out
+
+
 # families whose tables may stand empty: their rows are added from the desk,
 # by the operator's votes or by the station's first roll; an empty pool draws nothing
 POOL_FAMILIES = ("FAV", "DIRECTIVE", "CHANCE", "POOL")
 
 DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1, FAV1, DIRECTIVE1, CALLEVENT1,
-                  STATION1, POOLS1, SBEND1]
+                  STATION1, POOLS1, SBEND1, HOUR1, HOUR2, HOUR3]
 
 # --- MEMORY1: what the writer is reminded of - rules, then roulette -------------------
 #

@@ -1199,6 +1199,8 @@ def install(app, g):
     g['dynamic_inventory_match'] = runtime.inventory_match
     g['dynamic_segment_dispatch'] = runtime.dispatch
     g['dynamic_segment_window_owned'] = runtime.window_owned          # [book-nodes-4] the cupboard's doors ask it
+    g['dynamic_segment_prepare_pass'] = runtime.prepare_book          # [kitchen-hour] a window's voicing pass
+    g['dynamic_segment_prepare_supercut'] = runtime.prepare_supercut  # [kitchen-hour] a supercut's clip
     segment_prompts.install(g, g['DATA_DIR'])
     dynamic_segments.ensure_defaults(segment_prompts)
     for name in ('schedule_hour_slots', 'dialogue_row_ready', 'dj_banter', '_ready_shelf_air', 'alt_bank_banter', 'segment_chain_stamp', 'dialogue_stock_items', 'commitment_inventory_plan', 'ensure_entry_tinted'):

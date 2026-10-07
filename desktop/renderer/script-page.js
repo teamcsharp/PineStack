@@ -1270,16 +1270,21 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=7');
+      style.href = techUrl('/system3/system3.css?v=8');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=10')).then(function (mod) {
       return mod.openSystem3({request: s3Request, tab: tab || 'tables',
         onClose: function () { s3WindowOpen = null; }});
     }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
       try { console.warn('System 3 could not open', err); } catch (e) { /* no console */ }
     });
   }
+
+  /* [hour-tab] the desk's sheet opens System 3 on the Hour tab (renderer.js worksSchedule) */
+  root.addEventListener('pine:system3-open', function (event) {
+    s3Window((event && event.detail && event.detail.tab) || 'tables');
+  });
 
   function rejectionPolicyOpen() {
     var overlay = el('spRejectionDetail');
@@ -5001,10 +5006,10 @@
           var style = document.createElement('link');
           style.id = 'spS3Style';
           style.rel = 'stylesheet';
-          style.href = techUrl('/system3/system3.css?v=7');
+          style.href = techUrl('/system3/system3.css?v=8');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=9'));
+        var mod = await import(techUrl('/system3/system3.js?v=10'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -8457,10 +8462,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=7');
+      style.href = techUrl('/system3/system3.css?v=8');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=10')).then(function (mod) {
       if (gen !== mv.originGen || !mod || typeof mod.openSystem3Focus !== 'function') return null;
       return mod.openSystem3Focus({request: s3Request, lineId: item.lid, said: item.text || '', tab: 'focus',
         onBack: function () { mvOriginGone(gen); }});
@@ -16934,10 +16939,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=7');
+      style.href = techUrl('/system3/system3.css?v=8');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=10')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {
@@ -23203,10 +23208,10 @@
         var style = document.createElement('link');
         style.id = 'spS3Style';
         style.rel = 'stylesheet';
-        style.href = techUrl('/system3/system3.css?v=7');
+        style.href = techUrl('/system3/system3.css?v=8');
         document.head.appendChild(style);
       }
-      import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
+      import(techUrl('/system3/system3.js?v=10')).then(function (mod) {
         if (lineTabsPane !== pane) return null;
         return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
       }).then(function (view) {

@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import supercut_brand                  # [supercut-brand] the three-row card, its font and its entry / exit frames
+
 
 def require_mp4_sources(plan):
     clips = plan.get('clips') or []
@@ -34,8 +36,11 @@ def video_facts(path, *, seconds=None, executable=None):
             'video_size': list(meta['size']), 'video_codec': meta['codec']}
 
 
-def render_video(plan, result, output, executable):
-    """Cut the same measured source intervals as the audio, then mux that audio."""
+def render_video(plan, result, output, executable, *, brand=None, station=''):
+    """Cut the same measured source intervals as the audio, then mux that audio - with the
+    brand card over the picture ([supercut-brand]: its entry, hold and exit, three overlays
+    in the mux pass). `brand` is the station's supercut_brand_plan dict (the cached font, the
+    two rolled effects, the seed); `station` the long name on the card's third row."""
     require_mp4_sources(plan)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -62,13 +67,28 @@ def render_video(plan, result, output, executable):
                      str(folder / f'{ix}.mp4')])
             listing = folder / 'cuts.txt'
             listing.write_text(''.join(f"file '{ix}.mp4'\n" for ix in range(len(cues))), encoding='utf-8')
-            run(['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', str(result['path']),
-                 '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+            # [supercut-brand] the card: its entry, hold and exit rendered as frames beside the cuts and laid
+            # over the picture in the mux pass - three overlays, each in its window, 10 px up from the bottom
+            plan_brand = dict(brand or {})
+            seed = int(plan_brand.get('seed') or supercut_brand.seed_for(plan.get('id') or output.stem))
+            if not plan_brand.get('effect_in') or not plan_brand.get('effect_out'):
+                plan_brand['effect_in'], plan_brand['effect_out'] = supercut_brand.roll_effects(None, None, seed)
+            font = plan_brand.get('cached') or plan_brand.get('font_path') or ''
+            lines = supercut_brand.lines(station or (plan.get('config') or {}).get('station') or 'Pine Box FM')
+            prep = supercut_brand.prepare(lines, font, 640, 360, float(result['seconds']), plan_brand['effect_in'],
+                                          plan_brand['effect_out'], folder / 'brand', seed=seed)
+            inputs, graph = supercut_brand.overlay_graph(prep, first_input=2)
+            run(['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', str(result['path']), *inputs,
+                 '-filter_complex', graph, '-map', '[v]', '-map', '1:a:0',
+                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '128k',
                  '-t', f"{float(result['seconds']):.6f}", '-movflags', '+faststart', str(temporary)])
+            record = supercut_brand.record_of(prep, plan_brand.get('font_path') or font, plan_brand.get('cached') or '',
+                                              lines, plan_brand['effect_in'], plan_brand['effect_out'],
+                                              rolled=bool(plan_brand.get('rolled')))
             facts = video_facts(temporary, seconds=result['seconds'], executable=executable)
             run(['-i', str(temporary), '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'])
             temporary.replace(output)
         return {**facts, 'kind': 'video', 'video': output.name, 'video_path': str(output),
-                'video_source_only': True}
+                'video_source_only': True, 'brand': record}                        # [supercut-brand]
     finally:
         temporary.unlink(missing_ok=True)
