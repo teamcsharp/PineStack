@@ -236,6 +236,30 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
     const b = w.getBounds(), c = w.getContentBounds(), area = screen.getDisplayMatching(b).workArea;
     w.setBounds(fitBounds({ ...b, width, height: c.height * width / c.width }, area, [b.width - c.width, b.height - c.height]));
   }
+  /* [video-folders-live] the Video submenu: every folder on the share, read or not; a folder with
+     folders inside opens to them, and its first row pins the whole of it */
+  function videoFolderMenu(playback, send) {
+    const folders = (Array.isArray(playback?.folders) ? playback.folders : []).filter(f => f && typeof f.path === 'string');
+    const pinned = playback?.pin?.path || '';
+    const words = f => f.unread ? '  (new - ' + (f.files ? f.files + ' file' + (f.files === 1 ? '' : 's') + ', ' : '') + 'reading)'
+      : '  (' + (f.video || 0) + ' video, ' + (f.audio || 0) + ' audio)';
+    const kids = new Map(), known = new Set(folders.map(f => f.path));
+    for (const f of folders) if (f.parent && known.has(f.parent)) { if (!kids.has(f.parent)) kids.set(f.parent, []); kids.get(f.parent).push(f); }
+    const item = f => {
+      const name = String(f.name || f.path).split('/').pop();
+      const pin = { label: name + words(f), type: 'radio', checked: pinned === f.path, click: () => send({ type: 'video-folder', path: f.path }) };
+      const under = kids.get(f.path);
+      return under?.length ? { label: name + words(f), submenu: [{ ...pin, label: 'All of ' + name + words(f) }, { type: 'separator' }, ...under.map(item)] } : pin;
+    };
+    const reader = playback?.foldersReader;
+    return [
+      { label: playback?.pin ? ('Every folder (clear: ' + playback.pin.name + ', ' + playback.pin.minutes_left + ' min left)') : 'Every folder (no pin)', type: 'radio', checked: !playback?.pin, click: () => send({ type: 'video-folder', clear: true }) },
+      ...(reader?.busy && reader.say ? [{ label: reader.say, enabled: false }] : []),
+      { type: 'separator' },
+      ...(!folders.length ? [{ label: playback?.foldersLoading ? 'Reading the folders - open the menu again in a moment' : 'The station has not listed its folders yet - open the menu again', enabled: false }] : []),
+      ...folders.filter(f => !f.parent || !known.has(f.parent)).slice(0, 400).map(item)
+    ];
+  }
   function menu(playback = {}) {
     if (!getWindow()?.__pinePip || activeMenu) return state();
     const s = state();
@@ -303,14 +327,7 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
       { label: 'Overlay transparency...', click: () => getWindow()?.webContents.send('pip:action', 'appearance') },
       { label: 'Always on top', type: 'checkbox', checked: s.alwaysOnTop, click: () => update({ alwaysOnTop: !s.alwaysOnTop }) },
       /* [pip-video-folder] every folder of the SFX collection; the chosen one owns the clips for an hour */
-      { label: 'Video', submenu: [
-        { label: playback?.pin ? ('Every folder (clear: ' + playback.pin.name + ', ' + playback.pin.minutes_left + ' min left)') : 'Every folder (no pin)', type: 'radio', checked: !playback?.pin, click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', clear: true }) },
-        { type: 'separator' },
-        ...(!(Array.isArray(playback?.folders) && playback.folders.length) ? [{ label: playback?.foldersLoading ? 'Reading the SFX catalog\u2019s folders - open the menu again in a moment' : 'The station has not listed its folders yet - open the menu again', enabled: false }] : []),
-        ...(Array.isArray(playback?.folders) ? playback.folders : []).filter(f => f && typeof f.path === 'string').slice(0, 300)
-          .map(f => ({ label: (f.name || f.path) + '  (' + (f.video || 0) + ' video, ' + (f.audio || 0) + ' audio)', type: 'radio', checked: !!playback?.pin && playback.pin.path === f.path,
-            click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', path: f.path }) }))
-      ] },
+      { label: 'Video', submenu: videoFolderMenu(playback, action => getWindow()?.webContents.send('pip:action', action)) },   /* [video-folders-live] */
       { label: 'Unseen video (endless - clips he has never categorised)', type: 'checkbox', checked: playback?.on === true,   /* [unseen-video] */
         click: item => getWindow()?.webContents.send('pip:playback', { on: item.checked }) },
       { label: 'Seamless video', type: 'checkbox', checked: playback?.seamless === true,
