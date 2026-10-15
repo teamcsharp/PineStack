@@ -551,19 +551,19 @@ class PineDesktopBridge(
          * `<audio>` or `<video>` works. See net/Revive.kt for what was
          * measured and what was ruled out.
          *
-         * With no argument this REPORTS - whether a revival is allowed
-         * and how long since the last - so the page can decide without
-         * causing one. `{now:true}` actually does it, and the answer
-         * never arrives, because the process is gone. */
+         * With no argument this reports historical recovery diagnostics.
+         * `{now:true}` repairs the connection in place and returns. Only
+         * the operator's native rail action may restart the application. */
         "revive" -> {
             val opts = args.optJSONObject(0)
             val why = opts?.optString("why", "") ?: ""
             if (opts != null && opts.optBoolean("now", false)) {
-                val went = com.pinebox.kiosk.net.Revive.now(context, why)
+                // The page watchdog may repair its transport, never kill the
+                // application. Explicit restart remains on the native rail.
+                com.pinebox.kiosk.MainActivity.live?.recoverMediaConnection(why)
                 BridgeEnvelope.ok(id, JSONObject()
-                    .put("ok", went)
-                    .put("say", if (went) "reviving" else
-                        "too soon since the last one").toString())
+                    .put("ok", true)
+                    .put("say", "retried the station connection without restarting").toString())
             } else {
                 BridgeEnvelope.ok(id, JSONObject()
                     .put("ok", true)
@@ -1366,6 +1366,10 @@ class PineDesktopBridge(
                     }
                 }
                 when (want) {
+                    "cue-sync" -> {
+                        val clip = args.optJSONObject(1) ?: JSONObject()
+                        wall.syncCue(clip.optString("id"), clip.optLong("at"), clip.optBoolean("paused", false))
+                    }
                     "cue", "cue-warm" -> {
                         val clip = args.optJSONObject(1) ?: JSONObject()
                         wall.cue(clip.optString("id"), clip.optString("url"),
@@ -1380,6 +1384,7 @@ class PineDesktopBridge(
                      * running and only the surface leaves the screen. */
                     "hide" -> wall.veil(true, args.optJSONObject(1)?.optBoolean("vcr", true) ?: true)
                     "show" -> wall.veil(false, args.optJSONObject(1)?.optBoolean("vcr", true) ?: true)
+                    "pip" -> wall.pipBackground(args.optJSONObject(1)?.optBoolean("on", false) ?: false)
                     "vcr" -> wall.vcrReplay()                                   // [vcrfx]
                     /* [#1386] HOLD is not HIDE. The operator has a menu
                      * open over this clip and is deciding what to do with

@@ -23,7 +23,7 @@ body.pine-pip-camera-only #controlFrame, body.pine-pip-camera-only > #pine-pip-p
 .pip-camera.main { z-index: -1; border: 0; border-radius: 0; pointer-events: none; }
 .pip-camera.main button { display: none; }
 body.pine-pip-ui-hidden #pinePipWidgets > .pip-camera:not([hidden]) { display: block !important; }
-body.pine-pip > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(script):not(link):not(.plv-sheet):not(#pineExportBar):not(.pip-exportbar):not(#pinePipFavorites):not(#pinePipPopupDock):not(#pineGeneratedMediaDock):not(.gm-review-shade):not(.pip-popup-visible):not(.sp-rrp-back) { display: none !important; }
+body.pine-pip:not(.pine-pip-tablet) > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(script):not(link):not(.plv-sheet):not(#pineExportBar):not(.pip-exportbar):not(#pinePipFavorites):not(#pinePipPopupDock):not(#pineGeneratedMediaDock):not(.gm-review-shade):not(.pip-popup-visible):not(.sp-rrp-back) { display: none !important; }
 body.pine-pip > main { display: block !important; position: fixed !important; inset: 0 !important; padding: 0 !important; margin: 0 !important; }
 body.pine-pip > main > :not(#control):not(.pip-popup-visible) { visibility: hidden !important; pointer-events: none !important; }
 body.pine-pip #control { display: block !important; position: fixed !important; inset: 0 !important; padding: 0 !important; }

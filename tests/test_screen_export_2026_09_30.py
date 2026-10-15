@@ -40,6 +40,8 @@ class ScreenOrders(unittest.TestCase):
     def test_pinepip_display_has_its_own_export_target(self):
         for text in ('export the last five minutes of the pinepip display',
                      'export the last 5 minutes of Pine PiP',
+                     'export the last 5 minutes from Pine Pip',
+                     'export the last 5 minutes of the pipepip broadcast and display',
                      'save the last 5 minutes of pine-pip'):
             self.assertEqual(parse(text), {'seconds': 300, 'screen': 'pip'})
 

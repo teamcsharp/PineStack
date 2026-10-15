@@ -23,6 +23,49 @@ function fn(name) {
   throw new Error('unterminated ' + name);
 }
 
+test('tablet primes a timed picture immediately without waiting for a second web download', () => {
+  const head = {id: 'clip', url: '/sfx/clip', silent_picture: true};
+  const warmed = [];
+  const warmUp = new Function('queue', 'warmElement', 'preFetch', `
+    var mounted = true, nativeCueCapable = true, endlessOn = false, warm = null;
+    ${fn('warmUp')}
+    return warmUp;
+  `)([head], clip => warmed.push(clip), () => { throw Error('duplicate download'); });
+  warmUp();
+  assert.deepEqual(warmed, [head]);
+});
+
+test('stopping the native endless wall releases scheduled conversation pictures', async () => {
+  let advanced = 0;
+  const bridge = {videoWall: async () => ({on: false, cue_capable: true})};
+  const build = new Function('api', 'nativeWallRect', 'next', `
+    var nativeCueActive = null, nativeCueCapable = false, wallWant = true,
+        wallHas = true, video = null, showing = true,
+        playing = {endless: true}, wallShowing = 'old-clip';
+    function wallState(got) { return got; }
+    function wallTakesOver() { throw new Error('off cannot take over'); }
+    ${fn('nativeWall')}
+    return {stop: () => nativeWall(false), state: () => ({showing, playing, wallShowing, nativeCueCapable})};
+  `);
+  const player = build(() => bridge, () => ({}), () => { advanced++; });
+  player.stop();
+  await Promise.resolve();
+  assert.deepEqual(player.state(), {showing: false, playing: null, wallShowing: '', nativeCueCapable: true});
+  assert.equal(advanced, 1);
+});
+
+test('each timed clip keeps the PiP background fullscreen across cue changes', () => {
+  let pip = true;
+  const document = {body: {classList: {contains: () => pip}}};
+  const windowed = {x: 25, y: 376, w: 432, h: 268};
+  const rect = new Function('document', 'fullWanted', 'listenUp', 'listenBare', 'nativeWallRect',
+    fn('nativeCueRect') + ';return nativeCueRect;')(
+      document, () => false, () => false, () => false, () => windowed);
+  assert.deepEqual(rect(), {x: 0, y: 0, w: 0, h: 0});
+  pip = false;
+  assert.deepEqual(rect(), windowed);
+});
+
 test('native device pixels are converted once before menu layout', () => {
   const root = {devicePixelRatio: 1.25};
   const build = new Function('root', fn('wallCssRect') + '\nreturn wallCssRect;');
@@ -131,7 +174,7 @@ test('leaving Listen immediately restores the popup ownership', () => {
 test('ordinary Listen keeps the native PIP authoritative', () => {
   const reconcile = fn('wallReconcile');
   assert.match(reconcile,
-    /wide = fullWanted\(\) \|\| \(listenUp\(\) && listenBare\(\)\)/,
+    /fullWanted\(\) \|\| \(listenUp\(\) && listenBare\(\)\)/,
     'bare Listen must use the native surface full-bleed');
   assert.match(reconcile, /want = uiOverPicture\(\)/,
     'Listen must not veil the native PIP merely because its tab is open');
@@ -229,8 +272,7 @@ test('dice rebuilds the server pool and replaces the whole native runway', () =>
 });
 
 test('native wall asks the full server deck before its local continuity cache', () => {
-  const native = 'C:/_tools/pinebox-android/PineBoxKiosk/app/src/main/java/com/pinebox/kiosk/video/PineVideoWall.kt';
-  if (!fs.existsSync(native)) return;
+  const native = path.join(__dirname, '..', 'app/src/main/java/com/pinebox/kiosk/video/PineVideoWall.kt');
   const kotlin = fs.readFileSync(native, 'utf8');
   const feedAt = kotlin.indexOf('private suspend fun feed()');
   const ringAt = kotlin.indexOf('val got = nextRingClip()', feedAt);
@@ -242,11 +284,10 @@ test('native wall asks the full server deck before its local continuity cache', 
 });
 
 test('native fullscreen long press and replay reach the shared video menu', () => {
-  const base = 'C:/_tools/pinebox-android/PineBoxKiosk/app/src/main/java/com/pinebox/kiosk';
+  const base = path.join(__dirname, '..', 'app/src/main/java/com/pinebox/kiosk');
   const wallPath = path.join(base, 'video', 'PineVideoWall.kt');
   const activityPath = path.join(base, 'MainActivity.kt');
   const bridgePath = path.join(base, 'bridge', 'PineDesktopBridge.kt');
-  if (![wallPath, activityPath, bridgePath].every(fs.existsSync)) return;
   const kotlin = fs.readFileSync(wallPath, 'utf8');
   const activity = fs.readFileSync(activityPath, 'utf8');
   const bridge = fs.readFileSync(bridgePath, 'utf8');
@@ -258,7 +299,27 @@ test('native fullscreen long press and replay reach the shared video menu', () =
 });
 
 test('Lens owns native picture visibility while open and returns it when closed',()=>{
- let open=true;const document={getElementById:id=>id==='pinelens'?{classList:{contains:()=>open}}:null,body:{children:[]}};
+ let open=true;const document={getElementById:id=>id==='pinelens'?{classList:{contains:()=>open}}:null,body:{classList:{contains:()=>false},children:[]}};
  const owns=new Function('document','readBox',fn('uiOverPicture')+';return uiOverPicture;')(document,()=>({left:0,top:0,width:500,height:300}));
  assert.equal(owns(),true);open=false;assert.equal(owns(),false);
 });
+
+test('the permanent ticker cannot veil video, but an overlapping dialog can', () => {
+  const element = {id: 'pinePulse', className: 'pine-pulse', matches: () => false,
+    getBoundingClientRect: () => ({left: 0, top: 633, right: 1126, bottom: 653, width: 1126, height: 20})};
+  const document = {getElementById: () => null, body: {classList: {contains: () => false}, children: [element]}};
+  const owns = new Function('document', 'readBox', 'getComputedStyle', 'host', 'UI_Z_FLOOR', 'UI_AREA_MIN',
+    fn('uiOverPicture') + ';return uiOverPicture;')(document,
+    () => ({left: 25, top: 376, width: 432, height: 268}),
+    () => ({display: 'block', visibility: 'visible', opacity: '1', zIndex: '2147483001'}),
+    null, 2147483000, 20000);
+  assert.equal(owns(), false);
+  element.id = 'real-dialog'; element.matches = () => true;
+  assert.equal(owns(), true);
+});
+
+ test('PiP widgets overlay the native video without veiling it',()=>{
+ const document={body:{classList:{contains:k=>k==='pine-pip-tablet'}}};
+ const owns=new Function('document',fn('uiOverPicture')+';return uiOverPicture;')(document);
+ assert.equal(owns(),false);
+ });

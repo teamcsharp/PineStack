@@ -4116,7 +4116,7 @@ function replayProgressTeller(sender, want, view) {
 }
 
 ipcMain.handle("replay:export", async (_event, want) => {
-  const endAt = Date.now();
+  const endAt = Number.isFinite(want?.end_at) && want.end_at > 0 ? Math.min(Date.now(), want.end_at) : Date.now();
   const asked = Math.max(1, Number((want || {}).seconds) || 30);
   const teller = replayProgressTeller(_event.sender, want);   /* [pip-export-bar] */
   try {
@@ -4134,6 +4134,11 @@ ipcMain.handle("replay:export", async (_event, want) => {
     /* The buffered mix is the sound that played during this picture.
      * Missing captured audio requires an explicit opt-out. */
     const dressed = audioOnly ? { path: made.out, audio: made.audio } : await replayWithSound(made, !!((want || {}).video_only));
+    const warnings = [];
+    if (!want?.video_only && !dressed.audio?.complete)
+      warnings.push(dressed.audio?.present ? 'Some recorded audio is missing; the available mix was preserved.' : 'No audio was captured for this interval.');
+    if (made.clamped && made.seconds < asked - 1)
+      warnings.push('Only ' + Math.round(made.seconds) + ' of the requested ' + Math.round(asked) + ' seconds were buffered.');
     if (!want?.video_only && want?.require_audio !== false
         && (!dressed.audio?.present || !dressed.audio?.complete)) {
       clipMux.forget(made.dir);
@@ -4142,15 +4147,22 @@ ipcMain.handle("replay:export", async (_event, want) => {
     }
     made.out = dressed.path;
     made.bytes = fs.statSync(dressed.path).size;
-    const folder = replayFolder();
+    // Command exports save locally first; the station courier delivers to the
+    // configured share. An offline UNC path must not block the Electron UI.
+    const folder = want?.upload ? path.join(app.getPath('userData'), 'recordings') : replayFolder();
+    await fs.promises.mkdir(folder, { recursive: true });
     const name = String((want || {}).name || "") || (audioOnly ? replayName(made.seconds).replace('screen-', 'mix-').replace(/\.mp4$/, '.wav') : replayName(made.seconds));
-    const where = path.join(folder, name.replace(/[^\w.-]+/g, "-"));
+    let where = path.join(folder, name.replace(/[^\w.-]+/g, "-"));
     teller.tell('save', .93);
     try {
       await fs.promises.copyFile(made.out, where);
     } catch (error) {
-      clipMux.forget(made.dir);
-      return { ok: false, detail: "could not write " + where + ": " + error.message };
+      // A disconnected recordings share must not destroy an encoded replay.
+      const local = path.join(app.getPath('userData'), 'recordings');
+      await fs.promises.mkdir(local, { recursive: true });
+      where = path.join(local, path.basename(where));
+      await fs.promises.copyFile(made.out, where);
+      warnings.push('The configured folder was unavailable; saved in local recordings.');
     }
     /* The station's export courier, when asked for. A courier that is not
      * there is uploaded:{ok:false} with a reason - never a failed save. The
@@ -4165,7 +4177,7 @@ ipcMain.handle("replay:export", async (_event, want) => {
           + encodeURIComponent(made.seconds) + "&name=" + encodeURIComponent(path.basename(where));
         const response = await fetch(url, { method: "PUT",
           headers: { "Content-Type": "video/mp4", ...authHeaders(cfg) },
-          body: fs.readFileSync(where) });
+          body: fs.createReadStream(where), duplex: 'half', signal: AbortSignal.timeout(120000) });
         const text = await response.text();
         let body = {};
         try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { text }; }
@@ -4176,11 +4188,14 @@ ipcMain.handle("replay:export", async (_event, want) => {
         uploaded = { ok: false, detail: error.message };
       }
     }
+    if (uploaded && !uploaded.ok) warnings.push('Station upload failed; the saved MP4 is available at ' + where + '.');
     clipMux.forget(made.dir);
-    teller.tell('done', 1, { seconds: made.seconds, where });
+    const warning = warnings.join(' ');
+    teller.tell('done', 1, { seconds: made.seconds, where,
+      say: 'Saved ' + Math.round(made.seconds) + ' s to ' + where + (warning ? '. ' + warning : '') });
     return { ok: true, where, bytes: made.bytes, asked,
       seconds: made.seconds, held: made.held, clamped: !!made.clamped,
-      uploaded, audio: dressed.audio, video: made.video || null, detail: "" };
+      uploaded, audio: dressed.audio, video: made.video || null, warning, detail: "" };
   } catch (error) {
     teller.tell('failed', null, { detail: error.message });
     return { ok: false, detail: error.message };
@@ -5123,6 +5138,7 @@ ipcMain.handle("agent:discover-key", () => discoverAgentKey());
 ipcMain.handle("agent:get", (_event, route) => fetchJson(`${readConfig().baseUrl}${route}`));
 ipcMain.handle("agent:post", (_event, route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {
   method: "POST",
+  ...(/^\/api\/export\/screen\/(claim|done|heartbeat)$/.test(route) ? { signal: AbortSignal.timeout(10000) } : {}),
   body: JSON.stringify(body || {})
 }));
 ipcMain.handle("agent:put", (_event, route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {

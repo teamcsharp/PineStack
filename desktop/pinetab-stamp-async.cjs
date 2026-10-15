@@ -4,7 +4,7 @@ const path = require('node:path');
 const {Worker} = require('node:worker_threads');
 class StampSampler {
   constructor({WorkerClass=Worker, workerPath=path.join(__dirname,'pinetab-stamp-worker.cjs'),
-      timeoutMs=30000, cacheMs=15000, now=Date.now} = {}) {
+      timeoutMs=120000, cacheMs=15000, now=Date.now} = {}) {
     Object.assign(this,{WorkerClass,workerPath,timeoutMs,cacheMs,now});
     this.worker=null; this.stopping=false; this.sequence=0;
     this.pending=new Map(); this.inFlight=new Map(); this.cache=new Map();

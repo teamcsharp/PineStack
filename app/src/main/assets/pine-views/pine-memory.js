@@ -114,6 +114,12 @@
     setTimeout(function () {
       list.forEach(function (v) {
         if (v.isConnected) return;
+        // Observing detached previews retains their entire DOM/player graph.
+        if (io) { try { io.unobserve(v); } catch (e) {} }
+        v.__pmSeen = false;
+        clearTimeout(v.__pmOff);
+        var at = order.indexOf(v);
+        if (at >= 0) order.splice(at, 1);
         if (!v.paused && !v.muted) return;   /* an audible player is somebody's business */
         park(v, 'detached');
       });

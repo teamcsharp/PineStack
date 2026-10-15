@@ -18,6 +18,19 @@ class SfxCadence:
         with self.lock:
             return {'heard_units': self.units, 'heard_samples': self.samples}
 
+    def samples_for(self, identities):
+        """Recover exact clip identities from older audio-only cue sheets."""
+        keys = list(dict.fromkeys(str(key) for key in identities if key))
+        found = {}
+        with closing(sqlite3.connect(self.path)) as db:
+            for start in range(0, len(keys), 400):
+                batch = keys[start:start + 400]
+                marks = ','.join('?' for _ in batch)
+                found.update(db.execute(
+                    f"SELECT id,sample FROM receipts WHERE id IN ({marks}) AND sample<>''",
+                    batch).fetchall())
+        return found
+
     def record(self, rows):
         """Commit complete audible rows once; reject invalid inputs atomically."""
         clean = []

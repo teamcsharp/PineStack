@@ -129,3 +129,13 @@ test('encoder failures retain the specific driver reason above generic EOF chatt
     Array.from({length:10},()=> '[output] Task finished with error code: -22').join('\n'));
   assert.match(diagnostic,/Frame Dimension less than the minimum/);
 });
+
+test('progress output cannot hide a PiP geometry failure',()=>{
+  const {mux}=isolatedMux(()=>{});
+  const diagnostic=mux.lastReal('Padded dimensions cannot be smaller than input dimensions.\n'
+    + 'Failed to configure input pad\nError reinitializing filters!\n'
+    + 'frame=0\nfps=0.00\nstream_0_0_q=0.0\nbitrate=N/A\ntotal_size=0\n'
+    + 'out_time_us=N/A\nout_time_ms=N/A\nout_time=N/A\ndup_frames=0\ndrop_frames=0\nspeed=N/A\nprogress=end\n');
+  assert.match(diagnostic,/Padded dimensions cannot be smaller/);
+  assert.doesNotMatch(diagnostic,/progress=end|out_time/);
+});

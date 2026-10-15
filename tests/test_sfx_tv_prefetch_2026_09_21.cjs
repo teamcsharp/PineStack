@@ -76,6 +76,7 @@ function sandbox(opts) {
     warm: it.warm || null,
     mounted: true,
     cache: [],
+    cacheEpoch: 0,
     fetching: Object.create(null),
     aborts: Object.create(null),          // [tv-stream]
     AbortController: undefined,
@@ -101,13 +102,13 @@ function sandbox(opts) {
     });
   };
   const body = [
-    fn('srcOf'), fn('cacheFind'), fn('cacheHeld'), fn('cacheTrim'),
+    fn('srcOf'), fn('cacheFind'), fn('cacheHeld'), fn('cacheTrim'), fn('releaseOptionalCache'),
     fn('canHold'), fn('preFetch'), fn('heldSrc'), fn('worthSeeking'),
   ].join('\n');
   const keys = Object.keys(box);
   // eslint-disable-next-line no-new-func
   const build = new Function(keys.join(','), body
-    + '\nreturn {srcOf, cacheFind, cacheTrim, canHold, preFetch, heldSrc,'
+    + '\nreturn {srcOf, cacheFind, cacheTrim, releaseOptionalCache, canHold, preFetch, heldSrc,'
     + ' worthSeeking, box: {get cache() { return cache; },'
     + ' get fetching() { return fetching; }}};');
   const api = build.apply(null, keys.map((k) => box[k]));
@@ -116,6 +117,29 @@ function sandbox(opts) {
 }
 
 const clip = (n) => ({url: '/sfx/' + n + '?t=sig' + n, endless: true});
+
+test('memory pressure releases unused video blobs and preserves the active picture', async () => {
+  const video = {src: ''};
+  const s = sandbox({video});
+  video.src = await s.preFetch(clip(1));
+  const unused = await s.preFetch(clip(2));
+  s.releaseOptionalCache();
+  assert.deepEqual(s.stub.revoked, [unused]);
+  assert.equal(s.box.cache.length, 1);
+  assert.equal(s.box.cache[0].href, video.src);
+});
+
+test('a preload completing after memory pressure cannot refill the cache', async () => {
+  let complete;
+  const s = sandbox({fetch: () => Promise.resolve({ok: true, headers: {get: () => '100'},
+    blob: () => new Promise(resolve => { complete = resolve; })})});
+  const job = s.preFetch(clip(1));
+  await Promise.resolve();
+  s.releaseOptionalCache();
+  complete({size: 100});
+  assert.equal(await job, null);
+  assert.equal(s.box.cache.length, 0);
+});
 
 /* ------------------------------------------- 1. the seek that chokes */
 
@@ -334,14 +358,28 @@ test('a long dialogue round keeps its nearest timed MP4 cues', () => {
     'the 30-second endless runway discarded line-timed cues from the front');
 });
 
-test('the endless set still keeps only its bounded runway', () => {
-  const endless = Array.from({length: 8}, (_, i) => ({
+test('the endless row bound keeps the next owed clips even beyond thirty seconds', () => {
+  const endless = Array.from({length: 27}, (_, i) => ({
     id: 'wall-' + i,
     seconds: 10,
     endless: true,
   }));
   const kept = trimQueue(endless);
-  assert.deepEqual(kept.map((clip) => clip.id), ['wall-5', 'wall-6', 'wall-7']);
+  assert.deepEqual(kept.map((clip) => clip.id), endless.slice(0, 24).map(clip => clip.id));
+});
+
+test('a warmed seamless video waits for its broadcast slot and rejects expired slots', () => {
+  const head = {url: '/sfx/next', endless: true, at: 2000, seconds: 5};
+  const warm = {clip: head, el: {readyState: 4}};
+  let clock = 1000;
+  const ready = new Function('queue', 'warm', 'now', 'missed',
+    'var seamOn=true;' + fn('seamReady') + ';return seamReady;')(
+      [head], warm, () => clock, clip => clock >= clip.at + clip.seconds * 1000);
+  assert.equal(ready(), false, 'prefetching must not start a future clip early');
+  clock = 2000;
+  assert.equal(ready(), true);
+  clock = 7000;
+  assert.equal(ready(), false, 'an expired video must go through the normal skip path');
 });
 
 test('the timed cue row guard discards the farthest future cue', () => {

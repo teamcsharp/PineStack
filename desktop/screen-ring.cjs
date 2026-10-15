@@ -849,6 +849,11 @@ class ScreenRing {
       filters.push('[' + i + ':v]trim=start=' + seek.toFixed(6)
         + ',setpts=PTS-(' + seek.toFixed(6) + ')/TB'
         + ',fps=' + got.fps + ':start_time=0:round=near'
+        // Chromium can retain the old, larger encoded dimensions after the
+        // window enters PiP even though track settings report the new size.
+        // Restore those oversized frames to the recorded window's geometry;
+        // matching native frames pass through at their original dimensions.
+        + ",scale=w='min(iw," + run.w + ")':h='min(ih," + run.h + ")':flags=lanczos"
         + ',pad=' + width + ':' + height + ':0:0:color=black,setsar=1'
         + ',tpad=stop_mode=clone:stop_duration=' + duration.toFixed(6)
         + ',trim=duration=' + duration.toFixed(6) + ',setpts=PTS-STARTPTS[v' + i + ']');

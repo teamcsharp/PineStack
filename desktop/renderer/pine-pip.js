@@ -9,7 +9,7 @@
     if (w.PinePipPanel) return;
     const doc = w.document;
     let host, background, logo, particles, raf = 0, last = 0, enabled = false, loading;
-    let shell = false, otherCount = 0, reportedCount = '', voiceMeters = false, lastMeters = 0;
+    let shell = false, nativeCovered = false, otherCount = 0, reportedCount = '', voiceMeters = false, lastMeters = 0;
     /* [pip-viz] the living background: PineViz on the panel's background, fed by this page's analysers and the station's telemetry */
     let viz = null, vizProvider = null, vizLoading = null, vizFailed = false, vizMode = '', telemetry = { speaking: 0, music: 0, activity: 0, at: 0 };
     const programBands = new Float32Array(24); let programLevel = 0;
@@ -108,7 +108,7 @@
     function mountViz(P) {
       if (viz || !enabled || shell) return;
       vizProvider = new P.ExternalProvider();
-      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: 'both', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
+      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: w.PinePipTabletApi ? 'medium' : 'high', mode: w.PinePipTabletApi ? w.PinePip?.state()?.vizMode : undefined, keys: false, click: 'both', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
       viz.on((kind, value) => { if (kind === 'mode') { vizMode = value; try { w.postMessage({ type: 'pine-pip-background', mode: value }, '*'); } catch (_) {}
         /* [pinepip-bg] the server's own copy of "which mode is on", so a
            listener's page over Tailscale can show the same background -
@@ -117,6 +117,7 @@
         try { api().pipUpdate({ vizMode: value }).catch(() => {}); } catch (_) {} } });
       vizMode = viz.activeId || '';
       if (particles) { particles.dispose(); particles = null; }
+      layout();
     }
     function vizFeed() {
       if (!vizProvider) return;
@@ -195,6 +196,7 @@
       return tile.animate(frames, { duration: on ? 420 : 460, fill: 'forwards', easing: on ? 'cubic-bezier(.18,.9,.3,1)' : 'cubic-bezier(.7,0,.9,.35)' }).finished.catch(() => false);
     }
     function active(video) {
+      if (w.PinePipTabletApi) return false; // Android already composites the synchronized native player.
       if (host.contains(video) || !video.isConnected) return false;
       // Gallery previews are not live program. A late autoplay callback
       // must not resurrect a closed H3 popup behind the compact display.
@@ -238,9 +240,12 @@
       items.forEach((it, local) => { const i = local + (shell ? otherCount : 0); Object.assign(it.tile.style, { left: (i % cols * 100 / cols) + '%', top: (Math.floor(i / cols) * 100 / rows) + '%', width: (100 / cols) + '%', height: (100 / rows) + '%' }); });
       /* [pip-tube] the logo and the background step aside only for a tile that has drawn a picture; the
          living background keeps running underneath, so a tile without a picture never means a blank tube */
-      const covered = items.some(it => it.painted && !it.leaving) || otherCount > 0;
+      const covered = nativeCovered || items.some(it => it.painted && !it.leaving) || otherCount > 0;
       logo.style.display = covered || shell ? 'none' : ''; background.style.display = shell ? 'none' : '';
-      if (viz) { if (shell) viz.stop(); else if (enabled) viz.start(); }
+      // The tablet's native surface is under the WebView. Retain the canvas
+      // and its size, but make it transparent once a real video frame exists.
+      background.style.visibility = nativeCovered ? 'hidden' : '';
+      if (viz) { if (shell || nativeCovered || !enabled) viz.stop(); else viz.start(); }
       const slots = items.filter(it => !it.leaving).map(it => ({ label: it.label.textContent,
         width: it.video.videoWidth, height: it.video.videoHeight, poster: it.video.poster || it.thumbnail || '',
         source: (it.video.title || it.video.getAttribute('aria-label') || String(it.video.currentSrc || '').split('/').pop().split('?')[0] || 'Live stream').slice(0, 200) }));
@@ -323,7 +328,7 @@
         }
         vizFeed();
       }
-      if (!tiles.size && !otherCount && particles && now - last >= 33) {
+      if (!nativeCovered && !tiles.size && !otherCount && particles && now - last >= 33) {
         last = now;
         // Render a still cloud for reduced motion, including its first frame.
         const still = w.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -351,7 +356,14 @@
           }
         } catch (_) { /* retain last drawable frame */ }
     }
-    w.PinePipPanel = { showing(video) {
+    function nativePicture(st) {
+      const covered = !!(st && st.on && st.visible && st.playing
+        && st.first_frame_id === st.playing && st.frames_rendered > 0);
+      if (covered === nativeCovered) return;
+      nativeCovered = covered;
+      layout();
+    }
+    w.PinePipPanel = { nativePicture, showing(video) {
       /* [pip-seen] the tile's rectangle when this element is drawn on one (painted, not leaving), else null -
          the seen-check (sfx-seen.js) measures the element's own box, which is hidden in Pine PiP */
       try {
@@ -407,7 +419,8 @@
   let cursor = { s3: 0, n: 0, t: 0 }, station, track, roll = null, seen = new Set(), flow = [], production = [];
   let panelReady = false, entering = false, shellCount = 0, panelCount = 0, currentLine = '', rollLine = '', activeRolls = [], activeRollIndex = 0;
   let painting, paintingKey = '', paintingTimer, slateTimers = [], slateDrag;
-  const widgets = {}, api = () => root.pineDesktop;
+  const tablet = !!root.PinePipTabletApi;
+  const widgets = {}, api = () => tablet ? root.PinePipTabletApi : root.pineDesktop;
   let sharedReady = false, sharedLoading = false, sharedSignature = '', sharedSaveTimer = 0;
   function sharedPreferences(value) {
     const out = {};
@@ -415,7 +428,7 @@
     return out;
   }
   function publishShared(value) {
-    if (!sharedReady || sharedLoading || !api()?.post) return;
+    if (tablet || !sharedReady || sharedLoading || !api()?.post) return;
     const prefs = sharedPreferences(value), signature = JSON.stringify(prefs);
     if (signature === sharedSignature) return;
     clearTimeout(sharedSaveTimer);
@@ -440,8 +453,9 @@
     try {
       const favorites=(root.PinePipPopups?.catalog?.()||[]).map(({id,label})=>({id,label}));
       /* [pip-video-folder] the first menu waits a moment for the folders; later ones have them already */
-      if (!foldersCache.folders.length) await Promise.race([refreshFolders(), new Promise(resolve => setTimeout(resolve, 2500))]);
-      const opening = api().pipMenu({...playbackCache,favorites,folders:foldersCache.folders,pin:foldersCache.pin,foldersLoading:!foldersCache.folders.length&&!!foldersPending});
+      /* [video-folders-live] every open reads the folders again (and the station looks for new ones) */
+      await Promise.race([refreshFolders(true), new Promise(resolve => setTimeout(resolve, foldersCache.folders.length ? 1200 : 2500))]);
+      const opening = api().pipMenu({...playbackCache,favorites,folders:foldersCache.folders,pin:foldersCache.pin,foldersReader:foldersCache.reader,foldersLoading:!foldersCache.folders.length&&!!foldersPending});
       refreshFolders();
       refreshPlayback();
       await opening;
@@ -452,9 +466,10 @@
   function refreshFolders(force) {
     if (foldersPending) return foldersPending;
     if (!force && Date.now() - foldersAt < (foldersCache.folders.length ? 300000 : 20000)) return Promise.resolve();
-    foldersPending = Promise.resolve().then(() => api().get('/api/sfx/folders')).then(got => {
+    foldersPending = Promise.resolve().then(() => api().get('/api/sfx/folders' + (force ? '?fresh=1' : ''))).then(got => {   /* [video-folders-live] */
       const rows = Array.isArray(got?.folders) ? got.folders : [];
-      foldersCache = { folders: rows.map(f => ({ path: String(f.path || ''), name: String(f.name || f.path || ''), video: Number(f.video) || 0, audio: Number(f.audio) || 0 })).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })), pin: got?.pin || null };
+      foldersCache = { folders: rows.map(f => ({ path: String(f.path || ''), name: String(f.name || f.path || ''), video: Number(f.video) || 0, audio: Number(f.audio) || 0,
+        parent: f.parent ? String(f.parent) : '', unread: !!f.unread, files: Number(f.files) || 0 })).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })), pin: got?.pin || null, reader: got?.reader || null };
       foldersAt = Date.now();
     }).catch(() => { foldersAt = Date.now() - 280000; }).finally(() => { foldersPending = null; });
     return foldersPending;
@@ -689,7 +704,7 @@
      blue to white across the width; what is left is the unlit part. [pip-export-bar] the same bar, with
      words over it, while an export runs - in PiP and in the full app alike. */
   const videoTime = { panel: null, shell: null };
-  let playbar, exportbar, exportTimer = 0, exportQuiet = 0;
+  let playbar, exportbar, exportTimer = 0, exportQuiet = 0, localExportAt = 0;
   function paintPlaybar() {
     if (!playbar) return;
     const t = videoTime.panel || videoTime.shell, on = !!(state?.active && t && t.dur > 0 && Number.isFinite(t.dur));
@@ -714,7 +729,7 @@
       if (note) {
         exportbar.hidden = false; exportbar.classList.remove('busy'); exportbar.classList.toggle('failed', note.stage === 'failed');
         exportbar.style.setProperty('--pip-done', note.stage === 'done' ? '100%' : '0%');
-        text.textContent = note.stage === 'done' ? 'Saved ' + exportName(note) + (Number(note.seconds) > 0 ? ' - ' + Math.round(note.seconds) + ' s' : '') : exportName(note) + ' export failed' + (note.detail ? ': ' + note.detail : '');
+        text.textContent = note.say || (note.stage === 'done' ? 'Saved ' + exportName(note) + (Number(note.seconds) > 0 ? ' - ' + Math.round(note.seconds) + ' s' : '') : exportName(note) + ' export failed' + (note.detail ? ': ' + note.detail : ''));
       }
       exportTimer = setTimeout(() => { exportbar.hidden = true; exportbar.classList.remove('failed'); }, note ? (note.stage === 'failed' ? 7000 : 3500) : 0);
       return;
@@ -722,8 +737,23 @@
     const known = Number.isFinite(note.ratio);
     exportbar.hidden = false; exportbar.classList.toggle('busy', !known); exportbar.classList.remove('failed');
     exportbar.style.setProperty('--pip-done', known ? (Math.max(0, Math.min(1, note.ratio)) * 100).toFixed(1) + '%' : '0%');
-    text.textContent = 'Exporting ' + exportName(note) + (known ? ' - ' + Math.round(note.ratio * 100) + '%' : '...') + (EXPORT_STAGE[note.stage] ? ' - ' + EXPORT_STAGE[note.stage] : '');
+    text.textContent = note.say || ('Exporting ' + exportName(note) + (known ? ' - ' + Math.round(note.ratio * 100) + '%' : '...') + (EXPORT_STAGE[note.stage] ? ' - ' + EXPORT_STAGE[note.stage] : ''));
     exportQuiet = setTimeout(() => paintExport(null), 180000);   /* an export that says nothing for three minutes has stopped */
+  }
+  /* [pip-export-bar] "export the last 5 minutes of the pine pip" spoken or typed to the LLM never
+     touches this window's own replay:export IPC - it is claimed by whichever device answers first
+     (see screen-export.js), so a desk that loses that race used to show nothing at all here. The
+     station's own export_progress (polled on the station feed, already driving the thin bar across
+     the top of the shell) names the same stages regardless of who is doing the cutting; feed it into
+     this same bottom bar too, so an LLM-triggered export always shows here, in the one place "the
+     foot of Pine" already looks - the same bar that PineTab recordings use (exportName's 'tablet'
+     case). Suppressed while THIS window is itself mid-capture (replay:progress is already driving
+     the bar, more finely, every few hundred ms) so the two sources never fight. */
+  function paintSharedExport(progress) {
+    if (!progress || !['app', 'pip'].includes(progress.target)) return;
+    if (Date.now() - localExportAt < 5000) return;
+    paintExport({ view: progress.target, stage: ['placed', 'saved'].includes(progress.stage) ? 'done' : progress.stage === 'failed' ? 'failed' : 'encode',
+      ratio: Number.isFinite(progress.pct) ? progress.pct / 100 : null, say: progress.say || '' });
   }
   /* [pip-rec] ------------------------------------------------------------------------------------
      THE ALBUM RECORDER. The operator's drawing: album art, total time, the falling-peak meter, the
@@ -1373,7 +1403,7 @@
     box.addEventListener('pointerdown',e=>{
       if(e.button!==0||e.isPrimary===false||e.shiftKey||e.target.closest('button,input,select,a'))return;
       const edge=e.target.closest('.pip-messages-edge')?.dataset.edge||'';
-      if(e.pointerType==='touch'&&!edge&&e.target.closest('.pip-system3-words,.pip-system3-rolls'))return;
+      if(e.pointerType==='touch'&&!edge&&!document.body.classList.contains('ppt-editing')&&e.target.closest('.pip-system3-words,.pip-system3-rolls'))return;
       placeMessages();const rect=box.getBoundingClientRect();
       messageDrag={id:e.pointerId,x:e.clientX,y:e.clientY,edge,target:edge?e.target:box,moved:!!edge,rect:{left:rect.left,top:rect.top,width:rect.width,height:rect.height},font:messageFontDraft??messageTileOptions().fontSize,
         bounds:{x:rect.left/innerWidth,y:rect.top/innerHeight,width:messageLayout.wrapWidth/innerWidth,height:rect.height/innerHeight}};
@@ -1712,7 +1742,7 @@
         if (![30,60,120,180,300,600,900,1200,1800,3600].includes(action.seconds) || !['audio', 'video'].includes(action.format)) throw new Error('Unknown recording export.');
         exportBusy = true; say('Exporting the last ' + action.seconds + ' seconds to Pine Box recordings...', 0);
         try {
-          const result = await api().replayExport({ seconds: action.seconds, audio_only: action.format === 'audio', require_audio: true, view: 'pip' });
+          const result = await api().replayExport({ seconds: action.seconds, audio_only: action.format === 'audio', require_audio: action.format === 'audio', view: 'pip' });
           if (!result?.ok) throw new Error(result?.detail || 'Recording export failed.');
           say('Saved ' + result.seconds + ' seconds' + (result.clamped ? ' (available buffer)' : '') + ': ' + result.where, 15000);
         } finally { exportBusy = false; }
@@ -1879,6 +1909,7 @@
     if (!state?.active || state.ui === false) return;
     messageTile?.receive(payload);
     station = payload.station || {}; track = station.now; updateCast(); updatePainting();
+    paintSharedExport(station.export_progress);   /* [pip-export-bar] */
     tellPanelTelemetry(payload);   /* [pip-viz] */
     const live = payload.now || (payload.rows || []).find(r => r.lcdStatus === 'Playing' && !r.music);
     liveSpeaker = String(live?.who || live?.speaker || live?.name || '');
@@ -2004,6 +2035,7 @@
     }
   }
   async function syncPanel() {
+    if (tablet) return;
     if (!panelReady) {   /* [pip-panel-ready] a page that answers is ready, whatever the flag last heard */
       try { await frame.executeJavaScript('document.readyState'); panelReady = true; } catch (_) { return; }
     }
@@ -2027,14 +2059,15 @@
     placeSlate(); syncMusic(); syncMessages(); syncMessageTileSettings(); syncRecorder();   /* [pip-rec] */
     if (next.active && !was) {
       root.PineAdViewer?.close();
-      pinePipPanel(root); root.PinePipPanel.appearance(themePalette()); root.PinePipPanel.set(true, '', true);
+      pinePipPanel(root); root.PinePipPanel.appearance(themePalette()); root.PinePipPanel.set(true, tablet ? root.__pineLogo : '', !tablet);
+      if (tablet) root.pineDesktop.videoWall('state').then(st => root.PinePipPanel.nativePicture(st)).catch(() => {});
       leave = root.PineStationFeed.subscribe(receive);
       pollExtra(); timer = setInterval(pollExtra, 2500);
       voiceTimer = setInterval(paintVoices, 70); loadPortraits();
       loadDice().catch(e => say('Dice visualization: ' + e.message));
     } else if (!next.active && was) {
       overlay.querySelector('.pip-appearance')?.setAttribute('hidden', '');
-      root.PinePipPanel?.set(false, '', true); shellCount = panelCount = 0;
+      root.PinePipPanel?.set(false, '', !tablet); shellCount = panelCount = 0;
       videoTime.panel = videoTime.shell = null; overlay.querySelector('.pip-adjust')?.remove(); adjustFor = '';   /* [pip-playbar] [pip-free] */
       leave?.(); leave = null; clearInterval(voiceTimer); voiceReadings.panel = []; voiceReadings.shell = []; videoSlots.panel = []; videoSlots.shell = []; clearInterval(timer); timer = null;
       root.cancelAnimationFrame(diceRaf);
@@ -2083,21 +2116,23 @@
     w.__pinePipDetailDismiss = closeAway;
   }
   function bootstrap() {
-    if (!api()?.pipEnter) return;
-    frame = document.getElementById('controlFrame'); if (!frame) return;
+    if (root.PinePip || !api()?.pipEnter) return;
+    frame = document.getElementById('controlFrame'); if (!frame && !tablet) return;
     build(); buildTitlebar();
     installPipDetailDismiss(root);
+    if (!tablet) {
     const button = node('button', 'pine-view-tab', 'PiP'); button.id = 'pinePipBtn'; button.type = 'button';
     button.title = 'Reduce Pine to a frameless picture-in-picture window'; button.addEventListener('click', enter);
     const rail = document.getElementById('pineViewRail') || document.getElementById('techRail'); rail.appendChild(button);
-    frame.addEventListener('dom-ready', () => { panelReady = true; if (state) syncPanel().catch(e => say(e.message)); });
+    }
+    frame?.addEventListener('dom-ready', () => { panelReady = true; if (state) syncPanel().catch(e => say(e.message)); });
     /* [pip-panel-ready] Only a new page in the main frame unreadies the panel. did-start-loading also
        fires for every iframe the station page opens later (the Gazette press, a book, a manual, an
        embedded video); with no dom-ready to follow, the flag stayed false and PiP showed the raw
        page until F5. A load that ends while PiP is on re-syncs the panel. */
-    frame.addEventListener('did-start-navigation', e => { if (e.isMainFrame && !e.isInPlace) panelReady = false; });
-    frame.addEventListener('did-stop-loading', () => { if (state?.active) syncPanel().catch(e => say(e.message)); });
-    frame.addEventListener('ipc-message', e => {
+    frame?.addEventListener('did-start-navigation', e => { if (e.isMainFrame && !e.isInPlace) panelReady = false; });
+    frame?.addEventListener('did-stop-loading', () => { if (state?.active) syncPanel().catch(e => say(e.message)); });
+    frame?.addEventListener('ipc-message', e => {
       if (state?.active && e.channel === 'pine-pip-voices') { voiceReadings.panel = e.args[0] || []; return; }
       if (e.channel === 'pine-pip-time') { heardVideoTime('panel', e.args[0]); return; }   /* [pip-playbar] */
       if (state?.active && e.channel === 'pine-pip-count') { panelCount = Number(e.args[0]) || 0; root.PinePipPanel?.layout(panelCount); updateSlots('panel', e.args[1]); return; }
@@ -2128,9 +2163,9 @@
       if (!sheet) { api().pipShiftCovered?.(id); return; }
       sheet.begin(note?.to, { from: note?.from, target: note?.target }).then(() => api().pipShiftCovered?.(id));
     });
-    api().onReplayProgress?.(paintExport);   /* [pip-export-bar] */
+    api().onReplayProgress?.(note => { localExportAt = Date.now(); paintExport(note); });   /* [pip-export-bar] */
     api().onPipState(apply); api().pipState().then(apply).catch(e => say(e.message));
-    api().get('/api/pip/config').then(remote => {
+    if (!tablet) api().get('/api/pip/config').then(remote => {
       sharedLoading = true;
       const finish = () => { sharedLoading = false; sharedReady = true; };
       if (remote?.configured && remote.settings) {
@@ -2144,7 +2179,7 @@
     root.addEventListener('keydown', e => { if (state?.active && (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10'))) { e.preventDefault(); showMenu().catch(err => say(err.message)); }
       if (state?.active && e.ctrlKey && e.altKey && e.key.startsWith('Arrow') && api().pipPosition) { e.preventDefault(); api().pipPosition(e.key).catch(err => say(err.message)); }
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyP') { e.preventDefault(); state?.active ? expand() : enter(); } });
-    root.PinePip = { enter, exit: () => shiftTo('app'), state: () => state, messageTile: messageTileState, digitalFeed: messageTileState, repairCamera: async () => {
+    root.PinePip = { enter, appearance: showAppearance, adjust: showAdjust, messageSettings: showMessageTileSettings, exit: () => shiftTo('app'), state: () => state, messageTile: messageTileState, digitalFeed: messageTileState, repairCamera: async () => {
       if (state?.cameraSource && state.cameraSource !== 'pine') await api().cameraPip({ off: true });
       cameraGeneration++; clearInterval(cameraTimer); clearTimeout(cameraPoll); cameraTimer = null;
       cameraImage.removeAttribute('src'); cameraImage.dataset.stream = ''; cameraFramePending = false;
@@ -2154,5 +2189,6 @@
       return { ok: true, say: cameraLabel() + ' display reconnected; waiting for a live picture.' };
     } };
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap); else bootstrap();
+  if (tablet) root.PinePipBootstrap = bootstrap;
+  else if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap); else bootstrap();
 })(window);

@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const {test} = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'renderer', 'deaf-watch.js'), 'utf8');
 
-function harness({bridge = () => Promise.resolve({}), web = () => Promise.resolve({status: 200}), media = [], location, stationBase} = {}) {
+function harness({bridge = () => Promise.resolve({}), web = () => Promise.resolve({status: 200}), media = [], location, stationBase, recover = false} = {}) {
   let id = 0, bridgeCalls = 0, webCalls = 0;
   const timers = new Map(), intervals = new Map(), revivals = [];
   const context = vm.createContext({Promise, WeakMap, AbortController,
@@ -18,7 +18,7 @@ function harness({bridge = () => Promise.resolve({}), web = () => Promise.resolv
       location,
       pineStationBase: stationBase,
       pineDesktop: {get: () => { bridgeCalls++; return bridge(); },
-        revive: request => { revivals.push(request); return Promise.resolve({say: 'test declined'}); }},
+        revive: request => { revivals.push(request); return Promise.resolve({ok: recover, say: 'repaired in place'}); }},
       fetch: (...args) => { webCalls++; return web(...args); }
     }
   });
@@ -49,6 +49,31 @@ test('loading rounds belong to the same media source', () => {
   el.src = '/second.wav'; assert.equal(h.watch.media().stuck, 0);
   assert.equal(h.watch.media().stuck, 1);
   el.readyState = 4; assert.equal(h.watch.media().stuck, 0);
+});
+
+test('paused previews never trigger automatic application recovery', async () => {
+  const preview = {paused: true, error: {code: 2}, networkState: 2, readyState: 0};
+  const h = harness({media: [preview]});
+  for (let n = 0; n < 6; n++) await h.watch.look();
+  assert.equal(h.revivals.length, 0);
+});
+
+test('failed active media retries its own source at the same position', async () => {
+  const events = new Map(); let loaded = 0, played = 0;
+  const player = {id: 'dj', tagName: 'AUDIO', paused: false, ended: false,
+    currentSrc: '/take.wav', currentTime: 42, error: {code: 2},
+    addEventListener: (name, fn) => events.set(name, fn),
+    removeEventListener: name => events.delete(name),
+    load() { loaded++; this.currentTime = 0; }, play() { played++; return Promise.resolve(); }};
+  const h = harness({media: [player], recover: true});
+  for (let n = 0; n < 3; n++) await h.watch.look();
+  assert.equal(h.revivals.length, 1);
+  assert.equal(h.revivals[0].automatic, true);
+  assert.equal(loaded, 1);
+  events.get('loadedmetadata')();
+  assert.equal(player.currentTime, 42);
+  assert.equal(played, 1);
+  assert.equal(events.size, 0);
 });
 
 test('successful probes retire deadlines, and stop cancels its warmup', async () => {

@@ -4,7 +4,8 @@ import ast
 import asyncio
 from pathlib import Path
 import sqlite3
-from threading import Event, RLock, Thread
+from threading import Event, RLock, Thread, local
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 
@@ -28,6 +29,91 @@ def actual(names, namespace):
 
 
 class BackendSideEffectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hourly_video_lookup_does_not_take_the_receipt_writer_lock(self):
+        class NoWriterLock:
+            def __enter__(self):
+                raise AssertionError("read-only hourly lookup took the writer lock")
+            def __exit__(self, *args):
+                pass
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE clips(sid TEXT,name TEXT,seconds REAL,folder TEXT,playable INT,video INT,said TEXT)")
+        db.execute("INSERT INTO clips VALUES('a','clip',8,'folder',1,1,'a spoken line')")
+        ns = {"sfx_db_reader": lambda: db, "_SFX_DB_LOCK": NoWriterLock(),
+              "h3_hourly_fresh_pick": lambda keys, what: keys[0],
+              "pipeline_log": lambda *args: None}
+        actual(["h3_hourly_fresh_clip"], ns)
+        try:
+            self.assertEqual("a", ns["h3_hourly_fresh_clip"]().get("id"))
+        finally:
+            db.close()
+
+    async def test_clip_readers_do_not_queue_behind_a_scan_on_another_thread(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "clips.db"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE clips(sid TEXT)")
+                db.execute("INSERT INTO clips VALUES('a')")
+            ns = {"_SFX_DB_READ": local(), "SFX_DB_PATH": path, "sfx_db": lambda: None}
+            actual(["sfx_db_reader"], ns)
+            entered, release, answered = Event(), Event(), Event()
+            errors = []
+            def slow():
+                try:
+                    con = ns["sfx_db_reader"]()
+                    def wait():
+                        entered.set()
+                        release.wait(3)
+                        return 1
+                    con.create_function("wait_for_test", 0, wait)
+                    con.execute("SELECT wait_for_test() FROM clips").fetchall()
+                    con.close()
+                except Exception as exc:
+                    errors.append(exc)
+            def quick():
+                try:
+                    con = ns["sfx_db_reader"]()
+                    self.assertIs(con, ns["sfx_db_reader"]())
+                    self.assertEqual("a", con.execute("SELECT sid FROM clips").fetchone()[0])
+                    answered.set()
+                    con.close()
+                except Exception as exc:
+                    errors.append(exc)
+            scan = Thread(target=slow)
+            scan.start()
+            self.assertTrue(entered.wait(1))
+            reader = Thread(target=quick)
+            reader.start()
+            try:
+                self.assertTrue(answered.wait(1), "a clip lookup waited behind the scan")
+            finally:
+                release.set()
+                reader.join(4)
+                scan.join(4)
+            self.assertEqual([], errors)
+
+    async def test_pending_receipt_retries_without_scanning_the_video_fallback_pool(self):
+        waits = []
+        async def sleep(delay):
+            waits.append(delay)
+            raise asyncio.CancelledError
+        async def empty(*args):
+            return None
+        def no_scan():
+            self.fail("a pending reservation cannot be solved by scanning the fallback pool")
+        cycle = {}
+        ns = {"asyncio": SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError),
+              "time": SimpleNamespace(time=lambda: 100),
+              "sfx_video_mode_on": lambda: True, "sfx_video_hourly_rebuild": lambda now: False,
+              "_SFX_CYCLE": cycle, "_SFX_INTERMISSION": {}, "sfx_reachable": lambda: True,
+              "sfx_match_video_pick_async": empty, "sfx_video_fresh_pick": empty,
+              "_SFX_VIDEO_FAMILY_WORK": SimpleNamespace(pending=lambda: True),
+              "sfx_deck_take": no_scan, "_sfx_any_video": no_scan}
+        actual(["sfx_video_cycle"], ns)
+        with self.assertRaises(asyncio.CancelledError):
+            await ns["sfx_video_cycle"]()
+        self.assertEqual([0.25], waits)
+        self.assertIn("receipts", cycle["why"])
+
     async def test_real_ack_side_effect_returns_and_http_loop_answers_while_database_lock_is_held(self):
         worker = OrderedSideEffects(capacity=1)
         database = sqlite3.connect(":memory:", check_same_thread=False)

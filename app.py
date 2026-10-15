@@ -33,7 +33,7 @@ from functools import wraps
 from html import escape as html_escape, unescape as html_unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from threading import BoundedSemaphore, RLock, Thread
+from threading import BoundedSemaphore, RLock, Thread, local as _ThreadLocal
 from typing import Any
 from urllib.parse import quote, urlparse
 from starlette.background import BackgroundTask
@@ -31183,6 +31183,9 @@ async def page_recovery_start() -> None:
             # the census records it as it always did.
             _rec_url = str(clip.get("url") or "")
             _rec_rows = ((clip.get("stream") or {}).get("rows") or None)
+            if _rec_rows:
+                _rec_rows = await asyncio.to_thread(_sfx_replay_picture_rows, _rec_rows)
+                clip["stream"] = {**clip["stream"], "rows": _rec_rows}
             _rec_len = float((clip.get("stream") or {}).get("length") or 0.0)
             if _rec_rows and _rec_len <= 0:
                 # A preserved burst knows where its turns are even when
@@ -32192,7 +32195,8 @@ def page_playback_ack(payload: Any, addr: str = "",
                         pending = [row for row in stream["rows"]
                                    if float(row.get("until") or 0) > position]
                         _sfx_cadence_pictures(pending, now - position,      # [pic-retime] move, not twin
-                                              retime=bool(delivery.get("sfx_pictures_rung")))
+                                              retime=bool(delivery.get("sfx_pictures_rung")),
+                                              occurrence=delivery_id)
                         delivery["sfx_pictures_rung"] = listener
             except Exception:  # noqa: BLE001
                 pass
@@ -50394,6 +50398,12 @@ def radio_pause_set(on: bool, why: str = "") -> bool:
     (with the transcript), a listener's wake, a repair. A pause that
     cannot say whose it was cost hours of "why is the music off"."""
     try:
+        # Every explicit return to air ends the independent video soundtrack,
+        # even when endless video was enabled during a pre-existing pause.
+        # Keep this here so panel, voice and repair callers share the rule;
+        # the outer transition alone performs the resume work.
+        if not on and sfx_video_mode_on():
+            sfx_video_banking_set(False, why=why, resume=False)
         now = time.time()
         pos = _RADIO.get("sched_pos") or {}
         if on and not radio_paused():
@@ -88313,6 +88323,30 @@ def sfx_seconds_held(path: Path) -> float | None:
     return _SFX_LEN_CACHE.get(f"{path}:{stamp}")
 
 
+def sfx_measure(path: Path) -> float:
+    """[video-folders-live] How long the file runs, read off the file itself: a wav header, then
+    mutagen, then (a video) the media probe. 0.0 = could not tell. No cache and no ledger - that
+    is sfx_seconds' business; the book reader keeps its lengths in the book."""
+    secs = 0.0
+    if path.suffix.lower() == ".wav":
+        import wave
+        try:
+            with wave.open(str(path), "rb") as handle:
+                secs = handle.getnframes() / float(handle.getframerate() or 1)
+        except Exception:
+            secs = 0.0
+    if secs <= 0:
+        try:
+            import mutagen
+            info = mutagen.File(str(path))
+            secs = float(getattr(getattr(info, "info", None), "length", 0) or 0)
+        except Exception:
+            secs = 0.0
+    if secs <= 0 and sfx_is_video(path):
+        secs = _media_duration_probe(path)      # #1263
+    return secs
+
+
 def sfx_seconds(path: Path) -> float:
     """How long a sample actually runs. 0.0 means we could not tell.
 
@@ -88331,23 +88365,7 @@ def sfx_seconds(path: Path) -> float:
     held = _SFX_LEN_CACHE.get(key)
     if held is not None:
         return held
-    secs = 0.0
-    if path.suffix.lower() == ".wav":
-        import wave
-        try:
-            with wave.open(str(path), "rb") as handle:
-                secs = handle.getnframes() / float(handle.getframerate() or 1)
-        except Exception:
-            secs = 0.0
-    if secs <= 0:
-        try:
-            import mutagen
-            info = mutagen.File(str(path))
-            secs = float(getattr(getattr(info, "info", None), "length", 0) or 0)
-        except Exception:
-            secs = 0.0
-    if secs <= 0 and sfx_is_video(path):
-        secs = _media_duration_probe(path)      # #1263
+    secs = sfx_measure(path)                    # [video-folders-live] the measuring, shared with the book reader
     while len(_SFX_LEN_CACHE) >= SFX_LEN_CACHE_MAX:
         _SFX_LEN_CACHE.pop(next(iter(_SFX_LEN_CACHE)), None)
     _SFX_LEN_CACHE[key] = secs
@@ -88642,14 +88660,18 @@ SFX_FOLDERS_KEEP_S = 900.0
 SFX_FOLDERS_RENEW_S = 300.0
 
 
-def sfx_folders_view() -> dict[str, Any]:
+def sfx_folders_view(fresh: bool = False) -> dict[str, Any]:
     """[sfx-folders-cache] The folder list, kept: the first call walks the book (slow, the database
     is on the share); later calls answer from the kept list and renew it in the background once it
-    is five minutes old. The pin is read fresh every time."""
+    is five minutes old. The pin is read fresh every time.
+    [video-folders-live] `fresh` (the PiP menu, every time it opens) reads the book now and asks
+    the look for folders the share has grown since."""
     now = time.time()
     memo = _SFX_FOLDERS_MEMO
     folders = memo.get("folders")
-    if folders is None or now - float(memo.get("at") or 0) > SFX_FOLDERS_KEEP_S:
+    if fresh:
+        sfx_book_kick()
+    if fresh or folders is None or now - float(memo.get("at") or 0) > SFX_FOLDERS_KEEP_S:
         folders = _sfx_folders_scan()
         memo.update(at=time.time(), folders=folders)
     elif now - float(memo.get("at") or 0) > SFX_FOLDERS_RENEW_S and not memo.get("busy"):
@@ -88667,42 +88689,340 @@ def sfx_folders_view() -> dict[str, Any]:
         _threading.Thread(target=_renew, name="sfx-folders-renew", daemon=True).start()
     pin = sfx_pin_view()
     return {"ok": True, "folders": folders, "pin": pin, "kept_s": round(time.time() - float(memo.get("at") or 0), 1),
+            "reader": sfx_book_state(),             # [video-folders-live]
             "say": ("all clips come from %s for another %d min" % (pin["name"], pin["minutes_left"]))
                    if pin else "every folder - no pin"}
 
 
 def _sfx_folders_scan() -> list[dict[str, Any]]:
     """Every folder the book knows, with counts and a few samples to
-    preview - one read of the book, grouped here."""
+    preview - one read of the book, grouped here.
+
+    [video-folders-live] Grouped by sqlite, not by a Python loop over 368,000 rows (0.8 s with the
+    GIL let go), then merged with the look: every folder on the share, read or not ("unread"), and
+    each parent of a nested folder (user above user/gBox) counting everything under it."""
     out: dict[str, dict[str, Any]] = {}
+    con = None
     try:
         con = sfx_db_reader()
         rows = con.execute(
-            "SELECT path, sid, name, video, seconds FROM clips WHERE playable = 1").fetchall()
+            "SELECT rtrim(path, replace(path, '/', '')) AS d,"
+            " SUM(playable = 1 AND video = 1) AS v, SUM(playable = 1 AND video = 0) AS a,"
+            " SUM(playable = 0) AS held FROM clips GROUP BY d").fetchall()
     except Exception:  # noqa: BLE001
         rows = []
     for r in rows:
-        p = str(r["path"] or "")
-        d = p.rsplit("/", 1)[0] if "/" in p else ""
+        d = str(r[0] or "").rstrip("/")
         if not d:
             continue
-        f = out.setdefault(d, {"path": d, "name": d.rsplit("/", 1)[-1], "audio": 0, "video": 0, "samples": []})
-        is_v = bool(r["video"])
-        f["video" if is_v else "audio"] += 1
-        want = 3
-        have = sum(1 for x in f["samples"] if x["video"] == is_v)
-        if have < want:
-            sid = str(r["sid"] or "")
-            f["samples"].append({"id": sid, "name": str(r["name"] or "")[:60], "video": is_v,
-                                 "url": f"/sfx/{sid}?t={media_sign(sid)}",
-                                 "seconds": round(float(r["seconds"] or 0), 1)})
-    return sorted(out.values(), key=lambda f: f["path"])[:300]
+        out[d] = {"path": d, "name": d.rsplit("/", 1)[-1], "video": int(r[1] or 0),
+                  "audio": int(r[2] or 0), "held": int(r[3] or 0), "samples": []}
+    for d, f in out.items():
+        for is_v in (1, 0):
+            if con is None or not f["video" if is_v else "audio"]:
+                continue
+            try:
+                got = con.execute(
+                    "SELECT sid, name, seconds FROM clips WHERE path >= ? AND path < ? AND +playable = 1"
+                    " AND +video = ? LIMIT 3", (d + "/", d + "0", is_v)).fetchall()   # + : the path range, not clips_pick
+            except Exception:  # noqa: BLE001
+                got = []
+            for s in got:
+                sid = str(s[0] or "")
+                f["samples"].append({"id": sid, "name": str(s[1] or "")[:60], "video": bool(is_v),
+                                     "url": f"/sfx/{sid}?t={media_sign(sid)}",
+                                     "seconds": round(float(s[2] or 0), 1)})
+    for d, info in dict(_SFX_BOOK.get("disk") or {}).items():
+        if d not in out and int(info.get("files") or 0) > 0:
+            out[d] = {"path": d, "name": d.rsplit("/", 1)[-1], "video": 0, "audio": 0, "held": 0,
+                      "samples": [], "unread": True, "files": int(info.get("files") or 0)}
+    roots = _sfx_book_roots()
+    own = [(d, f["video"], f["audio"]) for d, f in out.items()]
+    for d, v, a in own:
+        root = next((r for r in roots if d.startswith(r + "/")), "")
+        rel = d[len(root) + 1:] if root else ""
+        if "/" not in rel:
+            continue
+        parts = rel.split("/")
+        out[d]["name"] = rel
+        out[d]["parent"] = root + "/" + "/".join(parts[:-1])
+        for i in range(1, len(parts)):
+            anc = root + "/" + "/".join(parts[:i])
+            p = out.get(anc)
+            if p is None:
+                p = out[anc] = {"path": anc, "name": "/".join(parts[:i]), "video": 0, "audio": 0,
+                                "held": 0, "samples": []}
+                if i > 1:
+                    p["parent"] = root + "/" + "/".join(parts[:i - 1])
+            p["video"] += v
+            p["audio"] += a
+    return sorted(out.values(), key=lambda f: f["path"])[:5000]
 
 
 @app.get("/api/sfx/folders")
-async def sfx_folders_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+async def sfx_folders_api(fresh: int = 0, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_read_auth(authorization)
-    return await asyncio.to_thread(sfx_folders_view)
+    return await asyncio.to_thread(sfx_folders_view, bool(fresh))     # [video-folders-live]
+
+
+# --- [video-folders-live] THE LOOK AND THE READER ---------------------------------------
+SFX_BOOK_LOOK_EVERY_S = 20.0            # a menu opened twice in a breath looks once
+SFX_BOOK_READ_GAP_S = 0.05              # between two files measured off the share
+SFX_BOOK_SLICE = 500                    # files a visit; a big folder yields to the next look
+SFX_BOOK_MATCH_EVERY_S = 1800.0         # the keyword index is rebuilt at most this often mid-read
+SFX_BOOK_READ_PATH = data_path("sfx_book_read.json")
+_SFX_BOOK: dict[str, Any] = {"busy": False, "at": 0.0, "again": False, "first": "", "disk": {},
+                             "read": None, "now": "", "left": 0, "added": 0, "folders": 0,
+                             "why": "", "finished": 0.0}
+_SFX_BOOK_GATE = RLock()
+_SFX_BOOK_UPSERT = (
+    "INSERT INTO clips (path, sid, name, folder, video, bytes, mtime, seconds, playable, seen_at) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+    " sid=excluded.sid, name=excluded.name, folder=excluded.folder, video=excluded.video,"
+    " bytes=excluded.bytes, mtime=excluded.mtime,"
+    " seconds=COALESCE(excluded.seconds, clips.seconds),"
+    " playable=MAX(excluded.playable, clips.playable), seen_at=excluded.seen_at")
+
+
+def _sfx_book_roots() -> list[str]:
+    """The drop roots (samples_grabbed), spelled the way the book spells its paths. No stat."""
+    try:
+        drops = dj_settings().get("sfx_drop_folders")
+        if drops is None:
+            drops = list(SFX_DROP_FOLDERS)
+    except Exception:  # noqa: BLE001
+        drops = list(SFX_DROP_FOLDERS)
+    out = []
+    for name in drops:
+        wanted = str(name or "").strip().strip("/")
+        if wanted and ".." not in wanted:
+            out.extend(str(base / wanted) for base in (SFX_ROOT, SFX_LOCAL_ROOT))
+    return out
+
+
+def _sfx_book_on() -> bool:
+    try:
+        return dj_settings().get("sfx_book_reader", True) is not False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def sfx_book_state() -> dict[str, Any]:
+    b = _SFX_BOOK
+    say = ""
+    if b.get("busy") and b.get("now"):
+        say = "Reading %s into the clip book (%d folder%s waiting) - open the menu again to see it" % (
+            Path(str(b["now"])).name, int(b.get("left") or 0), "" if int(b.get("left") or 0) == 1 else "s")
+    return {"busy": bool(b.get("busy")), "now": b.get("now") or "", "left": int(b.get("left") or 0),
+            "added": int(b.get("added") or 0), "folders": int(b.get("folders") or 0),
+            "why": b.get("why") or "", "finished": b.get("finished") or 0.0, "say": say,
+            "on": _sfx_book_on()}
+
+
+def _sfx_book_look_one(path: str, video_only: bool, depth: int, disk: dict, was: dict) -> None:
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return
+    old = was.get(path)
+    if old and old.get("mtime") == mtime:
+        files, kids = int(old.get("files") or 0), list(old.get("kids") or [])
+    else:
+        files, kids = 0, []
+        types = SFX_VIDEO_TYPES if video_only else SFX_TYPES
+        own_files = not (video_only and depth == 1)      # user/ itself is the listener courier's
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        if depth < 2:
+                            kids.append(e.path)
+                    elif own_files and os.path.splitext(e.name)[1].lower() in types:
+                        files += 1
+        except OSError:
+            return
+    disk[path] = {"mtime": mtime, "files": files, "kids": kids, "video_only": video_only}
+    for kid in kids:
+        _sfx_book_look_one(kid, video_only, depth + 1, disk, was)
+
+
+def _sfx_book_look() -> dict[str, Any]:
+    """One scandir per drop root and per folder whose mtime moved; a stat for the rest."""
+    was = dict(_SFX_BOOK.get("disk") or {})
+    disk: dict[str, Any] = {}
+    for root in _sfx_book_roots():
+        if not sfx_reach_ok(root):
+            sfx_reach_stood_down("book-look")
+            continue
+        try:
+            with os.scandir(root) as it:
+                subs = [e for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for e in subs:
+            _sfx_book_look_one(e.path, e.name.lower() in SFX_DROP_SKIP, 1, disk, was)
+    _SFX_BOOK["disk"] = disk
+    _SFX_FOLDERS_MEMO["at"] = 0.0
+    return disk
+
+
+def _sfx_book_ledger() -> dict[str, float]:
+    if _SFX_BOOK.get("read") is None:
+        try:
+            got = json.loads(SFX_BOOK_READ_PATH.read_text())
+            _SFX_BOOK["read"] = {str(k): float(v) for k, v in got.items()} if isinstance(got, dict) else {}
+        except Exception:  # noqa: BLE001
+            _SFX_BOOK["read"] = {}
+    return _SFX_BOOK["read"]
+
+
+def _sfx_book_queue(disk: dict) -> list[str]:
+    """Folders with files the reader has not read at their current mtime: the pin (or the folder
+    just asked for) first, then folders the book has never held, smallest first."""
+    read = _sfx_book_ledger()
+    first = str(_SFX_BOOK.get("first") or "") or sfx_pin_prefix().rstrip("/")
+    _SFX_BOOK["first"] = ""
+    try:
+        booked = {str(r[0]).rstrip("/") for r in sfx_db_reader().execute(
+            "SELECT DISTINCT rtrim(path, replace(path, '/', '')) FROM clips").fetchall()}
+    except Exception:  # noqa: BLE001
+        booked = set()
+    want = [(p, info) for p, info in disk.items()
+            if int(info.get("files") or 0) > 0 and read.get(p) != info.get("mtime")]
+
+    def rank(item: tuple) -> tuple:
+        p, info = item
+        pinned = 0 if first and (p == first or p.startswith(first + "/")) else 1
+        return (pinned, 1 if p in booked else 0, int(info.get("files") or 0), p)
+
+    return [p for p, _ in sorted(want, key=rank)]
+
+
+def _sfx_book_read(folder: str, info: dict) -> tuple[int, bool]:
+    """One visit to one folder: up to SFX_BOOK_SLICE clips the book lacks, measured and written.
+    Returns (added, finished)."""
+    types = SFX_VIDEO_TYPES if info.get("video_only") else SFX_TYPES
+    con = sfx_db()
+    with _SFX_DB_LOCK:
+        known = {str(r[0]) for r in con.execute(
+            "SELECT path FROM clips WHERE path >= ? AND path < ?", (folder + "/", folder + "0")).fetchall()}
+    try:
+        with os.scandir(folder) as it:
+            names = sorted(e.path for e in it if not e.is_dir(follow_symlinks=False)
+                           and os.path.splitext(e.name)[1].lower() in types and e.path not in known)
+    except OSError as err:
+        _SFX_BOOK["why"] = str(err)[:160]
+        return 0, True
+    banned = sfx_bans() | sfx_superseded()
+    names = [one for one in names if sfx_id(Path(one)) not in banned]
+    added, rows, tried = 0, [], 0
+
+    def write() -> None:
+        with _SFX_DB_LOCK:
+            con.executemany(_SFX_BOOK_UPSERT, rows)
+            con.commit()
+
+    for one in names:
+        if tried >= SFX_BOOK_SLICE or not _sfx_book_on() or not sfx_reach_ok(one):
+            break
+        tried += 1
+        path = Path(one)
+        sid = sfx_id(path)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        secs = sfx_seconds_held(path)
+        if secs is None:
+            secs = sfx_measure(path)
+        is_video = 1 if sfx_is_video(path) else 0
+        playable = 0
+        if secs and sfx_floor_seconds() <= secs <= sfx_cap_seconds():
+            playable = 1 if is_video else (0 if sfx_is_silent(path) else 1)
+        rows.append((one, sid, path.stem, path.parent.name, is_video, int(st.st_size), float(st.st_mtime),
+                     float(secs) if secs else None, playable, time.time()))
+        if len(rows) >= 100:
+            write()
+            added += len(rows)
+            rows = []
+        time.sleep(SFX_BOOK_READ_GAP_S)
+    if rows:
+        write()
+        added += len(rows)
+    return added, tried == len(names)
+
+
+def _sfx_book_run() -> None:
+    b = _SFX_BOOK
+    matched_at = time.time()
+    added_since = 0
+    try:
+        disk = _sfx_book_look()
+        queue = _sfx_book_queue(disk) if _sfx_book_on() else []
+        while queue and _sfx_book_on():
+            if b.get("again") and time.time() - float(b.get("at") or 0) >= SFX_BOOK_LOOK_EVERY_S:
+                b.update(again=False, at=time.time())
+                disk = _sfx_book_look()
+                queue = _sfx_book_queue(disk)
+                if not queue:
+                    break
+            folder = queue[0]
+            b.update(now=folder, left=len(queue) - 1)
+            info = disk.get(folder) or {}
+            got, finished = _sfx_book_read(folder, info)
+            b["added"] = int(b.get("added") or 0) + got
+            added_since += got
+            if got:
+                _SFX_FOLDERS_MEMO["at"] = 0.0
+            if finished:
+                queue.pop(0)
+                b["folders"] = int(b.get("folders") or 0) + 1
+                read = _sfx_book_ledger()
+                read[folder] = info.get("mtime")
+                try:
+                    tmp = SFX_BOOK_READ_PATH.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(read))
+                    tmp.replace(SFX_BOOK_READ_PATH)
+                except OSError:
+                    pass
+                if got:
+                    pipeline_log("air", "clip book: read %s - %d new clip(s) (%d folder(s) waiting)"
+                                 % (folder, got, len(queue)))
+            if added_since and time.time() - matched_at > SFX_BOOK_MATCH_EVERY_S:
+                matched_at, added_since = time.time(), 0
+                sfx_match_kick()
+    except Exception as err:  # noqa: BLE001
+        b["why"] = str(err)[:200]
+        print("[sfx-book] reader failed: %s" % err, flush=True)
+    finally:
+        b.update(busy=False, now="", left=0, finished=time.time())
+        if added_since:
+            try:
+                sfx_match_kick()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def sfx_book_kick(first: str = "") -> bool:
+    """Look (and read what is new) on its own thread, one at a time. A kick while it runs asks it to
+    look again between folders; `first` puts that folder at the front of the queue."""
+    with _SFX_BOOK_GATE:
+        if first:
+            _SFX_BOOK["first"] = str(first).rstrip("/")
+        if _SFX_BOOK.get("busy"):
+            _SFX_BOOK["again"] = True
+            return False
+        if not first and time.time() - float(_SFX_BOOK.get("at") or 0) < SFX_BOOK_LOOK_EVERY_S:
+            return False
+        _SFX_BOOK.update(busy=True, at=time.time(), again=False, why="")
+    Thread(target=_sfx_book_run, name="sfx-book", daemon=True).start()
+    return True
+
+
+@app.get("/api/sfx/book-reader")
+async def sfx_book_reader_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"ok": True, **sfx_book_state()}
 
 
 @app.get("/api/sfx/folder-pin")
@@ -88733,6 +89053,7 @@ async def sfx_folder_pin_api(
         raise HTTPException(status_code=400, detail="that is not a folder in the SFX collection")
     hours = float(body.get("hours") or 1)
     got = sfx_pin_set(path, hours)
+    sfx_book_kick(first=path)                   # [video-folders-live] a pinned folder is read first
     pin = sfx_pin_view()
     note_action("you pinned the SFX guy to %s for %s hour(s)" % (pin["name"] if pin else path, got.get("hours")))
     pipeline_log("air", "sfx folder pin: %s for %.2f h (stings and endless video) (2026-09-14)" % (path, got.get("hours") or 0))
@@ -92178,6 +92499,10 @@ async def sfx_keeper() -> None:
             await _sfx_pool_refresh()
         except Exception:  # noqa: BLE001
             pass                    # a missed rescan is not a dead show
+        try:
+            sfx_book_kick()         # [video-folders-live] new folders reach the book with the menu shut
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.on_event("startup")
@@ -92806,7 +93131,33 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
             sfxguy_ready_commit(str(row["sfxguy_reservation"]))
 
 
-def _sfx_cadence_pictures(rows, starts_at: float, retime: bool = False) -> None:
+def _sfx_picture_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    """Keep a welded clip's picture identity with its audio cue sheet."""
+    return {key: row[key] for key in (
+        "sfx_sample_id", "sfx_video_id", "sfx_video_seconds", "sfx_match_why",
+        "sfx_dir") if row.get(key) is not None}
+
+
+def _sfx_replay_picture_rows(rows):
+    """Repair legacy cue sheets from exact audible receipts, off the loop."""
+    repaired = [dict(row) for row in rows]
+    missing = [row for row in repaired if row.get("who") == "board"
+               and not row.get("sfx_video_id")]
+    if not missing:
+        return repaired
+    samples = _SFX_CADENCE.samples_for(row.get("id") for row in missing)
+    for row in missing:
+        key = str(row.get("sfx_sample_id") or samples.get(str(row.get("id") or "")) or "")
+        source = sfx_db_path_of(key) if key else None
+        if source and sfx_is_video(source):
+            row.update(sfx_sample_id=key, sfx_video_id=key,
+                       sfx_video_seconds=max(0.0, float(row.get("clip_until", row.get("until")) or 0)
+                                             - float(row.get("clip_from", row.get("from")) or 0)))
+    return repaired
+
+
+def _sfx_cadence_pictures(rows, starts_at: float, retime: bool = False,
+                          occurrence: str = "") -> None:
     """Ring a silent picture at the audible board row's measured offset.
     [pic-retime] `retime`: a picture already rung for the row is MOVED (its
     ring entry and a reservation update the sets apply to what they hold)."""
@@ -92814,7 +93165,9 @@ def _sfx_cadence_pictures(rows, starts_at: float, retime: bool = False) -> None:
         key = str(row.get("sfx_video_id") or "")
         if not key:
             continue
-        pic_id = "pic:" + str(row.get("id") or key)
+        # A replay has the same script rows but is a new showing. Reusing
+        # its old picture delivery id makes the sets discard it as seen.
+        pic_id = "pic:" + ((occurrence + ":") if occurrence else "") + str(row.get("id") or key)
         at_ms = int((starts_at + float(row.get("from") or 0)) * 1000)
         if retime:
             moved = False
@@ -93463,12 +93816,14 @@ def _sfx_video_withdraw() -> None:
         pass
 
 
-def sfx_video_banking_set(on: bool, why: str = "") -> dict[str, Any]:
+def sfx_video_banking_set(on: bool, why: str = "", *,
+                          resume: bool = True) -> dict[str, Any]:
     """Set the endless screen and its Off Air banking mode as one action.
 
     On acquires the pause only when the station was on air. Off releases
     only a pause this mode acquired. This lets endless video run during a
-    separately requested pause without stealing ownership of it."""
+    separately requested pause without stealing ownership of it. An explicit
+    return to air passes resume=False because it owns the resume transition."""
     on = bool(on)
     settings = load_settings()
     dj = dict(settings.get("dj") or {})
@@ -93486,7 +93841,7 @@ def sfx_video_banking_set(on: bool, why: str = "") -> dict[str, Any]:
         dj["sfx_video_banking_owned"] = False
         save_settings({**settings, "dj": dj})
         _sfx_video_withdraw()
-        if owned and radio_paused():
+        if resume and owned and radio_paused():
             radio_pause_set(False,
                             why=why or "endless video banking mode ended")
     return {"was_on": was_on, "owned": owned,
@@ -93882,8 +94237,8 @@ def _sfx_video_rotation_mark_clip_blocking(key: str, folder: str = "",
                 # book query is cheap and never reads the media share.
                 if row["name"]:
                     family = con.execute(
-                        "SELECT sid FROM clips WHERE video = 1 AND "
-                        "(name = ? OR (bytes = ? AND seconds = ?))",
+                        "SELECT sid FROM clips WHERE video = 1 AND name = ? "
+                        "UNION SELECT sid FROM clips WHERE video = 1 AND bytes = ? AND seconds = ?",
                         (row["name"], row["bytes"], row["seconds"])).fetchall()
                     siblings = [str(r[0]) for r in family if r and r[0]] or siblings
             con.executemany(
@@ -94358,6 +94713,8 @@ async def sfx_intermission_turn(now: float, last_end: float) -> dict[str, Any] |
         raise
     except Exception:  # noqa: BLE001
         _lv_path = pick
+    if not sfx_video_mode_on():
+        return None
     key = sfx_id(pick)                    # and the way back: /sfx/<key> serves this file
     start = max(now, last_end + SFX_CYCLE_GAP)
     why = "%s - %s" % (SFX_INTERMISSION_WHY, {"h3": "an H3 render", "supercut": "a saved supercut",
@@ -94505,6 +94862,13 @@ async def sfx_video_cycle() -> None:
                     seconds = float(got[1]) if got else 0.0
             if pick is None:
                 # The old road, for the minutes after a fresh install only.
+                # A pending receipt temporarily bars every video. Walking
+                # the entire fallback pool cannot find a legal candidate;
+                # retry promptly when the commit has released the gate.
+                if _SFX_VIDEO_FAMILY_WORK.pending():
+                    _SFX_CYCLE["why"] = "waiting for video playback receipts to commit"
+                    await asyncio.sleep(0.25)
+                    continue
                 pick = None
                 for _ in range(4):
                     candidate = sfx_deck_take()
@@ -94518,6 +94882,10 @@ async def sfx_video_cycle() -> None:
                 if pick is None:
                     pick = await asyncio.to_thread(_sfx_any_video)
                 if pick is None:
+                    if _SFX_VIDEO_FAMILY_WORK.pending():
+                        _SFX_CYCLE["why"] = "waiting for video playback receipts to commit"
+                        await asyncio.sleep(0.25)
+                        continue
                     _SFX_CYCLE["why"] = ("no video clip qualifies - the book is "
                                          "empty and the pool has nothing")
                     await asyncio.sleep(10.0)
@@ -94572,6 +94940,10 @@ async def sfx_video_cycle() -> None:
                 raise
             except Exception:  # noqa: BLE001
                 _lv_how = "raw"
+            # Picking/levelling yields to the operator's resume command.
+            # Do not publish a new background soundtrack after it was stopped.
+            if not sfx_video_mode_on():
+                continue
             if _lv_how == "raw":
                 _sfx_video_level_want(pick)
             key = sfx_id(pick)
@@ -95746,7 +96118,22 @@ def _sfx_any_video() -> Path | None:
     test stands.
 
     Unrepeated against the ordinary sting ring, so tapping the button
-    twice does not play the same clip twice."""
+    twice does not play the same clip twice.
+
+    #1306c/#1311c already taught this file never to walk the share
+    inside a to_thread call the shared executor also serves - this was
+    the one caller still doing it. Reached from sfx_video_cycle once
+    every faster pick has missed, a cold memo used to mean the FULL
+    ffprobe walk of the whole collection ran right there, on a
+    "pine-pool" worker, with the cycle's own asyncio task suspended on
+    it - freezing every tube for as long as the walk took (caught live:
+    rung stuck for 11+ minutes while a pine-pool thread sat inside
+    _sfx_deck_fill -> _sfx_video_pool -> mutagen). Kick the safe
+    background build (its own daemon thread) and answer empty this
+    round instead; sfx_video_cycle already retries in 10s on None."""
+    if not sfx_video_warm():
+        sfx_video_kick()
+        return None
     pool = [path for path in _sfx_video_pool()
             if sfx_reach_ok(path) and not sfx_video_on_cooldown(sfx_id(path))]   # [sfx-reach]
     if not pool:
@@ -126009,6 +126396,13 @@ async def generate_answer(
             % max(1, len(settings.get("prompts") or [1]))].get("name", ""),
     }
 
+    # Desktop replay is a deterministic command, before contextual/model work.
+    # Otherwise a busy local model can delay the request until its moment has
+    # already moved out of the selected replay window.
+    desktop_export = parse_export_command(user_text)
+    if desktop_export and desktop_export.get("screen") in ("pip", "app"):
+        return export_screen_request(desktop_export), {**feature_meta, "model": "cutter", "export_command": True}
+
     # A bare command deliberately asks once rather than guessing the copy.
     # The short pending window also works for the Nabu's stateless turns.
     ad_goal = voice_ad_goal(user_text)
@@ -138641,11 +139035,6 @@ async def radio_pause_api(
     want = payload.get("paused")
     if want is None:
         want = not radio_paused()               # a plain toggle
-    # "Back on air" means the banking screen is over too. This is the
-    # only manual pause transition that changes endless mode; pausing an
-    # already-running endless set simply leaves its ownership intact.
-    if not bool(want) and sfx_video_mode_on() and sfx_video_banking_owned():
-        sfx_video_banking_set(False, why="the pause control returned FM to air")
     radio_pause_set(bool(want), why="the pause control (panel/API)")
     return {"paused": radio_paused(),
             "for_seconds": round(radio_paused_for(), 1),
@@ -168438,6 +168827,8 @@ async def video_editor_export_courier(
 # once, cuts its own screen ring (pineDesktop.replayExport, upload: true) and
 # reports. The upload above carries the file to export_desk_dir.
 _SCREEN_EXPORT: dict[str, Any] = {}
+_SCREEN_EXPORT_QUEUE: list[dict[str, Any]] = []
+_SCREEN_EXPORT_FINISHED: dict[str, str] = {}
 _SCREEN_EXPORT_LOCK = RLock()
 SCREEN_EXPORT_HOLD = {"tab": 1200, "app": 600, "pip": 1200}   # what each ring holds, seconds
 SCREEN_EXPORT_LIFE = 180.0                       # an unclaimed order expires
@@ -168524,10 +168915,19 @@ def export_screen_request(cmd: dict[str, Any]) -> str:
     name = "%s-last-%s-%s.mp4" % ({"tab": "pinetab", "app": "pineapp", "pip": "pinepip"}[target],
                                   ("%dmin" % (want // 60)) if want % 60 == 0 else ("%ds" % want), stamp)
     with _SCREEN_EXPORT_LOCK:
-        _SCREEN_EXPORT.clear()
-        _SCREEN_EXPORT.update({"id": uuid.uuid4().hex[:12], "target": target, "seconds": want,
+        order = {"id": uuid.uuid4().hex[:12], "target": target, "seconds": want,
                                "asked": asked, "name": name, "at": time.time(),
-                               "claimed_by": "", "claimed_at": 0.0, "done": False, "result": None})
+                               "claimed_by": "", "claimed_at": 0.0, "done": False, "result": None}
+        order["name"] = name = name[:-4] + "-" + order["id"][:4] + ".mp4"
+        busy = bool(_SCREEN_EXPORT and not _SCREEN_EXPORT.get("done") and
+                (bool(_SCREEN_EXPORT.get("claimed_by")) or
+                 time.time() - float(_SCREEN_EXPORT.get("at") or 0) < SCREEN_EXPORT_LIFE))
+        if busy:
+            order["queued"] = True
+            _SCREEN_EXPORT_QUEUE.append(order)
+        else:
+            _SCREEN_EXPORT.clear()
+            _SCREEN_EXPORT.update(order)
     dest = export_desk_dir()
     pipeline_log("air", "spoken: export the last %ss of %s (%s)" % (want, SCREEN_EXPORT_NAMES[target], name))
     words = "Exporting the last %s of %s to %s." % (                 # [short-say]
@@ -168535,6 +168935,8 @@ def export_screen_request(cmd: dict[str, Any]) -> str:
         spoken_folder(dest) if dest else "the station's exports")
     if asked > hold:
         words += " It only keeps the last %s." % _screen_export_minutes(hold)
+    if busy:
+        words += " Queued behind the current export; the requested time is preserved."
     return words
 
 
@@ -168562,6 +168964,12 @@ def export_progress() -> dict[str, Any] | None:
                 return None
             return {"target": row.get("target"), "stage": "failed", "pct": 100, "failed": True, "name": name,
                     "say": "%s did not finish: %s" % (head, res.get("detail") or "no reason given")}
+        if res.get("where") and not (res.get("uploaded") or {}).get("ok"):
+            if now - float(row.get("done_at") or row.get("at") or now) > 120:
+                return None
+            return {"target": row.get("target"), "stage": "saved", "pct": 100, "name": name,
+                    "say": "Saved %ss to %s. %s" % (res.get("seconds") or row.get("seconds"),
+                         res["where"], res.get("warning") or "Station upload unavailable; the local MP4 is safe.")}
         rows = []
         try:
             rows = [r for r in courier_read() if str(r.get("name") or "") == name]
@@ -168574,8 +168982,8 @@ def export_progress() -> dict[str, Any] | None:
                 return None
             by = "the host" if placed.get("carried_by") == "host" else "the desk"
             return {"target": row.get("target"), "stage": "placed", "pct": 100, "name": name,
-                    "say": "%s - done, %s placed %s in %s" % (head, by, name,
-                                                             export_desk_dir() or "data/exports")}
+                    "say": "%s - done, %s placed %s in %s. %s" % (head, by, name,
+                                                             export_desk_dir() or "data/exports", res.get("warning") or "")}
         if now - float(row.get("at") or now) > 900:
             return None
         return {"target": row.get("target"), "stage": "owed", "pct": 90, "name": name,
@@ -168599,7 +169007,9 @@ def export_screen_public() -> dict[str, Any] | None:
     """The order a surface may still claim, or None."""
     with _SCREEN_EXPORT_LOCK:
         row = dict(_SCREEN_EXPORT)
-    if not row or row.get("done") or row.get("claimed_by"):
+    leased = row.get("claimed_by") and (row.get("target") == "tab" or
+             time.time() - float(row.get("heartbeat_at") or row.get("claimed_at") or 0) < 120)
+    if not row or row.get("done") or leased:
         return None
     if time.time() - float(row.get("at") or 0) > SCREEN_EXPORT_LIFE:
         return None
@@ -168610,7 +169020,8 @@ def export_screen_public() -> dict[str, Any] | None:
 async def export_screen_state_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_read_auth(authorization)
     with _SCREEN_EXPORT_LOCK:
-        return {"ok": True, "order": dict(_SCREEN_EXPORT) or None}
+        row = dict(_SCREEN_EXPORT) or None
+    return {"ok": True, "order": row, "progress": export_progress()}
 
 
 @app.post("/api/export/screen/claim")
@@ -168623,15 +169034,35 @@ async def export_screen_claim_api(request: Request,
         body = {}
     rid = str((body or {}).get("id") or "")
     device = str((body or {}).get("device") or "")[:24]
+    owner = str((body or {}).get("owner") or "")[:100]
     with _SCREEN_EXPORT_LOCK:
         row = _SCREEN_EXPORT
-        fresh = time.time() - float(row.get("at") or 0) <= SCREEN_EXPORT_LIFE
-        if (not row or row.get("id") != rid or row.get("done") or row.get("claimed_by")
+        age = time.time() - float(row.get("at") or 0)
+        fresh = age <= (SCREEN_EXPORT_HOLD.get(device, SCREEN_EXPORT_LIFE) if row.get("claimed_by") or row.get("queued") else SCREEN_EXPORT_LIFE)
+        leased = row.get("claimed_by") and (device == "tab" or
+                 time.time() - float(row.get("heartbeat_at") or row.get("claimed_at") or 0) < 120)
+        if (not row or row.get("id") != rid or row.get("done") or leased
                 or not fresh or device != row.get("target")):
             return {"ok": True, "go": False}
         row["claimed_by"] = device
         row["claimed_at"] = time.time()
-        return {"ok": True, "go": True, "seconds": row["seconds"], "name": row["name"]}
+        row["heartbeat_at"] = time.time()
+        row["owner"] = owner
+        return {"ok": True, "go": True, "seconds": row["seconds"], "name": row["name"],
+                "age_ms": max(0, age * 1000)}
+
+
+@app.post("/api/export/screen/heartbeat")
+async def export_screen_heartbeat_api(request: Request,
+                                      authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    body = await request.json()
+    with _SCREEN_EXPORT_LOCK:
+        if (_SCREEN_EXPORT.get("id") != body.get("id") or not body.get("owner")
+                or _SCREEN_EXPORT.get("owner") != body.get("owner") or _SCREEN_EXPORT.get("done")):
+            return {"ok": False}
+        _SCREEN_EXPORT["heartbeat_at"] = time.time()
+    return {"ok": True}
 
 
 @app.post("/api/export/screen/done")
@@ -168646,14 +169077,24 @@ async def export_screen_done_api(request: Request,
     rid = str(body.get("id") or "")
     result = body.get("result") if isinstance(body.get("result"), dict) else {}
     with _SCREEN_EXPORT_LOCK:
+        if rid in _SCREEN_EXPORT_FINISHED:
+            return {"ok": _SCREEN_EXPORT_FINISHED[rid] == str(body.get("owner") or "")}
         if _SCREEN_EXPORT.get("id") != rid:
             return {"ok": False, "detail": "not the open order"}
+        if _SCREEN_EXPORT.get("owner") and _SCREEN_EXPORT.get("owner") != body.get("owner"):
+            return {"ok": False, "detail": "not the export owner"}
         _SCREEN_EXPORT["done"] = True
+        _SCREEN_EXPORT["done_at"] = time.time()
         _SCREEN_EXPORT["result"] = {"ok": bool(body.get("ok")),
                                     "seconds": result.get("seconds"),
+                                    "where": str(result.get("where") or ""),
+                                    "warning": str(result.get("warning") or ""),
                                     "uploaded": result.get("uploaded"),
                                     "detail": str(body.get("detail") or result.get("detail") or "")[:300]}
         row = dict(_SCREEN_EXPORT)
+        _SCREEN_EXPORT_FINISHED[rid] = str(body.get("owner") or "")
+        while len(_SCREEN_EXPORT_FINISHED) > 100:
+            _SCREEN_EXPORT_FINISHED.pop(next(iter(_SCREEN_EXPORT_FINISHED)))
     what = SCREEN_EXPORT_NAMES.get(row.get("target"), "the screen")
     if row["result"]["ok"]:
         note_action("exported %ss of %s as %s - the desk carries it to %s" % (
@@ -168661,6 +169102,10 @@ async def export_screen_done_api(request: Request,
             export_desk_dir() or "data/exports"))
     else:
         note_action("the screen export of %s did not finish: %s" % (what, row["result"]["detail"] or "no reason given"))
+    with _SCREEN_EXPORT_LOCK:
+        if _SCREEN_EXPORT.get("id") == rid and _SCREEN_EXPORT_QUEUE:
+            _SCREEN_EXPORT.clear()
+            _SCREEN_EXPORT.update(_SCREEN_EXPORT_QUEUE.pop(0))
     return {"ok": True}
 
 
@@ -178888,7 +179333,9 @@ async def debug_tasks_api(
             coro = getattr(coro, "cr_await", None) \
                 or getattr(coro, "gi_yieldfrom", None)
         rows.append({"name": task.get_name(), "stack": chain})
-    return {"count": len(rows), "tasks": rows}
+    return {"count": len(rows), "tasks": rows, "workers": _pulse_blind()[1],
+            "video_reservations": {"pending": _SFX_VIDEO_FAMILY_WORK.pending(),
+                                   "error": _SFX_VIDEO_FAMILY_WORK.error}}
 
 
 @app.get("/api/dj/plan")
@@ -180913,6 +181360,7 @@ async def _broadcast_replay(rows: list[dict[str, Any]],
         seen.add(got["key"])
         turns = [r for r in pool
                  if str(r.get("clip_media") or "") == got["key"]]
+        turns = await asyncio.to_thread(_sfx_replay_picture_rows, turns)
         turns.sort(key=lambda r: float(r.get("clip_from") or 0))
         length = max([float(r.get("clip_until") or 0) for r in turns] + [0.0])
         stream = {"length": length, "rows": [
@@ -180920,7 +181368,8 @@ async def _broadcast_replay(rows: list[dict[str, Any]],
              "name": str(r.get("name") or ""),
              "text": str(r.get("text") or "")[:400],
              "from": float(r.get("clip_from") or 0),
-             "until": float(r.get("clip_until") or 0)} for r in turns]}
+              "until": float(r.get("clip_until") or 0),
+              **_sfx_picture_metadata(r)} for r in turns]}
         did = page_feed_append({
             "url": "/media/%s?t=%s" % (got["key"], got["sig"]),
             "text": ("\u21ba " + (str(row.get("round") or "a round"))
@@ -184946,12 +185395,14 @@ def sfx_db() -> Any:
                     "ON clips(playable, video, deck_cycle)")
         con.execute("CREATE INDEX IF NOT EXISTS clips_duplicate "
                     "ON clips(video, name, bytes, seconds)")
+        con.execute("CREATE INDEX IF NOT EXISTS clips_duplicate_media "
+                    "ON clips(video, bytes, seconds)")
         con.commit()
         _SFX_DB[0] = con
         return con
 
 
-_SFX_DB_READ: list[Any] = [None]
+_SFX_DB_READ = _ThreadLocal()
 
 # #1362f: A THREAD OF ITS OWN.
 #
@@ -185013,17 +185464,18 @@ def sfx_db_reader() -> Any:
     writer commits atomically, so the worst a concurrent read can see
     is the book as it was a folder ago.
     """
-    if _SFX_DB_READ[0] is not None:
-        return _SFX_DB_READ[0]
-    with _SFX_DB_LOCK:
-        if _SFX_DB_READ[0] is not None:
-            return _SFX_DB_READ[0]
-        sfx_db()                     # the schema exists before we read
-        import sqlite3
-        con = sqlite3.connect(str(SFX_DB_PATH), check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        _SFX_DB_READ[0] = con
+    # Readers must also be separate from each other. Sharing a connection
+    # let the matcher's full-book scan park the hourly reader while it held
+    # the writer lock, stopping every video receipt and the entire runway.
+    con = getattr(_SFX_DB_READ, "connection", None)
+    if con is not None:
         return con
+    sfx_db()                         # the schema exists before we read
+    import sqlite3
+    con = sqlite3.connect(str(SFX_DB_PATH))
+    con.row_factory = sqlite3.Row
+    _SFX_DB_READ.connection = con
+    return con
 
 
 def sfx_db_folders() -> list[dict[str, Any]]:
@@ -193235,11 +193687,10 @@ def h3_hourly_fresh_clip() -> dict[str, Any]:
     random from the whole clip book."""
     try:
         con = sfx_db_reader()
-        with _SFX_DB_LOCK:
-            rows = con.execute(
-                "SELECT sid,name,seconds,folder FROM clips "
-                "WHERE playable=1 AND video=1 AND seconds >= 3 "
-                "AND length(trim(COALESCE(said,''))) >= 6").fetchall()
+        rows = con.execute(
+            "SELECT sid,name,seconds,folder FROM clips "
+            "WHERE playable=1 AND video=1 AND seconds >= 3 "
+            "AND length(trim(COALESCE(said,''))) >= 6").fetchall()
     except Exception as exc:  # noqa: BLE001
         pipeline_log("ads", "hourly H3: the clip book could not be read (%s)" % type(exc).__name__)
         return {}
@@ -197024,6 +197475,9 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         "clip_tail": round(float(entry.get("clip_tail") or 0), 3),
         "seconds": round(seconds, 2),
     }
+    # Welded SFX have their audio inside clip_media. Their separate video
+    # identity must survive the ring too, or replay becomes audio-only.
+    row.update(_sfx_picture_metadata(entry))
     # [#1222] THE CLIP'S IDENTITY OUTLIVES THE RING. A sting row carried
     # only its stem here ("95 clip"), which names a file in a dozen
     # folders; the id, the folder and the URL were on the ring row and
@@ -197112,7 +197566,8 @@ def airlog_row_hash(row: dict[str, Any]) -> str:
                 row.get(HEARD_STAMP),
                 row.get("clip_from"), row.get("clip_until"), row.get("media"),
                 row.get("round"), len(row.get("images") or []),
-                row.get("cut_why"))                          # [#1237]
+                row.get("cut_why"),                         # [#1237]
+                _sfx_picture_metadata(row))
         return hashlib.sha1(repr(bits).encode("utf-8")).hexdigest()[:16]
     except Exception:  # noqa: BLE001
         return ""
@@ -208486,7 +208941,7 @@ _EXPORT_SCREEN_RX = re.compile(
     r"\b(?:of|from|on|off)\s+(?:the\s+|my\s+|this\s+)?(?P<t>"
     r"(?:pine|kind|pint|pain|paint|pie|part|find|mind|fine)[\s-]*(?:ta[bp]|tub|time)(?:let)?|tablet|"   # [export-lead] "Pine Tap", "KindTab", "part-time"
     r"pine[\s-]*lens|pinelens|"
-    r"pine[\s-]*pip|pine\s+picture[\s-]+in[\s-]+picture|"
+    r"(?:pine|pipe)[\s-]*pip|pine\s+picture[\s-]+in[\s-]+picture|"
     r"pine\s*(?:cam(?:era)?|can)|pinecam|camera|cam|"   # [cam-export] the Pine Cam's footage
     r"(?:visual|video|picture)\s+(?:broadcast|show|radio|air)|"
     r"broadcast(?:'?s)?\s+(?:video|picture|visuals?)|"
@@ -218227,6 +218682,29 @@ async def chat_completions(
                 yield "data: " + json.dumps(chunk) + "\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(inbox_events(), media_type="text/event-stream")
+        return completion
+
+    # Explicit desktop video exports do not wait for station intent/context or
+    # model availability. Inbox dictation above still keeps its own words.
+    desktop_export = parse_export_command(llm_commands.rewrite(user_text)[0])
+    if desktop_export and desktop_export.get("screen") in ("pip", "app"):
+        answer = export_screen_request(desktop_export)
+        completion = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
+                      "created": int(time.time()), "model": "cutter",
+                      "choices": [{"index": 0, "message": {"role": "assistant", "content": answer},
+                                   "finish_reason": "stop"}],
+                      "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                      "spark_agent": {"export_command": True, "screen": desktop_export["screen"]}}
+        if incoming.get("stream"):
+            async def export_events():
+                base = {key: completion[key] for key in ("id", "created", "model")}
+                chunk = {**base, "object": "chat.completion.chunk", "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": answer}, "finish_reason": None}]}
+                yield "data: " + json.dumps(chunk) + "\n\n"
+                chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                yield "data: " + json.dumps(chunk) + "\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(export_events(), media_type="text/event-stream")
         return completion
 
     # #787: "hey DJ …" — straight to the booth: a request if the library
@@ -264334,6 +264812,10 @@ function panelReloadWatch(state) {
   const at = Number((state || {}).reload_at || 0);
   if (!at || panelBuildGoing) return;
   if (at <= panelBuildUp) return;
+  if (window.pineDesktop && window.pineDesktop.__pineKiosk) {
+    window.pinePanelUpdatePending = true;
+    return; // Reconnect without tearing down the tablet's active players.
+  }
   panelBuildGoing = true;
   setTimeout(() => { try { location.reload(); } catch (e) {} },
              800 + Math.floor(Math.random() * 4000));
@@ -264344,6 +264826,11 @@ function panelBuildWatch(state) {
   if (!build) return;
   if (!panelBuildSeen) { panelBuildSeen = build; return; }
   if (build === panelBuildSeen || panelBuildGoing) return;
+  if (window.pineDesktop && window.pineDesktop.__pineKiosk) {
+    panelBuildSeen = build;
+    window.pinePanelUpdatePending = true;
+    return; // Apply page updates when the operator explicitly reloads.
+  }
   if (Date.now() - panelBuildUp < 60000) { panelBuildSeen = build; return; }
   panelBuildGoing = true;
   setTimeout(() => { try { location.reload(); } catch (e) {} },

@@ -2764,7 +2764,11 @@
     /* #1426: an endless clip belongs to the native surface while it is
        running. Checked here as well as at the poll because a clip can
        reach this through cut() and the replay road too. */
-    if (clip && clip.endless && wallRunning()) return;
+    if (clip && clip.endless && wallRunning()) {
+      showing = false;
+      setTimeout(next, 0);
+      return;
+    }
     /* [#1214] AND NEITHER DOES ANYTHING ELSE while that surface is
        showing. #1426 covered only the endless clips; a station sting
        with a picture went out over the wall's own soundtrack, which is
@@ -3407,6 +3411,9 @@
     if (!seamOn) return false;
     var head = queue[0];
     if (!head || !head.url || !head.endless) return false;
+    // A decoded frame is not permission to play a future broadcast slot.
+    // The ordinary next() path waits for its time if a seam is too early.
+    if (missed(head) || Number(head.at || 0) > now() + 50) return false;
     if (!warm || warm.clip !== head) return false;
     try { if (warm.el && warm.el.error) return false; }
     catch (err) { return false; }
@@ -5444,8 +5451,11 @@
       var all = document.querySelectorAll('audio');
       for (var i = 0; i < all.length; i += 1) {
         var a = all[i], held = a && a.pineDeliveryClip;
-        if (!held || a.paused || a.ended) continue;
-        clock = {t: Number(a.currentTime) || 0, rows: (held.stream || {}).rows || []};
+        if (!held || a.ended) continue;
+        var heldRows = (held.stream || {}).rows || [];
+        if (!heldRows.some(function (row) { return String(row.id) === String(clip.line); })) continue;
+        clock = {t: Number(a.currentTime) || 0, rows: heldRows, paused: a.paused || a.readyState < 3};
+        if (a.paused) continue; // Prefer an active occurrence of a replayed row.
         break;
       }
       if (typeof djVoiceQueue !== 'undefined') pending = djVoiceQueue;
@@ -5457,7 +5467,7 @@
       if (String(rows[r].id) !== String(clip.line)) continue;
       var elapsed = now() - Number(clock.at || now());
       var t = Number(clock.t) + (clock.at ? Math.max(0, elapsed) / 1000 : 0);
-      return {at: now() + (Number(rows[r].from || 0) - t) * 1000, pending: false};
+      return {at: now() + (Number(rows[r].from || 0) - t) * 1000, pending: false, paused: !!clock.paused};
     }
     for (var p = 0; p < pending.length; p += 1) {
       var future = pending[p].rows || (pending[p].stream || {}).rows || [];
@@ -5500,6 +5510,19 @@
   var aborts = Object.create(null);     // url -> AbortController of its whole-file pull
   var cache = [];                       // [{url, href, bytes, at}]
   var fetching = Object.create(null);   // url -> promise; asked once only
+  var cacheEpoch = 0;
+
+  function releaseOptionalCache() {
+    cacheEpoch += 1;
+    Object.keys(aborts).forEach(function (url) { try { aborts[url].abort(); } catch (err) {} });
+    var keep = cacheHeld();
+    for (var i = cache.length - 1; i >= 0; i -= 1) {
+      if (keep[cache[i].href]) continue;
+      try { URL.revokeObjectURL(cache[i].href); } catch (err) {}
+      cache.splice(i, 1);
+    }
+  }
+  if (root.addEventListener) root.addEventListener('pine-memory-trim', releaseOptionalCache);
 
   function cacheFind(url) {
     var i;
@@ -5547,6 +5570,7 @@
     var got = cacheFind(url);
     if (got) return Promise.resolve(got.href);
     if (fetching[url]) return fetching[url];
+    var epoch = cacheEpoch;
     var ctl = null;
     try { ctl = typeof AbortController === 'function' ? new AbortController() : null; } catch (err) { ctl = null; }
     if (ctl) aborts[url] = ctl;
@@ -5559,6 +5583,7 @@
       }
       return res.blob();
     }).then(function (blob) {
+      if (epoch !== cacheEpoch) throw new Error('memory trim retired this preload');
       if (!blob || !blob.size) throw new Error('empty');
       if (blob.size > CACHE_FILE_MOST) throw new Error('too big');
       var href = URL.createObjectURL(blob);
@@ -5710,6 +5735,13 @@
     if (!mounted) return;
     var head = queue[0];
     if (!head || !head.url) return;
+    // The tablet player has its own disk cache. Waiting for a WebView
+    // blob download before starting that cache costs two full downloads
+    // and can use up the entire spoken lead-in to a short video.
+    if (head.silent_picture && nativeCueCapable && !endlessOn) {
+      warmElement(head);
+      return;
+    }
     if (warm && warm.clip === head) return;
     /* #1421: THE BYTES FIRST, THEN THE ELEMENT. A warm element pointed
        at the station is still an element that can stall halfway through
@@ -5864,6 +5896,8 @@
     if (!clip || !clip.url) return '';
     var mark = String(clip.ts || '') + '|' + String(clip.url);
     marks[mark] = 1;
+    var keys = Object.keys(marks);
+    if (keys.length > 2048) delete marks[keys[0]];
     return mark;
   }
 
@@ -5962,18 +5996,11 @@
       while (queue.length > QUEUE_ROWS_MOST) queue.pop();
       return;
     }
-    while (queue.length > QUEUE_ROWS_MOST) queue.shift();
-    var held = 0, i;
-    for (i = 0; i < queue.length; i += 1) {
-      held += Math.max(0.8, Number(queue[i].seconds) || 6);
-    }
-    /* Dropped from the FRONT, as it always was: the oldest rung clip is
-       the one whose moment has most nearly gone. Never below two rows, or
-       a seam has nothing to hand over to. */
-    while (queue.length > 2 && held > QUEUE_AHEAD_S) {
-      held -= Math.max(0.8, Number(queue[0].seconds) || 6);
-      queue.shift();
-    }
+    // The station already bounds its scheduled runway. Summing file
+    // lengths and dropping the front skipped the very next owed slot,
+    // making a seamless desktop jump ahead of the tablet. Keep air order;
+    // the row limit is only a final memory bound on the farthest future.
+    while (queue.length > QUEUE_ROWS_MOST) queue.pop();
   }
 
   function offer(clip) {
@@ -6016,6 +6043,12 @@
   var nativeCueCapable = false, nativeCueWarm = null, nativeCueActive = null;
   var nativeCuePosition = 0;
 
+  function nativeCueRect() {
+    var wide = document.body.classList.contains('pine-pip-tablet')
+      || fullWanted() || (listenUp() && listenBare());
+    return wide ? {x: 0, y: 0, w: 0, h: 0} : (nativeWallRect() || {});
+  }
+
   function nativeCuePlay(clip) {
     teardownNow(); showing = true; playing = clip;
     nativeCueActive = clip; nativeCuePosition = 0;
@@ -6023,12 +6056,13 @@
     ringRemember([clip]); warmDrop();
     var bridge = api(), sound = soundClock(clip);
     var at = sound ? sound.at : Number(clip.at || now());
-    var args = nativeWallRect() || {};
+    var args = nativeCueRect();
     args.id = clipId(clip); args.url = clip.url; args.seconds = clip.seconds; args.at = Math.round(at);
     var started = now(), first = false;
     function finish(stop) {
       if (nativeCueActive !== clip) return;
       nativeCueActive = null; nativeCueWarm = null; wallHas = false; showing = false; curtain = null;
+      if (root.PinePipTabletApi && root.PinePipPanel) root.PinePipPanel.nativePicture(null);
       if (stop) bridge.videoWall('off', {vcr: false})['catch'](function () {});
       floorRelease('tube'); playing = null; next();
     }
@@ -6036,12 +6070,17 @@
     function fallback() {
       if (nativeCueActive !== clip) return;
       nativeCueActive = null; wallHas = false; showing = true; curtain = null;
+      if (root.PinePipTabletApi && root.PinePipPanel) root.PinePipPanel.nativePicture(null);
       bridge.videoWall('off', {vcr: false})['catch'](function () {});
       clip.__webFallback = true; play(clip);
     }
     function follow() {
       if (nativeCueActive !== clip) return;
-      bridge.videoWall('state').then(function (got) {
+      var clock = soundClock(clip);
+      if (clock && !clock.pending) at = clock.at;
+      var action = clock && !clock.pending ? 'cue-sync' : 'state';
+      var sync = action === 'cue-sync' ? {id: args.id, at: Math.round(at), paused: !!clock.paused} : undefined;
+      bridge.videoWall(action, sync).then(function (got) {
         if (nativeCueActive !== clip) return;
         var st = wallState(got);
         if (!st) { fallback(); return; }
@@ -6054,7 +6093,7 @@
           else finish(false);
           return;
         }
-        if (now() > at + Number(clip.seconds || 15) * 1000 + 5000) { finish(true); return; }
+        if (!(clock && clock.paused) && now() > at + Number(clip.seconds || 15) * 1000 + 5000) { finish(true); return; }
         setTimeout(follow, 200);
       })['catch'](fallback);
     }
@@ -6065,7 +6104,10 @@
   function wallState(got) {
     if (!got) return null;
     if (typeof got === 'string') {
-      try { return JSON.parse(got); } catch (err) { return null; }
+      try { got = JSON.parse(got); } catch (err) { return null; }
+    }
+    if (root.PinePipTabletApi && root.PinePipPanel && root.PinePipPanel.nativePicture) {
+      root.PinePipPanel.nativePicture(got);
     }
     return got;
   }
@@ -6145,6 +6187,7 @@
   var UI_AREA_MIN = 20000;          /* a panel, not a button */
 
   function uiOverPicture() {
+    if (document.body.classList.contains('pine-pip-tablet')) return false;
     // Lens owns the display and pointer input while controlling a computer.
     var lens = document.getElementById('pinelens');
     if (lens && lens.classList && lens.classList.contains('open')) return true;
@@ -6157,6 +6200,9 @@
     try { kids = document.body.children; } catch (err) { return false; }
     for (var i = 0; i < kids.length; i += 1) {
       var el = kids[i];
+      // The permanent station ticker is not a dialog. Its 20px strip
+      // overlaps the default video box and otherwise hides every frame.
+      if (el.id === 'pinePulse') continue;
       var cs;
       try { cs = getComputedStyle(el); } catch (err) { continue; }
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
@@ -6305,7 +6351,7 @@
       /* Normal Listen keeps the native PIP visible. Fullscreen Listen uses
          that same hardware surface full-bleed. There is never a second
          WebView decoder trying to follow it. */
-      wide = fullWanted() || (listenUp() && listenBare());
+      wide = document.body.classList.contains('pine-pip-tablet') || fullWanted() || (listenUp() && listenBare());
       want = uiOverPicture();
     } catch (err) { return; }
     pageBackdrop(!(wallHas || (st && st.on)) || want);
@@ -6484,10 +6530,16 @@
     if (wallWant === want) return wallHas;
     wallWant = want;
     bridge.videoWall(want ? 'on' : 'off', nativeWallRect()).then(function (got) {
+      if (wallWant !== want) return;
       var state = wallState(got);
       nativeCueCapable = !!(state && state.cue_capable);
       wallHas = !!(state && state.on);
       if (wallHas) wallTakesOver();
+      if (!want && !nativeCueActive && !video) {
+        // A native endless clip has no DOM ended event to release the queue.
+        showing = false; playing = null; wallShowing = '';
+        next();
+      }
     })['catch'](function () {
       /* The bridge refused or the method is not on this build. Forget the
          ask so a later poll tries again, and keep the page's own tube. */
@@ -6923,6 +6975,10 @@
     on = !!on;
     if (on === endlessOn) return;
     endlessOn = on;
+    if (!on && playing && playing.endless && video) {
+      // Returning to speech must also stop the browser fallback soundtrack.
+      teardownNow(); playing = null;
+    }
     /* #1184: the switch can be flipped while a report is open, and which
        rule this set is under depends on it - so the report rule is
        decided again here rather than only when the report itself

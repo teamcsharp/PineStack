@@ -23,14 +23,14 @@
  * and the other does not, the difference is the WebView, and no amount of
  * dead air or silence can produce that pattern.
  *
- * TWICE, NEVER ONCE. A single failed fetch is ordinary - a stalling
+ * THREE ROUNDS, NEVER ONCE. A single failed fetch is ordinary - a stalling
  * station, a dropped packet, a request cancelled by a repaint. It takes
- * two consecutive rounds, a full interval apart, with the bridge answering
- * in both, before this will end a process the operator is watching.
+ * three consecutive rounds, a full interval apart, with the bridge answering
+ * in both, before this will request a transport repair.
  *
- * AND THE APP DECIDES, NOT THIS FILE. It asks the bridge to revive; the
- * bridge holds the rest period (five minutes) and can refuse. A page that
- * has gone wrong cannot put the terminal into a restart loop.
+ * Recovery re-probes the native connection and retries failed active media
+ * at its current position. It retains the application and page; paused
+ * previews never trigger recovery.
  */
 (function (root) {
   'use strict';
@@ -47,6 +47,9 @@
   var STRIKES = 3;           /* consecutive rounds before anything happens */
 
   var timer = null;
+  var warmup = null;
+  var looking = false;
+  var generation = 0;
   var strikes = 0;
   var last = {at: 0, bridge: null, web: null, say: 'not looked yet'};
   var reviving = false;
@@ -56,6 +59,19 @@
   /* The cheapest true thing the station will say, down each road. */
   var PROBE = '/api/dj/sections';
 
+  function probeUrl() {
+    // A desktop document is file://; its relative /api path is a disk URL.
+    // Served station panels keep their own origin for the same-road comparison.
+    if (root.location && root.location.protocol === 'file:') {
+      try {
+        if (typeof root.pineStationBase !== 'function') return null;
+        var base = String(root.pineStationBase() || '').replace(/\/$/, '');
+        return /^https?:\/\//i.test(base) ? base + PROBE : null;
+      } catch (err) { return null; }
+    }
+    return PROBE;
+  }
+
   /* Both roads are timed, because the COMPARISON is the evidence and a
      bridge that took longer than the web probe was allowed proves
      nothing at all. */
@@ -63,22 +79,44 @@
     var bridge = api();
     if (!bridge || !bridge.get) return Promise.resolve({ok: null, ms: 0});
     var t0 = Date.now();
-    return bridge.get(PROBE).then(
-      function () { return {ok: true, ms: Date.now() - t0}; },
-      function () { return {ok: false, ms: Date.now() - t0}; });
+    return new Promise(function (settle) {
+      var done = false;
+      var timeout;
+      var give = function (ok) {
+        if (done) return;
+        done = true; clearTimeout(timeout);
+        settle({ok: ok, ms: Date.now() - t0});
+      };
+      timeout = setTimeout(function () { give(false); }, PROBE_MS);
+      try { Promise.resolve(bridge.get(PROBE)).then(function () { give(true); }, function () { give(false); }); }
+      catch (err) { give(false); }
+    });
   }
 
   function viaWeb() {
     /* No cache, so a stored answer cannot stand in for a working stack.
      * The timeout matters as much as the failure: a stack that has died
      * often hangs rather than refusing. */
+    var url = probeUrl();
+    if (!url) return Promise.resolve(null);
     var done = false;
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
     return new Promise(function (settle) {
-      var give = function (ok) { if (!done) { done = true; settle(ok); } };
-      setTimeout(function () { give(false); }, PROBE_MS);
+      var timeout;
+      var give = function (ok) {
+        if (!done) { done = true; clearTimeout(timeout); settle(ok); }
+      };
+      timeout = setTimeout(function () {
+        try { if (ctl) ctl.abort(); } catch (err) {}
+        give(false);
+      }, PROBE_MS);
       try {
-        root.fetch(PROBE, {cache: 'no-store'}).then(
-          function (r) { give(!!r && r.status > 0); },
+        var fileDocument = root.location && root.location.protocol === 'file:';
+        root.fetch(url, {cache: 'no-store', mode: fileDocument ? 'no-cors' : 'same-origin',
+          signal: ctl ? ctl.signal : undefined}).then(
+          // The station API does not expose CORS headers. An opaque response
+          // from a file document still proves Chromium reached the station.
+          function (r) { give(!!r && (r.status > 0 || (fileDocument && r.type === 'opaque'))); },
           function () { give(false); });
       } catch (err) { give(false); }
     });
@@ -105,6 +143,8 @@
     catch (err) { return out; }
     for (var i = 0; i < els.length; i += 1) {
       var el = els[i];
+      // Parked previews and paused preloads are not broadcast failures.
+      if (el.paused === true) { if (stuckRounds) stuckRounds.delete(el); continue; }
       var src = '';
       try { src = el.currentSrc || el.getAttribute('src') || ''; } catch (err) { src = ''; }
       if (!src) { if (stuckRounds) stuckRounds.delete(el); continue; }
@@ -117,8 +157,10 @@
       }
       /* NETWORK_LOADING with nothing decoded yet, round after round. */
       var loading = el.networkState === 2 && el.readyState < 1;
-      var n = loading && stuckRounds ? (Number(stuckRounds.get(el) || 0) + 1) : 0;
-      if (stuckRounds) { if (loading) stuckRounds.set(el, n); else stuckRounds.delete(el); }
+      var previous = stuckRounds ? stuckRounds.get(el) : null;
+      var n = loading ? (previous && previous.src === src ? previous.rounds + 1 : 1) : 0;
+      // A new cue loading in the same reusable element starts a new observation.
+      if (stuckRounds) { if (loading) stuckRounds.set(el, {src: src, rounds: n}); else stuckRounds.delete(el); }
       if (n >= MEDIA_STUCK_ROUNDS) {
         out.stuck += 1;
         out.ids.push((el.id || el.tagName.toLowerCase()) + ':loading×' + n);
@@ -128,8 +170,11 @@
   }
 
   function look() {
-    if (reviving) return;
-    Promise.all([viaBridge(), viaWeb()]).then(function (got) {
+    if (reviving || looking) return;
+    looking = true;
+    var mine = generation;
+    return Promise.all([viaBridge(), viaWeb()]).then(function (got) {
+      if (mine !== generation) return;
       var bridge = got[0].ok;
       var bridgeMs = got[0].ms;
       var web = got[1];
@@ -142,6 +187,11 @@
       if (bridge !== true) {
         strikes = 0;
         last.say = 'the bridge is not answering either - not deafness';
+        return;
+      }
+      if (web === null) {
+        strikes = 0;
+        last.say = 'the desktop has no station URL to compare - not evidence of deafness';
         return;
       }
       var mediaDead = (media.stuck + media.errors) > 0;
@@ -175,29 +225,64 @@
         return;
       }
       reviving = true;
-      last.say = 'deaf on ' + STRIKES + ' rounds - asking to be revived';
+      last.say = 'media trouble on ' + STRIKES + ' rounds - repairing in place';
       try {
         Promise.resolve(bridgeApi.revive({
           now: true,
+          automatic: true,
           why: web
             ? ('the WebView media is dead: the bridge answers ' + PROBE
                + ' and ' + media.ids.join(', ') + ' never loads')
             : ('the WebView network is dead: the bridge answers ' + PROBE
                + ' and fetch does not')
         })).then(function (said) {
-          /* An answer at all means it declined - a revival does not
-             return, because the process is gone. */
+          if (mine !== generation) return;
+          // Native transport recovery retains the process and page. Retry
+          // only failed active elements, preserving their audible position.
+          if (said && said.ok) repairMedia();
           reviving = false;
           strikes = 0;
-          last.say = 'the app declined: '
-            + ((said && said.say) || 'no reason given');
+          last.say = (said && said.say) || 'media recovery attempted';
         }, function () {
           reviving = false;
         });
       } catch (err) {
         reviving = false;
       }
-    }, function () { /* a broken round is not evidence of anything */ });
+    }, function () { /* a broken round is not evidence of anything */ }).then(function () {
+      looking = false;
+    }, function () { looking = false; });
+  }
+
+  function repairMedia() {
+    var els = document.querySelectorAll('audio, video');
+    for (var i = 0; i < els.length; i += 1) {
+      var el = els[i], previous = stuckRounds && stuckRounds.get(el);
+      if (el.paused === true || el.ended) continue;
+      if (!(el.error && el.error.code === 2) && !(previous && previous.rounds >= MEDIA_STUCK_ROUNDS)) continue;
+      (function (player) {
+        var source = player.currentSrc || player.getAttribute('src');
+        if (!source) return;
+        var offset = Number(player.currentTime) || 0, started = Date.now();
+        var timer;
+        function done() { clearTimeout(timer); player.removeEventListener('loadedmetadata', ready); }
+        function ready() {
+          done();
+          if ((player.currentSrc || player.getAttribute('src')) !== source) return;
+          try {
+            // Pause time belongs to this same broadcast take, not a new clip.
+            player.currentTime = offset;
+            var playing = player.play();
+            if (playing && playing.catch) playing.catch(function () {});
+          } catch (err) { /* ordinary player recovery handles refusal */ }
+        }
+        if (started - Number(player.__pineMediaRetryAt || 0) < 60000) return;
+        player.__pineMediaRetryAt = started;
+        player.addEventListener('loadedmetadata', ready);
+        timer = setTimeout(done, PROBE_MS);
+        try { player.load(); } catch (err) { done(); }
+      })(el);
+    }
   }
 
   root.PineDeafWatch = {
@@ -205,12 +290,16 @@
       if (timer) return;
       /* Not immediately: a page that has just loaded is still opening
          its own connections, and a probe in that crowd proves nothing. */
-      setTimeout(look, 20000);
+      warmup = setTimeout(function () { warmup = null; look(); }, 20000);
       timer = setInterval(look, EVERY_MS);
     },
     stop: function () {
       if (timer) clearInterval(timer);
+      if (warmup) clearTimeout(warmup);
       timer = null;
+      warmup = null;
+      generation += 1;
+      strikes = 0;
     },
     /* Numbers the operator can look at rather than a claim in a comment. */
     state: function () {

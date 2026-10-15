@@ -294,6 +294,7 @@ class PinetabUpdate {
         this.ready = { apk: path.join(dir, 'pine-platform.apk') };
         this.emit('snapshot', 'copying the latest source into an isolated background build directory (attempt ' + attempt + '/3)');
         const snapshot = await this.snapshotSource(dir);
+        this.emit('check', 'source copied - verifying the network source has not changed');
         if (snapshot.stamp !== (await this.wanted(true)).stamp) {
           if (attempt === 3) throw new Error('source is still being edited - wait for the edits to finish, then tap to retry');
           this.emit('queue', 'source changed while copying - automatically queuing a fresh snapshot', 'warn');
@@ -305,6 +306,7 @@ class PinetabUpdate {
         this.emit('build', 'building the latest workspace source ' + wanted);
         if (!(await this.deploy('', 'prepare'))) throw new Error('build failed - see the console output');
         if (!exists(this.ready.apk)) throw new Error('the build did not produce the prepared APK');
+        this.emit('check', 'compiled and signed - verifying the latest source before marking ready');
         if ((await this.wanted(true)).stamp !== wanted) {
           if (attempt === 3) throw new Error('source is still changing during compilation - wait for edits to finish, then tap to retry');
           this.emit('queue', 'source changed during compilation - automatically building the newer version', 'warn');

@@ -1,4 +1,5 @@
 """Real strict-stream plumbing with prepared-only, receipt-counted punctuation."""
+import asyncio
 import copy
 import unittest
 from pathlib import Path
@@ -65,6 +66,12 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         return take
 
     async def test_every_other_host_exact_clip_order_and_separate_road_credit(self):
+        history_done = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        def history_added(*args):
+            if app.sfx_history_add.call_count >= 2:
+                loop.call_soon_threadsafe(history_done.set)
+        app.sfx_history_add.side_effect = history_added
         original = copy.deepcopy(self.takes)
         await self.play()
         self.assertEqual(self.takes, original)
@@ -93,6 +100,8 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app._sfx_cadence_audible(rows, 14)  # the same complete hardware copy
         self.assertEqual(app._SFX_CADENCE.state()['heard_units'], 4)
         self.assertEqual(app.sfx_note_play.call_count, 2)
+        # History now runs on a worker after the synchronous audible receipt.
+        await asyncio.wait_for(history_done.wait(), 5)
         self.assertEqual(app.sfx_history_add.call_count, 2)
         app.sfx_history_add.assert_called_with(self.sample, 'board')
         receipts = [call for call in app.note_activity.call_args_list
@@ -113,7 +122,12 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         await self.play()
         paths = app._call_concat_blocking.call_args.args[0]
         self.assertEqual(sum(Path(path).name == 'levelled.wav' for path in paths), 2)
+        self.assertEqual([Path(path).name for path in paths],
+                         ['take-0.wav', 'take-1.wav', 'levelled.wav',
+                          'take-2.wav', 'take-1.wav', 'levelled.wav'])
         rows = self.radio['voice_clips'][0]['stream']['rows']
+        for before, after in zip(rows, rows[1:]):
+            self.assertLessEqual(before['until'], after['from'])
         board = [row for row in rows if row['who'] == 'board']
         self.assertEqual(len(board), 2)
         self.assertTrue(all(row['sfx_video_id'] == 'scratch-id' for row in board))
@@ -122,6 +136,10 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         for call in pictures.call_args_list:
             self.assertTrue(call.args[0]['silent_picture'])
             self.assertGreater(call.kwargs['at_ms'], 0)
+        first, second = pictures.call_args_list
+        self.assertAlmostEqual(second.kwargs['at_ms'] - first.kwargs['at_ms'],
+                               (board[1]['from'] - board[0]['from']) * 1000,
+                               delta=1)
 
     async def test_prepared_guy_keeps_own_voice_and_commits_only_audible_completion(self):
         take = self.bank_take()

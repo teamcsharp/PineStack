@@ -133,7 +133,8 @@ function run(exe, args, timeoutMs, onProgress) {
  * usually two lines above a wall of frame counters. */
 function lastReal(text) {
   const lines = String(text || '').split('\n').map((l) => l.trim())
-    .filter((l) => l && !/^(frame|size|video:|Press \[q\])/.test(l));
+    .filter((l) => l && !/^(frame|size|video:|Press \[q\])/.test(l)
+      && !/^(?:fps|stream_\d+_\d+_q|bitrate|total_size|out_time(?:_us|_ms)?|dup_frames|drop_frames|speed|progress)=/.test(l));
   /* SIX LINES, NOT TWO. ffmpeg's closing complaint is usually a symptom -
    * "at least one of its streams received no packets" - while the sentence
    * that says WHY sits several lines above it. Two lines was enough to know

@@ -123,6 +123,14 @@ class StationClient(private val configStore: ConfigStore) {
         .retryOnConnectionFailure(false)
         .build()
 
+    // A conversation cue has one matching picture; a different cached clip
+    // cannot replace it. The station has measured stalls beyond six seconds.
+    // Let its background download finish, with a finite overall deadline.
+    private val cueMedia: OkHttpClient = media.newBuilder()
+        .readTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(45, TimeUnit.SECONDS)
+        .build()
+
     /* THE SLOW ROADS GET THEIR OWN CLIENT.
      *
      * Twenty seconds is right for /api/dj and wrong for anything that
@@ -365,6 +373,21 @@ class StationClient(private val configStore: ConfigStore) {
     /** A bounded fetch for optional playback media with an offline fallback. */
     suspend fun getMediaBytes(route: String): Pair<ByteArray, String> {
         return getBytesWith(route, media)
+    }
+
+    /** Download to a temporary disk file without materializing the clip in RAM. */
+    suspend fun downloadMedia(route: String, target: File, limit: Long, cue: Boolean = false): Long = withContext(Dispatchers.IO) {
+        val cfg = configStore.read()
+        val url = if (route.startsWith("http")) route else Reach.base(cfg) + "/" + route.trimStart('/')
+        val request = Request.Builder().url(url).get()
+        if (cfg.apiKey.isNotBlank()) request.header("Authorization", "Bearer " + cfg.apiKey)
+        (if (cue) cueMedia else media).newCall(request.build()).execute().use { answer ->
+            if (!answer.isSuccessful) throw StationException(answer.code, "the station said ${answer.code}")
+            val body = answer.body ?: throw IOException("no clip came back")
+            target.outputStream().use { output ->
+                body.byteStream().use { input -> BoundedMediaCopy.copy(input, output, limit, body.contentLength()) }
+            }
+        }
     }
 
     /** A bounded JSON read used by the native video's replenishment loop. */

@@ -72,6 +72,11 @@ function replay(rows) {
     'QUEUE_ROWS_MOST', 'QUEUE_AHEAD_S'];
   const glue = `
     var queue = state.queue;
+    // These recorded-ring fixtures have no native bridge or audible clock;
+    // exercise the scheduler's station-clock fallback without preroll.
+    var root = {}, nativeCueCapable = false;
+    function soundClock() { return null; }
+    function avsyncAt() { return 0; }
     var reportUp = false, endlessOn = false, mounted = true;
     Object.defineProperty(state, 'showing', {get: function () { return showing; },
       set: function (v) { showing = v; }});
@@ -178,7 +183,7 @@ test('replay 2: a clip stuck on its last frame does not cost the pictures after 
 });
 
 test('a silent picture is joined where its sound is, a sting is not', () => {
-  const body = fn('airInto');
+  const body = 'function soundClock() { return null; }\n' + fn('airInto');
   // eslint-disable-next-line no-new-func
   const airInto = new Function('now', body + '\nreturn airInto;')(() => 10000);
   assert.equal(airInto({at: 6000, silent_picture: true, seconds: 8}), 4,
@@ -189,7 +194,7 @@ test('a silent picture is joined where its sound is, a sting is not', () => {
 });
 
 test('a silent picture is late only once its sound has run', () => {
-  const body = fn('missed');
+  const body = 'function soundClock() { return null; }\n' + fn('missed');
   // eslint-disable-next-line no-new-func
   const missed = new Function('now', 'LATE', 'SILENT_TAIL', body + '\nreturn missed;')(
     () => 20000, num('LATE'), num('SILENT_TAIL', 0));

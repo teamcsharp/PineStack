@@ -31,13 +31,13 @@ const send = (target, id, kind = 'poll') => receive({ kind, station: {
   send('tab', 'tablet'); await flush(); assert.equal(claimCalls, 0);
   send('pip', 'pip', 'join'); send('pip', 'pip'); await flush();
   assert.equal(claimCalls, 1); assert.equal(cuts.length, 1);
-  assert.equal(cuts[0].view, 'pip'); assert.equal(cuts[0].require_audio, true);
+  assert.equal(cuts[0].view, 'pip'); assert.equal(cuts[0].require_audio, false);
   assert.equal(cuts[0].upload, true); assert.equal(reports[0].device, 'pip'); assert.equal(reports[0].ok, true);
-  const bar = elements.get('pineExportBar'); assert.equal(bar.hidden, false); assert.equal(bar['aria-valuenow'], '45');
+  const bar = elements.get('pineExportBar'); assert.equal(bar.hidden, false); assert.equal(bar['aria-valuenow'], '2');
   send('pip', 'pip'); await flush(); assert.equal(cuts.length, 1);
   send('tab', 'tablet'); assert.equal(bar.hidden, true);
   retry = true; send('app', 'app'); await flush(); send('app', 'app'); await flush();
-  assert.equal(cuts[1].view, 'app'); assert.equal(cuts[1].require_audio, true); assert.equal(reports[1].device, 'app');
+  assert.equal(cuts[1].view, 'app'); assert.equal(cuts[1].require_audio, false); assert.equal(reports[1].device, 'app');
   receive({ kind: 'poll', station: {} }); assert.equal(bar.hidden, true);
   // Run the actual remote-panel painter: a tablet sees only tablet cuts.
   const app = fs.readFileSync(path.join(root, 'app.py'), 'utf8');

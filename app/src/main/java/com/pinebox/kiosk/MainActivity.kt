@@ -99,7 +99,6 @@ class MainActivity : AppCompatActivity() {
         if (!::webView.isInitialized) return
         runCatching {
             webView.evaluateJavascript("window.PineMemory&&window.PineMemory.trim($level)", null)
-            webView.clearCache(false)
         }
         android.util.Log.i("PineMemory", "onTrimMemory $level -> the page lets its loops go")
     }
@@ -896,6 +895,16 @@ class MainActivity : AppCompatActivity() {
         retryScheduled = false
     }
 
+    /** Automatic transport recovery keeps the activity and its players alive. */
+    fun recoverMediaConnection(why: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            Log.w(TAG, "media recovery in place: $why")
+            webView.resumeTimers()
+            roadChanged("media recovery")
+        }
+    }
+
     override fun onDestroy() {
         if (live === this) live = null                       // #1182T
         timerGuard?.let { webView.removeCallbacks(it) }      // #1241
@@ -1048,8 +1057,7 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = PanelClient()
         webView.webChromeClient = PanelChrome()
-        // A renderer can stay alive while ignoring input. Give a transient
-        // stall ten seconds to recover, then use PanelClient's rebuild path.
+        // Busy is not dead: a short stall must not destroy audible playback.
         webView.setWebViewRenderProcessClient(object : WebViewRenderProcessClient() {
             private var recovery: Runnable? = null
 
@@ -1058,11 +1066,12 @@ class MainActivity : AppCompatActivity() {
                 val retry = Runnable {
                     recovery = null
                     if (isFinishing || isDestroyed) return@Runnable
-                    Log.e(TAG, "panel renderer is ignoring input; rebuilding")
-                    if (renderer?.terminate() != true) recreate()
+                    Log.w(TAG, "panel renderer delayed; releasing optional work without restarting")
+                    view.resumeTimers()
+                    view.evaluateJavascript("window.PineMemory&&PineMemory.trim(15)", null)
                 }
                 recovery = retry
-                view.postDelayed(retry, 10_000)
+                view.postDelayed(retry, 30_000)
             }
 
             override fun onRenderProcessResponsive(view: WebView, renderer: WebViewRenderProcess?) {
@@ -1387,6 +1396,9 @@ class MainActivity : AppCompatActivity() {
             val js = ("try{window.PineSfxTv&&PineSfxTv.releaseHold&&"
                 + "PineSfxTv.releaseHold()}catch(e){}")
             webView.post { webView.evaluateJavascript(js, null) }
+        }
+        wall.onPipBackground = { on ->
+            webView.setBackgroundColor(if (on) android.graphics.Color.TRANSPARENT else 0xFF0B0F0C.toInt())
         }
         videoWall = wall
         bridge.videoWall = wall
@@ -1774,8 +1786,39 @@ class MainActivity : AppCompatActivity() {
             request: WebResourceRequest,
         ): WebResourceResponse? = PineNet.intercept(request)
 
+        private var pageGeneration = 0
+        private var viewsInstalled = false
+
+        private fun installPageViews(view: WebView) {
+            if (viewsInstalled || mainFrameFailed || isFinishing || isDestroyed) return
+            viewsInstalled = true
+            view.evaluateJavascript(WIDTH_GUARD, null)
+            SamplerAssets.install(this@MainActivity, view)
+            ViewAssets.install(this@MainActivity, view)
+            hideStatus()
+        }
+
+        override fun onPageCommitVisible(view: WebView, url: String) {
+            super.onPageCommitVisible(view, url)
+            if (!url.startsWith("http")) return
+            val generation = pageGeneration
+            fun ready() {
+                if (generation != pageGeneration || viewsInstalled || mainFrameFailed || isFinishing || isDestroyed) return
+                // Wait for inline scripts, not gallery images or poster requests.
+                view.evaluateJavascript("document.readyState !== 'loading' && !!document.body") { got ->
+                    if (generation != pageGeneration) return@evaluateJavascript
+                    if (got == "true") installPageViews(view)
+                    else view.postDelayed({ ready() }, 250L)
+                }
+            }
+            ready()
+        }
+
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             super.onPageStarted(view, url, favicon)
+            videoWall?.pipBackground(false)
+            pageGeneration++
+            viewsInstalled = false
             mainFrameFailed = false
             pendingShim?.let { view.evaluateJavascript(it, null) }
         }
@@ -1826,11 +1869,11 @@ class MainActivity : AppCompatActivity() {
              * subscription live but unreachable - a leaked poller against a
              * station with a documented history of being starved by chatty
              * clients. */
-            SamplerAssets.install(this@MainActivity, webView)
+            installPageViews(view)
             /* AFTER the sampler, on purpose. rail.js adopts the sampler's
              * existing host and edge handle rather than building a second
              * one, so the sampler must already have scaffolded itself. */
-            ViewAssets.install(this@MainActivity, webView)
+            // Already installed together by installPageViews.
 
             /* THE HOT CORNERS, TOLD RATHER THAN ASKED. hot-corners.js is in
              * the bundle above; the moment it is, the page gets the

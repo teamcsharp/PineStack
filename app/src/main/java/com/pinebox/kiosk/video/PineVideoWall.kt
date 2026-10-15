@@ -31,6 +31,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -79,11 +81,9 @@ import kotlin.math.roundToInt
  * can wait on the network. At a median 0.60 MB that costs nothing and
  * removes the entire class of fault.
  *
- * IT DOES NOT CHASE THE STATION'S CLOCK. #1173 put a clip's position
- * under a station clock so two surfaces would show the same frame, and
- * #1421 had to bound it because holding a clip there re-seeked it
- * mid-picture. A wall whose whole job is to be perpetual has no business
- * seeking.
+ * Scheduled clips join the station clock once per slot, then correct
+ * small drift through playback rate. Local cache continuity is reserved
+ * for connection failures, so a healthy tablet follows the desktop plan.
  *
  * AND IT DOES NOT EAT TOUCHES. It lies over the WebView and the operator
  * reaches the panel through it. The page's own CRT set is not just a
@@ -100,7 +100,8 @@ class PineVideoWall(
     /* [#1212] `seconds` is the clip's own measured length off the ring, so the
      * pump can keep a runway measured in PICTURE rather than in rows. 0 means
      * the station did not say, and secondsOf() falls back to the floor. */
-    private data class Clip(val id: String, val file: File, val seconds: Double = 0.0)
+    private data class Clip(val id: String, val file: File, val seconds: Double = 0.0,
+                            val broadcastAt: Long = 0L)
 
     /* THE one surface. Media-overlay so it sits over the WebView and
      * under this app's own chrome. */
@@ -114,6 +115,14 @@ class PineVideoWall(
     private var cueJoined = false
     @Volatile private var preparedCueId = ""
     private var cueFixedAt = 0L
+    private var cueClockHeld = false
+    private val cacheDownload = Mutex()
+    private var joinedBroadcast = ""
+    private var readyBroadcast = ""
+    private var broadcastSeekAt = 0L
+    @Volatile private var broadcastDrift = 0L
+    @Volatile private var broadcastStart = 0L
+    @Volatile private var lastRingOk = 0L
     private val running = AtomicBoolean(false)
     /** The page's requested veil. A menu has its own temporary compositor
      *  retirement and must not overwrite this ownership state. */
@@ -237,7 +246,7 @@ class PineVideoWall(
     private val watchdog = object : Runnable {
         override fun run() {
             try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
-            if (running.get()) postDelayed(this, if (cueOnly) 200L else WATCH_MS)
+            if (running.get()) postDelayed(this, if (cueOnly || lastRingOk > 0L) 200L else WATCH_MS)
         }
     }
 
@@ -291,6 +300,7 @@ class PineVideoWall(
      * was never meant for whatever the box happens to be lying over.
      */
     fun observeTouch(press: android.view.MotionEvent): Boolean {
+        if (pipBackground) return false
         if (!running.get() || veiled || menuHidden || visibility != View.VISIBLE) {
             removeCallbacks(longPressTrigger)
             trackingTap = false
@@ -445,7 +455,7 @@ class PineVideoWall(
         scope.launch {
             val file = withContext(Dispatchers.IO) {
                 val base = client.config().base.trimEnd('/')
-                pull(if (url.startsWith("http://") || url.startsWith("https://")) url else "$base/${url.trimStart('/')}", id)?.let { cueFile(it, id) }
+                pull(if (url.startsWith("http://") || url.startsWith("https://")) url else "$base/${url.trimStart('/')}", id, cue = true)?.let { cueFile(it, id) }
             }
             if (generation != cueGeneration) return@launch
             if (warm) {
@@ -469,7 +479,7 @@ class PineVideoWall(
             onMain {
                 if (generation != cueGeneration) return@onMain
                 cuePending = false; cueOnly = true; cueAt = at
-                cueJoined = false; cueFixedAt = 0L
+                cueJoined = false; cueFixedAt = 0L; cueClockHeld = false
                 running.set(true)
                 veiled = false; held = false; menuHidden = false
                 pump?.cancel(); pump = null
@@ -503,6 +513,20 @@ class PineVideoWall(
      * not torn down, so coming back is a change of visibility and not a
      * rebuild.
      */
+    @Volatile var pipBackground = false
+        private set
+    var onPipBackground: ((Boolean) -> Unit)? = null
+
+    /** Keep the same player and clock, with HTML widgets above its surface. */
+    fun pipBackground(on: Boolean) {
+        onMain {
+            pipBackground = on
+            translationZ = if (on) -1f else 0f
+            onPipBackground?.invoke(on)
+            if (on) { showFullScreen(); veil(false, false) }
+        }
+    }
+
     fun veil(on: Boolean, vcr: Boolean = true) {
         veiled = on
         onMain { if (!vcr) refreshVisibility() else if (on) vcrGone() else vcrShow() }   // [vcrfx]
@@ -656,6 +680,7 @@ class PineVideoWall(
         .put("w", width)
         .put("h", height)
         .put("veiled", veiled)
+        .put("pip_background", pipBackground)
         .put("vcr", VcrFx.phase(this))                      // [vcrfx] "in", "out" or ""
         .put("queued", aheadCount())
         .put("queued_s", aheadMs() / 1000.0)                // [#1212]
@@ -671,6 +696,8 @@ class PineVideoWall(
         .put("index", atIndex)
         .put("count", atCount)
         .put("position_ms", atPos)
+        .put("broadcast_at_ms", broadcastStart)
+        .put("broadcast_drift_ms", broadcastDrift)
         .put("duration_ms", atDuration)
         .put("still_s", if (stillSince > 0L) (android.os.SystemClock.elapsedRealtime() - stillSince) / 1000.0 else 0.0)
         .put("kicks", kicks)
@@ -809,6 +836,15 @@ class PineVideoWall(
         refreshVisibility()
     }
 
+    /** The audible browser clock can stop or move after the initial join. */
+    fun syncCue(id: String, at: Long, paused: Boolean) = onMain {
+        if (!cueOnly || !running.get() || showing != id || at <= 0L) return@onMain
+        cueAt = at
+        cueClockHeld = paused
+        if (paused) player?.pause()
+        else if (cueJoined && !held) player?.playWhenReady = true
+    }
+
     private fun cueReady(p: ExoPlayer) {
         if (cueJoined) return
         cueJoined = true
@@ -817,7 +853,7 @@ class PineVideoWall(
             if (generation == cueGeneration && cueOnly && player === p) {
                 val offset = (System.currentTimeMillis() - cueAt).coerceAtLeast(0L)
                 if (offset > 80L) p.seekTo(offset)
-                p.playWhenReady = true
+                p.playWhenReady = !cueClockHeld
                 cueFixedAt = System.currentTimeMillis()
             }
         }, (cueAt - System.currentTimeMillis()).coerceAtLeast(0L))
@@ -835,15 +871,22 @@ class PineVideoWall(
             seenCount(p)
             if (p.playbackState == Player.STATE_ENDED) { stop(false); return }
             val clock = System.currentTimeMillis()
-            if (clock > cueAt + ((listed.firstOrNull()?.seconds ?: 15.0) * 1000).toLong() + 200L) { stop(false); return }
-            if (!held && cueJoined && p.isPlaying) {
+            if (!cueClockHeld && clock > cueAt + ((listed.firstOrNull()?.seconds ?: 15.0) * 1000).toLong() + 200L) { stop(false); return }
+            if (!held && !cueClockHeld && cueJoined && p.isPlaying) {
                 val expected = (clock - cueAt).coerceAtLeast(0L)
                 val difference = expected - p.currentPosition
+                // Rate correction cannot recover seconds of drift in a short
+                // clip after buffering. Seek once, with a cooldown for decode.
+                if (kotlin.math.abs(difference) > 800L && clock - cueFixedAt > 2000L) {
+                    p.seekTo(expected)
+                    cueFixedAt = clock
+                }
                 val speed = if (difference > 100L) 1.15f else if (difference < -100L) 0.9f else 1f
                 if (p.playbackParameters.speed != speed) p.playbackParameters = PlaybackParameters(speed)
             }
             return
         }
+        syncBroadcast(p)
         val now = android.os.SystemClock.elapsedRealtime()
         /* A held wall is standing still ON PURPOSE, but not indefinitely.
          * The main-thread watchdog owns this deadline because WebView timers
@@ -871,6 +914,10 @@ class PineVideoWall(
         val moved = idx != atIndex || pos != atPos
         atIndex = idx
         atPos = pos
+        if ((listed.getOrNull(idx)?.broadcastAt ?: 0L) > System.currentTimeMillis()) {
+            stillSince = now
+            return // a future broadcast slot is not a stalled decoder
+        }
         if (moved || stillSince == 0L) { stillSince = now; return }
         val still = now - stillSince
         val ahead = (p.mediaItemCount - idx - 1).coerceAtLeast(0)
@@ -1014,12 +1061,13 @@ class PineVideoWall(
                  * edits the timeline while the player is moving across it.
                  * Posted, it lands after the hand-over has settled and the
                  * picture never stops. */
-                post { trimBehind(p) }
+                post { if (player === p) { trimBehind(p); syncBroadcast(p) } }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
                 playback = stateName(state)  // #1440
                 if (cueOnly && state == Player.STATE_READY && !cueJoined) cueReady(p)
+                if (!cueOnly && state == Player.STATE_READY) syncBroadcast(p)
                 Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
             }
 
@@ -1034,6 +1082,7 @@ class PineVideoWall(
             override fun onRenderedFirstFrame() {
                 firstFrameAt = System.currentTimeMillis()
                 firstFrameId = listed.getOrNull(p.currentMediaItemIndex)?.id ?: showing
+                if (!cueOnly) syncBroadcast(p)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -1089,8 +1138,13 @@ class PineVideoWall(
             val p = player ?: return@onMain
             try {
                 if (listed.any { it.id == clip.id }) return@onMain
-                p.addMediaItem(MediaItem.fromUri(Uri.fromFile(clip.file)))
                 listed.add(clip)
+                try {
+                    p.addMediaItem(MediaItem.fromUri(Uri.fromFile(clip.file)))
+                } catch (err: Throwable) {
+                    listed.remove(clip)
+                    throw err
+                }
                 made += 1
                 if (showing.isEmpty()) {
                     showing = listed.getOrNull(p.currentMediaItemIndex)?.id ?: clip.id
@@ -1104,9 +1158,53 @@ class PineVideoWall(
                     p.playWhenReady = true
                 }
                 retally()                                   // [#1212]
+                syncBroadcast(p)
             } catch (err: Throwable) {
                 Log.w(TAG, "offer ${clip.id}: ${err.message}")
             }
+        }
+    }
+
+    /** Join the station's current slot, including after buffering or a menu.
+     * A local continuity clip must yield when a scheduled picture arrives.
+     * Correct on joining and after a substantial stall. Small differences
+     * use rate correction; seeks are bounded so buffering can settle. */
+    private fun syncBroadcast(p: ExoPlayer) {
+        if (cueOnly || held || !running.get()) return
+        val now = System.currentTimeMillis()
+        val due = listed.indexOfLast { it.broadcastAt > 0L && it.broadcastAt <= now
+            && now < it.broadcastAt + (it.seconds * 1000).toLong() }
+        if (due >= 0) {
+            val expected = (now - listed[due].broadcastAt).coerceAtLeast(0L)
+            val key = "${listed[due].id}|${listed[due].broadcastAt}"
+            val drift = expected - p.currentPosition
+            // The initial seek can happen while the decoder is buffering.
+            // Rejoin once it becomes ready, including that startup time.
+            val firstReady = p.currentMediaItemIndex == due &&
+                p.playbackState == Player.STATE_READY && firstFrameId == listed[due].id &&
+                readyBroadcast != key
+            if (firstReady) readyBroadcast = key
+            broadcastStart = listed[due].broadcastAt
+            broadcastDrift = drift
+            if (p.currentMediaItemIndex != due || joinedBroadcast != key || firstReady ||
+                (p.playbackState == Player.STATE_READY && kotlin.math.abs(drift) > 1000L &&
+                    now - broadcastSeekAt >= 4000L)) {
+                joinedBroadcast = key
+                if (p.currentMediaItemIndex != due || kotlin.math.abs(drift) > 150L) {
+                    broadcastSeekAt = now
+                    p.seekTo(due, expected)
+                }
+            }
+            val residual = expected - p.currentPosition
+            val speed = if (residual > 150L) 1.05f else if (residual < -150L) 0.95f else 1f
+            if (p.playbackParameters.speed != speed) p.playbackParameters = PlaybackParameters(speed)
+            p.playWhenReady = true
+        } else {
+            broadcastDrift = 0L
+            broadcastStart = 0L
+            val current = listed.getOrNull(p.currentMediaItemIndex) ?: return
+            if (current.broadcastAt > now) p.playWhenReady = false
+            if (p.playbackParameters.speed != 1f) p.playbackParameters = PlaybackParameters(1f)
         }
     }
 
@@ -1298,7 +1396,11 @@ class PineVideoWall(
                         launchFresh()
                         delay(120)          // let the main thread's tally land
                     } else {
-                        val cached = withContext(Dispatchers.IO) { fromLarder() }
+                        // A healthy ring with no new slot is not an outage.
+                        // Filling that gap with local clips creates a second,
+                        // unrelated schedule and delays the next broadcast.
+                        val cached = if (System.currentTimeMillis() - lastRingOk > 5000L)
+                            withContext(Dispatchers.IO) { fromLarder() } else null
                         /* [pin-takeover] a pinned folder repeats before anything
                          * from outside it plays */
                         val again = if (cached == null && pinPath.isNotEmpty()) nextRingClip(repeat = true) else null
@@ -1392,6 +1494,9 @@ class PineVideoWall(
             return@withContext null
         }
         val root = JSONObject(text)
+        lastRingOk = System.currentTimeMillis()
+        val serverMs = root.optLong("server_ms", System.currentTimeMillis())
+        val localMs = System.currentTimeMillis()
         readPin(root)                                          // [pin-takeover]
         val rows = root.optJSONArray("clips")
         if (rows != null) {
@@ -1404,13 +1509,27 @@ class PineVideoWall(
                 if (!pinAllows(id)) continue                       // [pin-takeover]
                 if ((!repeat && rung.contains(id)) || listed.any { it.id == id }) continue
                 val secs = row.optDouble("length", row.optDouble("seconds", 0.0))
-                val file = pull(base + url, id)
+                val broadcastAt = row.optLong("broadcast_ms", 0L).let {
+                    if (it > 0L && !repeat) localMs + it - serverMs else 0L
+                }
+                if (broadcastAt > 0L && secs > 0.0
+                    && broadcastAt + (secs * 1000).toLong() <= localMs) continue
+                val file = pull(base + url, id)?.let {
+                    // The server's fragmented MP4s have no seek index. The
+                    // same lossless remux used for silent cues makes a clock
+                    // join land at its requested position instead of zero.
+                    if (broadcastAt > 0L) cueFile(it, id) else it
+                }
                 /* Remembered either way: a clip the station cannot give us
                  * is as finished with as one that played, and leaving a
                  * failure eligible meant picking the same dead id for ever. */
                 remember(id)
                 if (file == null) continue
-                return@withContext Clip(id, file, secs)     // [#1212]
+                // A slow download must not start a slot the station has
+                // already finished; the next poll joins the current one.
+                if (broadcastAt > 0L && secs > 0.0 &&
+                    broadcastAt + (secs * 1000).toLong() <= System.currentTimeMillis()) continue
+                return@withContext Clip(id, file, secs, broadcastAt)
             }
         }
         null
@@ -1431,6 +1550,7 @@ class PineVideoWall(
         val held = try {
             den.listFiles()?.filter {
                 it.isFile && it.length() > MIN_BYTES && it.name.endsWith(".mp4")
+                    && !it.name.endsWith(".cue.mp4")
                     && pinAllows(it.nameWithoutExtension, larder = true)   // [pin-takeover]
                     && it.nameWithoutExtension != now
                     && !rung.contains(it.nameWithoutExtension)
@@ -1505,20 +1625,23 @@ class PineVideoWall(
      * The clip, WHOLE, on local disk. Once this returns, nothing about
      * playing it can touch the network.
      */
-    private suspend fun pull(url: String, id: String): File? {
+    private suspend fun pull(url: String, id: String, cue: Boolean = false): File? = cacheDownload.withLock {
         val out = File(den, "$id.mp4")
-        if (out.isFile && out.length() > MIN_BYTES) return out
-        return try {
-            val bytes = client.getMediaBytes(url).first
-            if (bytes.size < MIN_BYTES) return null
-            val part = File.createTempFile("$id-", ".part", den)
-            part.writeBytes(bytes)
-            if (!part.renameTo(out)) { part.delete(); return null }
+        if (out.isFile && out.length() > MIN_BYTES) {
+            out.setLastModified(System.currentTimeMillis())
+            return@withLock out
+        }
+        val part = File.createTempFile("$id-", ".part", den)
+        try {
+            if (client.downloadMedia(url, part, 256L * 1024 * 1024, cue) < MIN_BYTES) return@withLock null
+            if (!part.renameTo(out)) return@withLock null
             sweepCache()
             out
         } catch (err: Throwable) {
             Log.w(TAG, "pull $id: ${err.message}")
             null
+        } finally {
+            part.delete()
         }
     }
 
@@ -1526,7 +1649,10 @@ class PineVideoWall(
      * Rebuild only their container once, on the cache thread, without decoding. */
     @Synchronized private fun cueFile(source: File, id: String): File? {
         val out = File(den, "$id.cue.mp4")
-        if (out.isFile && out.length() > MIN_BYTES) return out
+        if (out.isFile && out.length() > MIN_BYTES) {
+            out.setLastModified(System.currentTimeMillis())
+            return out
+        }
         val part = File.createTempFile("$id-cue-", ".part", den)
         val extractor = MediaExtractor()
         var muxer: MediaMuxer? = null
@@ -1545,6 +1671,7 @@ class PineVideoWall(
             val info = MediaCodec.BufferInfo()
             while (extractor.sampleTrackIndex >= 0) {
                 val size = extractor.sampleSize
+                if (size > 16L * 1024 * 1024) throw java.io.IOException("video sample exceeds decoder budget")
                 if (size > buffer.capacity()) buffer = ByteBuffer.allocateDirect(size.toInt())
                 buffer.clear()
                 val count = extractor.readSampleData(buffer, 0)
@@ -1570,14 +1697,15 @@ class PineVideoWall(
 
     /** Bounded by count AND bytes; a cache dir nothing prunes is a full disk. */
     private fun sweepCache() {
-        val files = den.listFiles()?.filter { it.isFile } ?: return
+        val files = den.listFiles()?.filter { it.isFile && it.extension == "mp4" } ?: return
         var bytes = files.sumOf { it.length() }
         var n = files.size
         for (f in files.sortedBy { it.lastModified() }) {
             if (n <= CACHE_MOST && bytes <= CACHE_BYTES) break
             /* Never the clip on the tube, nor one already in the playlist. */
-            if (f.nameWithoutExtension == showing) continue
-            if (listed.any { it.id == f.nameWithoutExtension }) continue
+            val clipId = f.name.removeSuffix(".mp4").removeSuffix(".cue")
+            if (clipId == showing || clipId == preparedCueId) continue
+            if (listed.any { it.id == clipId }) continue
             bytes -= f.length()
             n -= 1
             try { f.delete() } catch (err: Throwable) { }

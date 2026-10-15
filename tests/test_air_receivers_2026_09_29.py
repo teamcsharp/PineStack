@@ -106,7 +106,7 @@ def build():
           "pipeline_log": lambda *a, **k: None}
     receipts = []
     ns["_acknowledge_delivery_lines"] = (
-        lambda did, clip, pos, interval: receipts.append(did) or True)
+        lambda did, clip, pos, interval, **kwargs: receipts.append(did) or True)
 
     def load_settings():
         return {k: (dict(v) if isinstance(v, dict) else v)

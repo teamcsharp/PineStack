@@ -16,7 +16,7 @@
     defaults: { symbols: 320, pine: .28, bloom: .7, intensity: 1 },
     create(ctx) {
       const { THREE } = ctx; let scene, camera, field, mesh, material, n = 0, items = [], extent = { x: 8, y: 4.5 }, half = { x: 8, y: 4.5 };
-      let lastBeat = 0, burstLeft = 0, dummy, glyphAttr, sizeAttr, heatAttr, stream = [], pulse, clock = 0;
+      let lastBeat = 0, burstBeat = -1, burstLeft = 0, dummy, glyphAttr, sizeAttr, heatAttr, stream = [], pulse, clock = 0;
       const DIST = 12, SEG = 160, KINDS = 5;   /* 0 ring, 1 square, 2 cross, 3 triangle, 4 the Pine Box mark */
 
       /* ---- the field: near black, a blue haze low on the left where the stream rises */
@@ -213,7 +213,7 @@
           if (s.beat > .5 && s.beatCount !== lastBeat) { lastBeat = s.beatCount; pulse.push(1.4 * s.beat); }
           pulse.step(dt);
           let burst = false;
-          if (s.beat > .78 && burstLeft <= 0 && s.beatCount !== (update.burstBeat || -1)) { burst = true; burstLeft = .6; update.burstBeat = s.beatCount; }
+          if (s.beat > .78 && burstLeft <= 0 && s.beatCount !== burstBeat) { burst = true; burstLeft = .6; burstBeat = s.beatCount; }
           burstLeft -= dt;
           let thrown = 0;
           const gain = (ctx.preset.intensity || 1);

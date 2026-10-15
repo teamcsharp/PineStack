@@ -7,6 +7,26 @@ const path = require('node:path');
 const clipMux = require('../desktop/clip-mux.cjs');
 const { ScreenRing, HOLD_MAX_BYTES } = require('../desktop/screen-ring.cjs');
 
+test('real oversized Chromium frames export at PiP geometry with their captured sound', {skip:!clipMux.findFfmpeg().found}, async()=>{
+  const folder=clipMux.stash(), ring=new ScreenRing(), tool=clipMux.findFfmpeg().path;
+  let made;
+  try {
+    const video=path.join(folder,'picture.webm'), audio=path.join(folder,'audio.webm');
+    await clipMux.run(tool,['-v','error','-nostdin','-y','-f','lavfi','-i','testsrc2=size=640x360:rate=30',
+      '-t','2','-c:v','libvpx','-deadline','realtime',video]);
+    await clipMux.run(tool,['-v','error','-nostdin','-y','-f','lavfi','-i','sine=frequency=1000:sample_rate=48000',
+      '-t','2','-c:a','libopus',audio]);
+    const at=Date.now()-2000;
+    ring.take(fs.readFileSync(video),{at,ms:2000,w:320,h:180,fps:30,view:'pip'});
+    ring.take(fs.readFileSync(audio),{at,ms:2000,kind:'a',a:true,audio_complete:true});
+    made=await ring.cut({seconds:2,view:'pip',end_at:at+2000},{encoder:'cpu',onProgress:()=>{}});
+    assert.equal(made.ok,true,made.detail); assert.equal(made.seconds,2);
+    assert.equal(made.audio.present,true); assert.equal(made.w,320); assert.equal(made.h,180);
+    const decoded=await clipMux.run(tool,['-hide_banner','-nostdin','-i',made.out,'-f','null','-']);
+    assert.match(decoded,/Video: h264.*320x180/); assert.match(decoded,/Audio: aac/);
+  } finally {if(made?.dir)clipMux.forget(made.dir);ring.forget();clipMux.forget(folder);}
+});
+
 function seeded({ sizes = [[321,181],[321,183],[321,181]], audioShift = 120 } = {}) {
   const ring = new ScreenRing();
   const at = Date.now() - sizes.length * 2000;
@@ -41,7 +61,8 @@ test('resizing PinePiP preserves the entire run and every native source pixel', 
     const graph=result.args[result.args.indexOf('-filter_complex')+1];
     assert.match(graph,/concat=n=3:v=1:a=0/);
     assert.equal((graph.match(/pad=322:184:0:0/g)||[]).length,3);
-    assert.doesNotMatch(graph,/scale=|minterpolate|hqdn3d/);
+    assert.match(graph,/scale=w='min\(iw,321\)'/);
+    assert.doesNotMatch(graph,/minterpolate|hqdn3d/);
     assert.equal(result.args[result.args.indexOf('-r')+1],'60');
   } finally { if(made?.dir)clipMux.forget(made.dir); ring.forget(); }
 });

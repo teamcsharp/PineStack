@@ -73,6 +73,8 @@
     {id: 'tools', cls: 'ptv-view', label: 'TOOLS', mount: ['PineToolsView']}
   ];
 
+  if (root.PinePipTablet) VIEWS.unshift({id:'pip', cls:'ppt-view', label:'PIP', mount:['PinePipTablet']});
+
   var RAIL_CSS = [
     '#pineViewRail{position:fixed;right:0;top:50%;transform:translateY(-50%);',
     'z-index:2147483001;display:flex;flex-direction:column;gap:7px;',

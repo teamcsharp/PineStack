@@ -1,10 +1,29 @@
-/* Reuse desktop PiP widgets on the tablet while keeping the station page as
-   the media source behind them. The rail remains above the PiP surface. */
-body.pine-pip.pine-pip-tablet > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(script):not(link):not(.pine-view-host):not(.plv-sheet):not(#pineExportBar):not(#pinePipFavorites):not(#pinePipPopupDock):not(.pip-popup-visible):not(.sp-rrp-back){display:block!important}
-body.pine-pip.pine-pip-tablet > main{position:relative!important;inset:auto!important;padding:0!important;margin:0!important;width:auto!important;height:auto!important}
-body.pine-pip.pine-pip-tablet > main > *{visibility:visible!important;pointer-events:auto!important}
+﻿/* The native broadcast surface sits behind the transparent WebView in PiP. */
+html.pine-pip:has(body.pine-pip-tablet),body.pine-pip.pine-pip-tablet{background:transparent!important}
+body.pine-pip.pine-pip-tablet > main{visibility:hidden!important;pointer-events:none!important}
+body.pine-pip.pine-pip-tablet > main > *{visibility:hidden!important;pointer-events:none!important}
+body.pine-pip.pine-pip-tablet > #pineViewRail{display:flex!important}
 body.pine-pip.pine-pip-tablet > .pine-view-host{display:none!important}
-body.pine-pip.pine-pip-tablet > .pine-view-host.ppt-view.open{display:block!important;position:fixed!important;inset:0!important;z-index:1!important;padding:0!important;background:transparent!important;pointer-events:none!important}
-body.pine-pip.pine-pip-tablet #pine-pip-panel{z-index:20001!important}
+body.pine-pip.pine-pip-tablet #pine-pip-panel{z-index:20001!important;background:transparent!important;pointer-events:none!important}
 body.pine-pip.pine-pip-tablet #pinePipWidgets{z-index:21000!important}
-.ppt-view{background:transparent!important}
+#pinePipTabletControls{display:none;position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:2147483002;gap:8px;font:14px system-ui;color:#ecf5f3}
+body.pine-pip.pine-pip-tablet > #pinePipTabletControls{display:flex!important}
+#pinePipTabletControls button{min-height:40px;padding:8px 12px;border:1px solid #52666a;border-radius:8px;background:#142328e8;color:inherit;cursor:pointer}
+.ppt-settings{position:absolute;bottom:48px;left:50%;transform:translateX(-50%);width:min(350px,calc(100vw - 80px));max-height:calc(100vh - 80px);overflow:auto;padding:16px;background:#122025f5;border:1px solid #52666a;border-radius:12px;box-shadow:0 6px 24px #0008}
+.ppt-settings header{display:flex;align-items:center;justify-content:space-between;font-size:18px;font-weight:600}
+.ppt-settings p{line-height:1.45;color:#c2d1d5}
+.ppt-settings>button{margin:0 6px 8px 0}
+.ppt-setting-row{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid #35474d;padding:8px 0}
+.ppt-setting-row label{display:flex;align-items:center;gap:10px}
+.ppt-setting-row input{width:20px;height:20px;accent-color:#73caba}
+body.ppt-editing .pip-grip,body.ppt-editing .pip-free-edge{opacity:1!important;visibility:visible!important;pointer-events:auto!important}
+body.pine-pip-tablet .pip-adjust,body.pine-pip-tablet .pip-appearance{max-height:calc(100vh - 70px);overflow:auto;top:60px!important;bottom:auto!important;z-index:2147483003}
+body.pine-pip-tablet .pip-adjust input,body.pine-pip-tablet .pip-appearance input{min-height:32px}
+body.pine-pip-tablet .pip-adjust button,body.pine-pip-tablet .pip-appearance button{min-height:36px}
+
+body.ppt-editing .pip-messages{outline:1px dashed var(--pip-accent);touch-action:none}
+body.ppt-editing .pip-grip{min-width:32px;min-height:32px}
+
+body.pine-pip.pine-pip-tablet > :not(main):not(#pinePipWidgets):not(#pine-pip-panel):not(#pineViewRail):not(#pinePipTabletControls):not(script):not(link):not(style):not(.plv-sheet):not(.pip-exportbar):not(.sp-rrp-back){display:none!important}
+
+.ppt-setting-row select{max-width:60%;min-height:40px;background:#142328;color:inherit;border:1px solid #52666a;border-radius:6px}
